@@ -1,0 +1,225 @@
+# s01_data_split.py
+# -*- coding: utf-8 -*-
+
+"""
+步骤1：数据整理与切分（优化）
+
+主要改进：
+1. H5 扫描按文件并行（IO bound）
+2. 删除 line 99 的不可达死代码
+3. 切分逻辑、输出 schema 不变
+
+CLI 兼容旧版：仅新增 --n_workers 可选参数。
+"""
+
+import os
+import glob
+import json
+import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
+import h5py
+from sklearn.model_selection import train_test_split
+
+
+def _env_flag(name):
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_n_workers(n_workers=None, n_items=None, cap=4):
+    if _env_flag("WL_FORCE_SERIAL"):
+        return 1
+    if n_workers is None:
+        n_workers = max(1, min(cap, (os.cpu_count() or cap) // 2))
+    try:
+        resolved = max(1, int(n_workers))
+    except (TypeError, ValueError):
+        resolved = 1
+    if n_items is not None and int(n_items) <= 1:
+        return 1
+    return resolved
+
+
+def multiprocessing_context_from_env():
+    method = os.environ.get("WL_MP_START_METHOD", "").strip()
+    if not method:
+        return None
+    import multiprocessing as mp
+    return mp.get_context(method)
+
+
+def find_h5_files(dataset_dir):
+    h5_files = glob.glob(os.path.join(dataset_dir, "*.h5"))
+    if len(h5_files) == 0:
+        h5_files = glob.glob(os.path.join("..", dataset_dir, "*.h5"))
+    return sorted(h5_files)
+
+
+def _scan_one_h5(h5_file):
+    """单文件扫描。返回 (samples_list, filtered_counts_dict)。"""
+    samples = []
+    filtered = {"ppg_cfg": 0, "channel_count": 0}
+    try:
+        with h5py.File(h5_file, "r") as f:
+            for sample_name in f.keys():
+                grp = f[sample_name]
+                if "ppg" not in grp or "target" not in grp:
+                    continue
+                try:
+                    label = int(grp["target"][()])
+                except (TypeError, ValueError, KeyError):
+                    continue
+
+                shape = grp["ppg"].shape
+
+                ppg_cfg = None
+                if "ppg_config" in grp:
+                    try:
+                        ppg_cfg = int(grp["ppg_config"][()])
+                    except (TypeError, ValueError):
+                        pass
+                if ppg_cfg != 65:
+                    filtered["ppg_cfg"] += 1
+                    continue
+
+                if not is_supported_ppg_shape(shape):
+                    filtered["channel_count"] += 1
+                    continue
+
+                samples.append({
+                    "sample_name": sample_name,
+                    "h5_file": h5_file,
+                    "target": int(label),
+                    "ppg_shape": list(shape),
+                    "ppg_cfg": ppg_cfg,
+                })
+    except (OSError, h5py.HDF5DecodeError) as e:
+        print(f"读取 {h5_file} 失败: {e}")
+    except Exception as e:
+        # 兜底但要打印，方便定位
+        print(f"读取 {h5_file} 异常: {e}")
+    return samples, filtered
+
+
+def is_supported_ppg_shape(shape):
+    """Accept H5 PPG with last axis as points: (40, T) or (N_win, 40, T_win)."""
+    if len(shape) == 2:
+        return int(shape[0]) == 40
+    if len(shape) == 3:
+        return int(shape[1]) == 40
+    return False
+
+
+def scan_h5_samples(dataset_dir, n_workers=None):
+    """并行扫描 H5（n_workers=None 自动，=1 单进程）。"""
+    h5_files = find_h5_files(dataset_dir)
+    print(f"找到 {len(h5_files)} 个 H5 文件")
+    print(f"[生产] 使用全部H5文件: {h5_files}")
+
+    n_workers = resolve_n_workers(n_workers, n_items=len(h5_files))
+
+    samples = []
+    filtered_count = {"ppg_cfg": 0, "channel_count": 0}
+
+    if n_workers == 1 or len(h5_files) <= 1:
+        for h5_file in h5_files:
+            s, fc = _scan_one_h5(h5_file)
+            samples.extend(s)
+            filtered_count["ppg_cfg"] += fc["ppg_cfg"]
+            filtered_count["channel_count"] += fc["channel_count"]
+    else:
+        pool_kwargs = {"max_workers": n_workers}
+        mp_ctx = multiprocessing_context_from_env()
+        if mp_ctx is not None:
+            pool_kwargs["mp_context"] = mp_ctx
+        with ProcessPoolExecutor(**pool_kwargs) as ex:
+            futures = {ex.submit(_scan_one_h5, h5_file): h5_file for h5_file in h5_files}
+            for done_count, fut in enumerate(as_completed(futures), 1):
+                try:
+                    s, fc = fut.result()
+                except Exception as e:
+                    print(f"扫描 {futures[fut]} 异常: {e}")
+                    s, fc = [], {"ppg_cfg": 0, "channel_count": 0}
+                samples.extend(s)
+                filtered_count["ppg_cfg"] += fc["ppg_cfg"]
+                filtered_count["channel_count"] += fc["channel_count"]
+                if len(futures) >= 10 and (done_count % max(1, len(futures) // 10) == 0 or done_count == len(futures)):
+                    print(f"  s01 progress: {done_count}/{len(futures)} files", flush=True)
+
+    if filtered_count["ppg_cfg"] > 0 or filtered_count["channel_count"] > 0:
+        print(f"过滤样本: ppg_cfg!=65: {filtered_count['ppg_cfg']}, "
+              f"channel!=40: {filtered_count['channel_count']}")
+
+    # 保证并行下样本顺序的确定性（按 h5_file + sample_name 排序）
+    samples.sort(key=lambda s: (s["h5_file"], s["sample_name"]))
+    return samples
+
+
+def split_samples(samples, valid_size=0.15, test_size=0.15, random_state=42):
+    """sample 级分层切分。"""
+    y = np.array([s["target"] for s in samples])
+    indices = np.arange(len(samples))
+
+    train_valid_idx, test_idx = train_test_split(
+        indices, test_size=test_size,
+        random_state=random_state, stratify=y
+    )
+    y_train_valid = y[train_valid_idx]
+    valid_ratio_in_train_valid = valid_size / (1.0 - test_size)
+    train_idx, valid_idx = train_test_split(
+        train_valid_idx, test_size=valid_ratio_in_train_valid,
+        random_state=random_state, stratify=y_train_valid
+    )
+    return {
+        "train": [samples[i] for i in train_idx],
+        "valid": [samples[i] for i in valid_idx],
+        "test": [samples[i] for i in test_idx],
+    }
+
+
+def summarize_split(split):
+    for part in ["train", "valid", "test"]:
+        arr = split[part]
+        n0 = sum(1 for s in arr if s["target"] == 0)
+        n1 = sum(1 for s in arr if s["target"] == 1)
+        print(f"{part}: total={len(arr)}, target0={n0}, target1={n1}")
+
+
+def main(args=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset_dir", type=str, default="dataset")
+    parser.add_argument("--artifact_dir", type=str, default="artifacts")
+    parser.add_argument("--valid_size", type=float, default=0.15)
+    parser.add_argument("--test_size", type=float, default=0.15)
+    parser.add_argument("--random_state", type=int, default=42)
+    parser.add_argument("--n_workers", type=int,
+                        default=max(1, min(4, (os.cpu_count() or 4) // 2)),
+                        help="并行 worker 数")
+
+    if args is None:
+        args = parser.parse_args()
+
+    os.makedirs(args.artifact_dir, exist_ok=True)
+    samples = scan_h5_samples(args.dataset_dir, n_workers=args.n_workers)
+
+    print(f"总样本数: {len(samples)}")
+    print(f"target=0: {sum(1 for s in samples if s['target'] == 0)}")
+    print(f"target=1: {sum(1 for s in samples if s['target'] == 1)}")
+
+    split = split_samples(
+        samples,
+        valid_size=args.valid_size,
+        test_size=args.test_size,
+        random_state=args.random_state
+    )
+    summarize_split(split)
+
+    out_path = os.path.join(args.artifact_dir, "splits.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(split, f, indent=2, ensure_ascii=False)
+    print(f"切分结果已保存: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
