@@ -17,10 +17,9 @@ import json
 import argparse
 import numpy as np
 import pandas as pd
-import h5py
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.signal import resample_poly
-from s03_extract_feature_pool import normalize_ppg_array, flatten_prewindowed_signal
+from s03_extract_feature_pool import load_ppg as load_h5_ppg, flatten_prewindowed_signal
 
 STAGE1_PRIMITIVE_SEC = 1.0
 STAGE1_DECISION_SEC = 3.0
@@ -63,8 +62,7 @@ def multiprocessing_context_from_env():
 
 
 def load_ppg(sample):
-    with h5py.File(sample["h5_file"], "r") as f:
-        ppg = normalize_ppg_array(f[sample["sample_name"]]["ppg"][:])
+    ppg = load_h5_ppg(sample)
     ppg = flatten_prewindowed_signal(ppg)
     return ppg
 

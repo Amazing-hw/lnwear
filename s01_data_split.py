@@ -7,7 +7,10 @@
 主要改进：
 1. H5 扫描按文件并行（IO bound）
 2. 删除 line 99 的不可达死代码
-3. 切分逻辑、输出 schema 不变
+3. 不再依赖 ppg_config；只按 PPG 结构和窗口命名判断可用样本。
+4. 支持 grouped-window H5：一个 record 下多个 *_w20_1 窗口 group，
+   按 w 编号排序并保留窗口 label 序列。
+5. 切分逻辑、输出 schema 向后兼容
 
 CLI 兼容旧版：仅新增 --n_workers 可选参数。
 """
@@ -16,11 +19,15 @@ import os
 import glob
 import json
 import argparse
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import h5py
 from sklearn.model_selection import train_test_split
+
+
+WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
 
 
 def _env_flag(name):
@@ -56,6 +63,72 @@ def find_h5_files(dataset_dir):
     return sorted(h5_files)
 
 
+def parse_window_name(name):
+    """Return (window_index, label) parsed from names ending in *_w20_1."""
+    match = WINDOW_NAME_RE.search(str(name))
+    if not match:
+        return None
+    return int(match.group("index")), int(match.group("label"))
+
+
+def _read_ppg_config(group, fallback=None):
+    if "ppg_config" not in group:
+        return fallback
+    try:
+        return int(group["ppg_config"][()])
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _sample_target_from_window_labels(labels):
+    if not labels:
+        return 0
+    if len(set(labels)) == 1:
+        return int(labels[0])
+    return int(np.mean(labels) >= 0.5)
+
+
+def _scan_grouped_window_sample(h5_file, sample_name, grp, filtered):
+    parent_cfg = _read_ppg_config(grp)
+    windows = []
+    for child_name in grp.keys():
+        parsed = parse_window_name(child_name)
+        if parsed is None:
+            continue
+        child = grp[child_name]
+        if not isinstance(child, h5py.Group) or "ppg" not in child:
+            continue
+        ppg_cfg = _read_ppg_config(child, fallback=parent_cfg)
+        shape = child["ppg"].shape
+        if not is_supported_ppg_shape(shape):
+            filtered["channel_count"] += 1
+            continue
+        window_index, label = parsed
+        windows.append((window_index, label, child_name, shape, ppg_cfg))
+
+    if not windows:
+        return None
+
+    windows.sort(key=lambda item: item[0])
+    labels = [int(item[1]) for item in windows]
+    shapes = [list(item[3]) for item in windows]
+    return {
+        "sample_name": sample_name,
+        "h5_file": h5_file,
+        "target": _sample_target_from_window_labels(labels),
+        "ppg_shape": [len(windows)] + shapes[0],
+        "ppg_cfg": None if windows[0][4] is None else int(windows[0][4]),
+        "window_layout": "grouped_windows",
+        "window_names": [str(item[2]) for item in windows],
+        "window_indices": [int(item[0]) for item in windows],
+        "window_labels": labels,
+        "window_label_counts": {
+            "target0": int(sum(1 for x in labels if x == 0)),
+            "target1": int(sum(1 for x in labels if x == 1)),
+        },
+    }
+
+
 def _scan_one_h5(h5_file):
     """单文件扫描。返回 (samples_list, filtered_counts_dict)。"""
     samples = []
@@ -64,6 +137,11 @@ def _scan_one_h5(h5_file):
         with h5py.File(h5_file, "r") as f:
             for sample_name in f.keys():
                 grp = f[sample_name]
+                if "ppg" not in grp:
+                    grouped = _scan_grouped_window_sample(h5_file, sample_name, grp, filtered)
+                    if grouped is not None:
+                        samples.append(grouped)
+                    continue
                 if "ppg" not in grp or "target" not in grp:
                     continue
                 try:
@@ -79,10 +157,6 @@ def _scan_one_h5(h5_file):
                         ppg_cfg = int(grp["ppg_config"][()])
                     except (TypeError, ValueError):
                         pass
-                if ppg_cfg != 65:
-                    filtered["ppg_cfg"] += 1
-                    continue
-
                 if not is_supported_ppg_shape(shape):
                     filtered["channel_count"] += 1
                     continue
@@ -147,9 +221,8 @@ def scan_h5_samples(dataset_dir, n_workers=None):
                 if len(futures) >= 10 and (done_count % max(1, len(futures) // 10) == 0 or done_count == len(futures)):
                     print(f"  s01 progress: {done_count}/{len(futures)} files", flush=True)
 
-    if filtered_count["ppg_cfg"] > 0 or filtered_count["channel_count"] > 0:
-        print(f"过滤样本: ppg_cfg!=65: {filtered_count['ppg_cfg']}, "
-              f"channel!=40: {filtered_count['channel_count']}")
+    if filtered_count["channel_count"] > 0:
+        print(f"过滤样本: channel!=40: {filtered_count['channel_count']}")
 
     # 保证并行下样本顺序的确定性（按 h5_file + sample_name 排序）
     samples.sort(key=lambda s: (s["h5_file"], s["sample_name"]))

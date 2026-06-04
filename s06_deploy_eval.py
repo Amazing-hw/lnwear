@@ -15,6 +15,8 @@
    (b) window-level 模型+阈值：window_preds vs target，每窗一条。
    (c) window-level 流式状态机：state[i] vs target。
 4. 状态机网格搜索并行化（probs 缓存复用）。
+5. 预切窗和 grouped-window H5 直接按窗口编号推理；窗口缓存保留
+   window_indices/window_targets，供后处理按原始顺序组合。
 
 公共接口（main / predict_sample / predict_sample_with_bundle /
 predict_sample_safe / evaluate_streaming_window_accuracy /
@@ -53,6 +55,7 @@ from s03_extract_feature_pool import (
     extract_acc_features,
     extract_acc_ppg_cross_features,
     validate_h5_file,
+    load_grouped_window_metadata,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -421,6 +424,9 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
                               skip_initial_windows):
     """Run deployed inference directly on stored 3s windows."""
     FEATURE_FS = 25
+    window_meta = load_grouped_window_metadata(base)
+    window_indices = window_meta.get("window_indices") if window_meta else None
+    window_labels = window_meta.get("window_labels") if window_meta else None
     native_25hz = _is_25hz_sample(base) or int(ppg.shape[1]) == int(round(float(window_sec) * FEATURE_FS))
     ppg_src_fs = 25 if native_25hz else 100
     mode = detect_green_mode(ppg)
@@ -431,13 +437,19 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
     stage2_enabled_flags = []
     window_start_sec = []
     window_end_sec = []
+    emitted_window_indices = []
+    emitted_window_targets = []
 
     first_step = max(0, int(skip_initial_windows))
     for step in range(first_step, ppg.shape[0]):
         raw_window = ppg[step]
-        start_sec = float(step * stride_sec)
+        window_number = int(window_indices[step]) if window_indices and step < len(window_indices) else int(step)
+        window_target = int(window_labels[step]) if window_labels and step < len(window_labels) else int(base.get("target", 0))
+        start_sec = float(window_number * stride_sec)
         window_start_sec.append(start_sec)
         window_end_sec.append(start_sec + float(window_sec))
+        emitted_window_indices.append(window_number)
+        emitted_window_targets.append(window_target)
 
         enabled = (
             stage1_sample_pass(raw_window, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs)
@@ -510,6 +522,8 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
     base["stage2_enabled_flags"] = stage2_enabled_flags
     base["window_start_sec"] = window_start_sec
     base["window_end_sec"] = window_end_sec
+    base["window_indices"] = emitted_window_indices
+    base["window_targets"] = emitted_window_targets
     return base
 
 
@@ -542,6 +556,9 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
         "window_probs": [], "window_preds": [], "quality_metas": [],
         "window_ood_scores": [], "stage2_enabled_flags": [],
         "window_start_sec": [], "window_end_sec": [],
+        "window_layout": sample.get("window_layout"),
+        "window_indices": list(sample.get("window_indices", [])),
+        "window_labels": list(sample.get("window_labels", [])),
         "use_stage2_ir": bool(use_stage2_ir),
         "fallback": False, "fallback_reason": None,
     }
@@ -1179,7 +1196,8 @@ def export_deploy_report_plot(payload, artifact_dir, split="test", method="state
 def compute_window_model_metrics(results):
     """
     Stage2 模型评估（仅通过 Stage1 的数据）：
-    逐窗 XGBoost 预测 (window_preds) vs 整条样本的 target。
+    逐窗 XGBoost 预测 (window_preds) vs window_targets；旧数据缺少
+    window_targets 时回退到整条样本的 target。
 
     模型无状态，不做 warmup 跳过——所有通过 Stage1 的窗口全部参与。
     未通过 Stage1 / fallback 的样本不参与（它们没有窗口数据）。
@@ -1194,8 +1212,10 @@ def compute_window_model_metrics(results):
             samples_with_no_windows += 1
             continue
         stage1_pass_samples += 1
-        t = int(r["target"])
-        for p in wp:
+        sample_target = int(r["target"])
+        window_targets = r.get("window_targets", [])
+        for idx, p in enumerate(wp):
+            t = int(_safe_list_get(window_targets, idx, sample_target))
             y_true.append(t)
             y_pred.append(int(p))
 
@@ -1315,7 +1335,9 @@ def _window_rows_from_details(details):
         preds = detail.get("window_preds", []) or []
         if not probs or not preds:
             continue
-        target = int(detail.get("target", 0))
+        sample_target = int(detail.get("target", 0))
+        window_targets = detail.get("window_targets", [])
+        window_indices = detail.get("window_indices", [])
         sample_name = detail.get("sample_name")
         mode = int(detail.get("mode", 0))
         enabled = detail.get("stage2_enabled_flags", [])
@@ -1325,6 +1347,8 @@ def _window_rows_from_details(details):
         oods = detail.get("window_ood_scores", [])
         for idx, prob in enumerate(probs):
             pred = int(_safe_list_get(preds, idx, 0))
+            target = int(_safe_list_get(window_targets, idx, sample_target))
+            window_index = int(_safe_list_get(window_indices, idx, idx))
             start = float(_safe_list_get(starts, idx, idx))
             end = float(_safe_list_get(ends, idx, start))
             stage2_enabled = int(_safe_list_get(enabled, idx, 1))
@@ -1337,7 +1361,7 @@ def _window_rows_from_details(details):
                 "pred_raw": pred,
                 "error_type": error_type,
                 "is_error": int(error_type in {"FP", "FN"}),
-                "window_index": int(idx),
+                "window_index": window_index,
                 "window_start_sec": start,
                 "window_end_sec": end,
                 "prob_raw": float(prob),
@@ -2582,10 +2606,16 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
         ends = starts + float(window_sec)
     preds = np.asarray(result.get("window_preds", []), dtype=int)
     enabled = np.asarray(result.get("stage2_enabled_flags", np.ones(n, dtype=int)), dtype=int)
+    window_indices = np.asarray(result.get("window_indices", np.arange(n, dtype=int)), dtype=int)
+    window_targets = np.asarray(result.get("window_targets", np.full(n, int(result.get("target", 0)))), dtype=int)
     if len(preds) != n:
         preds = (probs >= float(model_threshold)).astype(int)
     if len(enabled) != n:
         enabled = np.ones(n, dtype=int)
+    if len(window_indices) != n:
+        window_indices = np.arange(n, dtype=int)
+    if len(window_targets) != n:
+        window_targets = np.full(n, int(result.get("target", 0)), dtype=int)
     quality_metas = result.get("quality_metas", [])
     quality = np.ones(n, dtype=float)
     ood_rate = np.zeros(n, dtype=float)
@@ -2608,6 +2638,8 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
         target=np.array(int(result.get("target", 0)), dtype=np.int64),
         window_start_sec=starts,
         window_end_sec=ends,
+        window_indices=window_indices.astype(np.int64),
+        window_targets=window_targets.astype(np.int64),
         stage1_enabled=enabled.astype(np.int64),
         prob_raw=probs,
         pred_raw=preds.astype(np.int64),

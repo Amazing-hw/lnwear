@@ -21,13 +21,14 @@ new_codex/
   SINGLE_WINDOW_98_FEATURE_OPTIMIZATION_PLAN.md
 
   s01_data_split.py
-    扫描 H5，过滤 ppg_config/channel 不符合要求的样本，按 sample 分层切分 train/valid/test。
+    扫描 H5，过滤 PPG shape 不符合要求的样本，按 sample/record 分层切分 train/valid/test。
 
   s02_ir_dc_threshold.py
     固定 Stage1 IR DC/ACDC 阈值为 3.6e6 / 0.35，导出 primitive window 统计和散点图。
 
   s03_extract_feature_pool.py
-    按 3s/1s 滑窗提取 Stage2 特征池，默认跳过每条样本前 3 个 Stage2 窗口。
+    提取 Stage2 特征池；3D 预切窗直接逐个使用已有 3s 窗口，连续时序才按 3s/1s 滑窗。
+    默认跳过每条样本前 3 个 Stage2 窗口。
     默认 Stage2 不使用 IR，开启 --use_stage2_ir 后才保留真实 IR。
 
   s04_feature_selection.py
@@ -55,23 +56,41 @@ new_codex/
 
 默认数据目录是 `dataset/`，可通过 `--dataset_dir` 指定。项目会扫描目录下的 `.h5` 文件。
 
-当前代码至少依赖每个 sample group 中包含：
+旧版连续/预切窗 sample group 至少包含：
 
 ```text
 sample_group/
   ppg          PPG 原始数据，当前筛选要求 shape[0] == 40
   target       样本标签，0=非佩戴，1=佩戴
-  ppg_config   当前筛选要求 ppg_config == 65
+  ppg_config   可选元数据；当前流程不再按 ppg_config 过滤
 ```
 
-`ppg` 同时支持两种形态：
+`ppg` 支持三种形态：
 
 ```text
 (40, T)              连续时序，后续步骤按 window/stride 滑窗
 (N_win, 40, T_win)   sample 内已经切好的窗口
+record/window_group  一个 H5 含多条 record，每条 record 下按窗口 group 存放 ppg
 ```
 
 当 `ppg` 是 3D 预切窗时，`s03/s06/s09` 会直接逐个使用已有窗口，不再在每个 sample 内二次滑窗；`s01` 仍按 sample/group 做 train/valid/test 切分。
+
+当前新 H5 结构也支持一个 H5 文件里包含多条数据，每条数据下包含多个 3s 窗口 group。窗口 group 名称必须能从末尾解析出窗口编号和 label：
+
+```text
+record_a/
+  anything_w0_1/
+    ppg        (40, 300)
+    acc        (3, 300)
+  anything_w1_1/
+    ppg        (40, 300)
+    acc        (3, 300)
+  anything_w20_1/
+    ppg        (40, 300)
+    acc        (3, 300)
+```
+
+解析规则是按 `_` 分割后的倒数第二段匹配 `w数字`，最后一段是 `label`。例如 `xxx_w20_1` 表示第 20 个窗口，label=1。H5 内部保存顺序不重要；`s01/s03/s06/s07` 会按 `w` 后的数字排序，`skip_initial_windows=3` 也是在排序后跳过前三个窗口。窗口是从原始信号按 3s 窗长、1s stride 预先截取的，因此后续不会重新滑窗。
 
 切分是 sample 级，不是 window 级。训练、验证、测试应避免同一条采集、同一人或同一 H5 的相邻样本跨 split；如果你的 H5 语义代表同一次采集，建议重点检查 split 结果。
 
@@ -111,7 +130,7 @@ postprocess latency:     first_worn_output_p95 <= 6s
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
 ```
 
-这条命令会一次性完成：数据切分、Stage1 固定阈值配置、3s/1s Stage2 特征提取、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、legacy 状态机优化参考、valid/test 逐窗缓存导出、s07 后处理状态机搜参、test 端到端评估、部署产物和部署配方导出。
+这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、legacy 状态机优化参考、valid/test 逐窗缓存导出、s07 后处理状态机搜参、test 端到端评估、部署产物和部署配方导出。
 
 只打印命令，不执行：
 

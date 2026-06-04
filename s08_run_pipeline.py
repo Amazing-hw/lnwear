@@ -37,7 +37,7 @@
 流程:
     s01: 数据扫描 & train/valid/test 切分
     s02: Stage1 IR DC/ACDC 固定阈值配置
-    s03: 滑窗特征池提取
+    s03: Stage2 特征池提取（预切窗直接使用；连续时序按 3s/1s 滑窗）
     s04: 稳定性特征筛选
     s05: XGBoost 最终模型训练
     s06_opt:  legacy 状态机参数网格搜索 (--optimize)

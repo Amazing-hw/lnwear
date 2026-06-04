@@ -42,6 +42,12 @@ def load_window_cache_npz(path):
         if arr.shape != prob.shape:
             raise ValueError(
                 f"{path} key {key} shape {arr.shape} != prob_raw shape {prob.shape}")
+    for key in ["window_indices", "window_targets"]:
+        if key in out:
+            arr = np.asarray(out[key])
+            if arr.shape != prob.shape:
+                raise ValueError(
+                    f"{path} key {key} shape {arr.shape} != prob_raw shape {prob.shape}")
 
     out["sample_name"] = str(_scalar(out["sample_name"]))
     out["target"] = int(_scalar(out["target"]))

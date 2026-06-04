@@ -2,12 +2,18 @@
 # -*- coding: utf-8 -*-
 
 """
-步骤3：滑窗特征池提取，增强鲁棒预处理版
+步骤3：Stage2 特征池提取，增强鲁棒预处理版。
+
+输入支持两种形态：
+- 3D 预切窗 PPG：直接逐个使用 H5 中已有窗口，不再二次滑窗。
+- 连续时序 PPG：通过 Stage1 后降采样到 25Hz，再按 3s/1s 滑窗。
+- grouped-window H5：一个 record 下多个窗口 group，窗口名末尾为 *_w20_1；
+  读取时按 w 后数字排序，label 来自最后一段。
 
 功能：
 1. 读取 artifacts/splits.json
 2. 读取 artifacts/stage1_threshold.json
-3. 对通过 Stage1 IR DC/ACDC 阈值的样本做 3s/25Hz 特征滑窗
+3. 对通过 Stage1 IR DC/ACDC 阈值的样本提取 3s/25Hz Stage2 特征
 4. 复用原始 H5 读取方式
 5. 复用原始绿光通道构建方式：
    - mode=1: ch3/ch4/ch5 为三通道绿光
@@ -27,6 +33,7 @@
 import os
 import json
 import argparse
+import re
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -58,6 +65,8 @@ COMMERCIAL_8_FEATURE_NAMES = [
     "GREEN_XCORR",
     "FFT_PEAK_MEDIAN_RATIO",
 ]
+
+WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
 
 
 def apply_stage2_ir_policy(ir, use_stage2_ir=DEFAULT_USE_STAGE2_IR):
@@ -169,13 +178,65 @@ def flatten_prewindowed_signal(arr):
     return x.reshape(x.shape[0] * x.shape[1], x.shape[2])
 
 
+def parse_grouped_window_name(name):
+    """Return (window_index, label) parsed from names ending in *_w20_1."""
+    match = WINDOW_NAME_RE.search(str(name))
+    if not match:
+        return None
+    return int(match.group("index")), int(match.group("label"))
+
+
+def _sorted_grouped_window_items(group):
+    items = []
+    for child_name in group.keys():
+        parsed = parse_grouped_window_name(child_name)
+        if parsed is None:
+            continue
+        child = group[child_name]
+        if not isinstance(child, h5py.Group) or "ppg" not in child:
+            continue
+        window_index, label = parsed
+        items.append((window_index, label, child_name, child))
+    return sorted(items, key=lambda item: item[0])
+
+
+def load_grouped_window_metadata(sample):
+    if sample.get("window_layout") != "grouped_windows":
+        return None
+    indices = sample.get("window_indices")
+    labels = sample.get("window_labels")
+    names = sample.get("window_names")
+    if indices is not None and labels is not None:
+        return {
+            "window_indices": [int(x) for x in indices],
+            "window_labels": [int(x) for x in labels],
+            "window_names": [str(x) for x in names] if names is not None else None,
+        }
+    with h5py.File(sample["h5_file"], "r") as f:
+        items = _sorted_grouped_window_items(f[sample["sample_name"]])
+    return {
+        "window_indices": [int(item[0]) for item in items],
+        "window_labels": [int(item[1]) for item in items],
+        "window_names": [str(item[2]) for item in items],
+    }
+
+
 def load_ppg(sample):
     """
     Read PPG as continuous (T, C) or pre-windowed (N_win, T_win, C).
     Old H5 layout (C, T) remains supported.
     """
     with h5py.File(sample["h5_file"], "r") as f:
-        ppg = normalize_ppg_array(f[sample["sample_name"]]["ppg"][:])
+        grp = f[sample["sample_name"]]
+        if sample.get("window_layout") == "grouped_windows" or "ppg" not in grp:
+            windows = []
+            for _idx, _label, _name, child in _sorted_grouped_window_items(grp):
+                windows.append(normalize_ppg_array(child["ppg"][:]))
+            if not windows:
+                raise KeyError(f"sample {sample['sample_name']} has no grouped PPG windows")
+            ppg = np.stack(windows, axis=0)
+        else:
+            ppg = normalize_ppg_array(grp["ppg"][:])
     return ppg
 
 
@@ -187,9 +248,19 @@ def load_acc(sample):
     如果没有acc数据，返回None
     """
     with h5py.File(sample["h5_file"], "r") as f:
-        if "acc" not in f[sample["sample_name"]]:
+        grp = f[sample["sample_name"]]
+        if sample.get("window_layout") == "grouped_windows" or "ppg" not in grp:
+            acc_windows = []
+            for _idx, _label, _name, child in _sorted_grouped_window_items(grp):
+                if "acc" not in child:
+                    return None
+                acc_windows.append(normalize_acc_array(child["acc"][:]))
+            if not acc_windows:
+                return None
+            return np.stack(acc_windows, axis=0)
+        if "acc" not in grp:
             return None
-        acc = normalize_acc_array(f[sample["sample_name"]]["acc"][:])
+        acc = normalize_acc_array(grp["acc"][:])
     return acc
 
 def _is_25hz_sample(sample):
@@ -395,11 +466,18 @@ def validate_h5_file(h5_file, sample_name):
         with h5py.File(h5_file, "r") as f:
             if sample_name not in f:
                 return False, f"样本 {sample_name} 不存在于H5文件中"
-            
-            if "ppg" not in f[sample_name]:
-                return False, f"样本 {sample_name} 缺少PPG数据"
-            
-            ppg = normalize_ppg_array(f[sample_name]["ppg"][:])
+
+            grp = f[sample_name]
+            if "ppg" not in grp:
+                items = _sorted_grouped_window_items(grp)
+                if not items:
+                    return False, f"样本 {sample_name} 缺少PPG数据"
+                ppg = normalize_ppg_array(items[0][3]["ppg"][:])
+                if ppg is None or len(ppg) == 0:
+                    return False, f"样本 {sample_name} PPG数据为空"
+                return True, None
+
+            ppg = normalize_ppg_array(grp["ppg"][:])
             if ppg is None or len(ppg) == 0:
                 return False, f"样本 {sample_name} PPG数据为空"
                 
@@ -1881,7 +1959,8 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
     """
     单样本抽窗特征。返回 rows list（失败时返回 []）。
 
-    Stage1 后降采样 ppg 到 25Hz 再滑窗，大幅降低计算量。
+    3D 预切窗样本直接使用已有窗口；连续时序样本在 Stage1 后降采样
+    ppg 到 25Hz 再滑窗，大幅降低计算量。
     fs 参数为降采样后目标采样率 (25Hz)。
     """
     FEATURE_FS = 25  # 特征提取统一采样率
@@ -1894,12 +1973,17 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
         return []
 
     if is_prewindowed_signal(ppg):
+        window_meta = load_grouped_window_metadata(sample)
+        window_indices = window_meta.get("window_indices") if window_meta else None
+        window_labels = window_meta.get("window_labels") if window_meta else None
         native_25hz = _is_25hz_sample(sample) or int(ppg.shape[1]) == int(round((window_len / max(fs, 1)) * FEATURE_FS))
         ppg_src_fs = 25 if native_25hz else 100
         mode = detect_green_mode(ppg)
         rows = []
         first_idx = max(0, int(skip_initial_windows))
         for win_idx in range(first_idx, ppg.shape[0]):
+            window_number = int(window_indices[win_idx]) if window_indices and win_idx < len(window_indices) else int(win_idx)
+            window_target = int(window_labels[win_idx]) if window_labels and win_idx < len(window_labels) else int(sample["target"])
             raw_window = ppg[win_idx]
             if raw_window.shape[0] < 2:
                 continue
@@ -1943,8 +2027,9 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                         feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
-                feat["target"] = int(sample["target"])
-                feat["start_100hz"] = int(win_idx * stride_len)
+                feat["target"] = int(window_target)
+                feat["start_100hz"] = int(window_number * stride_len)
+                feat["window_index"] = int(window_number)
                 feat["mode"] = int(mode)
                 rows.append(feat)
             except Exception as e:

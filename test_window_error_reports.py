@@ -100,6 +100,34 @@ def test_postprocess_replay_records_valid_selection_and_test_metrics():
     assert payload["best_params"]["T_on"] == 0.8
 
 
+def test_window_cache_preserves_window_indices_and_targets(tmp_path):
+    result = {
+        "sample_name": "record_a",
+        "target": 1,
+        "mode": 0,
+        "window_probs": [0.2, 0.8],
+        "window_preds": [0, 1],
+        "stage2_enabled_flags": [1, 1],
+        "window_start_sec": [3.0, 20.0],
+        "window_end_sec": [6.0, 23.0],
+        "window_indices": [3, 20],
+        "window_targets": [0, 1],
+        "quality_metas": [{}, {}],
+    }
+
+    path = s06.write_window_cache_npz(
+        result,
+        tmp_path,
+        window_sec=3,
+        stride_sec=1,
+        model_threshold=0.5,
+    )
+    cache = s07.load_window_cache_npz(path)
+
+    assert cache["window_indices"].tolist() == [3, 20]
+    assert cache["window_targets"].tolist() == [0, 1]
+
+
 def test_s08_dry_run_exports_replay_cache_before_postprocess():
     result = subprocess.run(
         [
