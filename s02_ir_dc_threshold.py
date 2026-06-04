@@ -24,6 +24,7 @@ from s03_extract_feature_pool import normalize_ppg_array, flatten_prewindowed_si
 
 STAGE1_PRIMITIVE_SEC = 1.0
 STAGE1_DECISION_SEC = 3.0
+DEFAULT_MIN_DURATION_SEC = STAGE1_DECISION_SEC
 STAGE1_FS = 5
 STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
 FIXED_DEPLOY_DC_THRESHOLD = 3.6e6
@@ -149,7 +150,7 @@ def _worker_extract_sample(args_tuple):
     return _extract_windows_from_sample(sample, min_duration_sec)
 
 
-def extract_stage1_windows(samples, min_duration_sec=10, n_workers=None):
+def extract_stage1_windows(samples, min_duration_sec=DEFAULT_MIN_DURATION_SEC, n_workers=None):
     """样本级并行（n_workers=None 自动选 cpu-1；=1 单进程）。"""
     n_workers = resolve_n_workers(n_workers, n_items=len(samples))
 
@@ -370,7 +371,7 @@ def plot_stage1_scatter(df_train, df_valid, deploy_dc, deploy_acdc, out_path):
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
-    parser.add_argument("--min_duration_sec", type=float, default=10.0)
+    parser.add_argument("--min_duration_sec", type=float, default=DEFAULT_MIN_DURATION_SEC)
     parser.add_argument("--train_dc_ratio", type=float, default=0.90)
     parser.add_argument("--train_acdc_margin", type=float, default=0.10)
     parser.add_argument("--n_workers", type=int,

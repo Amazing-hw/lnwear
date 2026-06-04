@@ -1,11 +1,29 @@
 # s08_run_pipeline.py
 # -*- coding: utf-8 -*-
 """
-主控脚本：一键运行全流程 s01→s06
+主控脚本：一键运行完整训练、搜参、评估和部署导出流程。
+
+推荐一条命令（不含商用 baseline 对比）:
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
+
+这条命令会默认跑到 s06_cb：
+    s01 数据切分
+    s02 Stage1 固定阈值
+    s03 3s/1s Stage2 特征窗口
+    s04 特征筛选 + s04_search 候选子集搜索
+    s05 XGBoost 训练；加 --model_search 时执行复杂度受限搜参
+    s06_opt legacy 状态机优化参考
+    s06_cache/s06_replay_cache 导出 valid/test 逐窗缓存
+    s07_post 在 valid 搜后处理状态机参数，并 replay test
+    s06_eval 用优化后的状态机做 test 端到端评估
+    s06_xpt/s06_feat/s06_plot/s06_cb 导出部署产物、特征脚本、错误图和部署配方
+
+商用 baseline 对比暂不属于默认全流程；需要时显式运行：
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search --commercial_compare --stop_after s09_cmp
 
 用法:
-    # 全量运行
-    python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
+    # 全量运行（含 XGBoost 搜参、状态机搜参、评估和部署导出；不含商用对比）
+    python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
 
     # 跳过某些步骤
     python new/s08_run_pipeline.py --skip s02,s03
@@ -13,8 +31,8 @@
     # 只跑到特征筛选
     python new/s08_run_pipeline.py --stop_after s04
 
-    # 部署最终运行
-    python new/s08_run_pipeline.py --artifact_dir artifacts --export_deploy
+    # 只复用已有 artifacts 做评估和部署导出
+    python new/s08_run_pipeline.py --artifact_dir artifacts --skip s01,s02,s03,s04,s04_search,s05
 
 流程:
     s01: 数据扫描 & train/valid/test 切分
@@ -27,7 +45,7 @@
     s07_post: FP 敏感后处理搜参
     s06_eval: 端到端评估
     s06_xpt: 导出部署产物 (--export_deploy)
-    s09_cmp: 我们方案 vs 商用方案对比
+    s09_cmp: 我们方案 vs 商用方案对比（默认不跑；需 --commercial_compare --stop_after s09_cmp）
 """
 
 import argparse
@@ -1094,8 +1112,8 @@ def main():
                    help="s07 maximum negative-sample false-worn event rate")
     p.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0,
                    help="s07 maximum P95 first worn output latency for positive samples")
-    p.add_argument("--commercial_compare", action=argparse.BooleanOptionalAction, default=True,
-                   help="run s09 commercial-vs-project comparison")
+    p.add_argument("--commercial_compare", action=argparse.BooleanOptionalAction, default=False,
+                   help="run optional s09 commercial-vs-project comparison")
     p.add_argument("--commercial_split", default="test", choices=["train", "valid", "test"],
                    help="split used by s09 commercial comparison")
     p.add_argument("--commercial_fp_cost", type=float, default=4.0,

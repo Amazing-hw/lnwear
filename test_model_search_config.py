@@ -113,3 +113,24 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
     assert '--model_search_n_estimators "20,30"' in output
     assert '--model_search_max_depth "2"' in output
     assert '--model_search_colsample_bytree "0.7,0.8"' in output
+
+
+def test_s08_model_search_full_pipeline_stops_before_commercial_compare_by_default():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--model_search",
+        ],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert "--model_search" in output
+    assert "s07_postprocess_optimize.py" in output
+    assert "--replay_split test" in output
+    assert "s09_commercial_compare.py" not in output

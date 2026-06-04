@@ -45,7 +45,7 @@ new_codex/
     只读取逐窗口 NPZ，不重跑模型；在 valid 上搜索状态机参数，并可在 test 上 replay 复验。
 
   s08_run_pipeline.py
-    一键编排 s01 到 s09，外层暴露主要实验参数。
+    一键编排训练、搜参、评估和部署导出流程；商用 baseline 对比作为显式可选步骤。
 
   s09_commercial_compare.py
     当前项目方案与商业 AdaBoost baseline 对比。
@@ -105,16 +105,18 @@ postprocess latency:     first_worn_output_p95 <= 6s
 
 ## 快速开始
 
-完整运行：
+完整运行（不含商用 baseline 对比）：
 
 ```bash
-python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
 ```
+
+这条命令会一次性完成：数据切分、Stage1 固定阈值配置、3s/1s Stage2 特征提取、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、legacy 状态机优化参考、valid/test 逐窗缓存导出、s07 后处理状态机搜参、test 端到端评估、部署产物和部署配方导出。
 
 只打印命令，不执行：
 
 ```bash
-python s08_run_pipeline.py --dry_run --stop_after s09_cmp
+python s08_run_pipeline.py --dry_run --model_search
 ```
 
 推荐先看 dry-run，确认每一步参数都符合预期。
@@ -136,28 +138,29 @@ s06_replay_cache    导出 replay split 逐窗口 NPZ，默认 test
 s07_post            valid 搜后处理参数，并 replay test
 s06_eval            端到端部署评估
 s06_feat/s06_cb     导出部署特征脚本和部署配方
-s09_cmp             商业方案对比
 ```
 
-常用命令：
+默认终点是 `s06_cb`，即跑到部署配方导出后停止；商用方案对比暂不纳入默认全流程。需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
+
+推荐一条命令：
 
 ```bash
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
+  --model_search \
   --window_sec 3 \
   --stride_sec 1 \
   --skip_initial_windows 3 \
   --no-use_stage2_ir \
   --max_features 15 \
   --postprocess_split valid \
-  --split test \
-  --commercial_split test
+  --split test
 ```
 
 ## 复杂度受限模型搜参
 
-模型搜参默认关闭。建议在特征筛选方案稳定后再开启，用来比较“更小/更稳的 XGBoost 参数”，而不是靠增大模型复杂度冲指标。
+模型搜参默认关闭；完整搜参全流程请在 `s08_run_pipeline.py` 上显式加 `--model_search`。建议在特征筛选方案稳定后开启，用来比较“更小/更稳的 XGBoost 参数”，而不是靠增大模型复杂度冲指标。
 
 一键流水线开启示例：
 
