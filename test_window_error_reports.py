@@ -136,6 +136,8 @@ def test_s08_dry_run_exports_replay_cache_before_postprocess():
             "--dry_run",
             "--stop_after",
             "s07_post",
+            "--export_window_cache",
+            "--optimize_postprocess",
             "--postprocess_split",
             "valid",
             "--split",

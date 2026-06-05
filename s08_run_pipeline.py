@@ -3,27 +3,31 @@
 """
 主控脚本：一键运行完整训练、搜参、评估和部署导出流程。
 
-推荐一条命令（不含商用 baseline 对比）:
-    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
+推荐一条命令（含 XGBoost 模型搜参；不含商用 baseline 对比、NPZ 缓存导出和 s07 后处理搜参）:
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 这条命令会默认跑到 s06_cb：
     s01 数据切分
     s02 Stage1 固定阈值
     s03 3s/1s Stage2 特征窗口
     s04 特征筛选 + s04_search 候选子集搜索
-    s05 XGBoost 训练；加 --model_search 时执行复杂度受限搜参
+    s05 XGBoost 训练；默认执行复杂度受限搜参
     s06_opt legacy 状态机优化参考
-    s06_cache/s06_replay_cache 导出 valid/test 逐窗缓存
-    s07_post 在 valid 搜后处理状态机参数，并 replay test
-    s06_eval 用优化后的状态机做 test 端到端评估
+    s06_eval 用当前已固化/默认状态机做 test 端到端评估
     s06_xpt/s06_feat/s06_plot/s06_cb 导出部署产物、特征脚本、错误图和部署配方
 
+NPZ 缓存导出和 s07 后处理搜参很耗时，默认不跑；需要时显式运行：
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --export_window_cache --optimize_postprocess
+
 商用 baseline 对比暂不属于默认全流程；需要时显式运行：
-    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search --commercial_compare --stop_after s09_cmp
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_compare --stop_after s09_cmp
 
 用法:
-    # 全量运行（含 XGBoost 搜参、状态机搜参、评估和部署导出；不含商用对比）
-    python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
+    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/商用对比）
+    python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
+
+    # 需要时再打开 NPZ 缓存导出和 s07 后处理搜参
+    python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --export_window_cache --optimize_postprocess
 
     # 跳过某些步骤
     python new/s08_run_pipeline.py --skip s02,s03
@@ -41,8 +45,8 @@
     s04: 稳定性特征筛选
     s05: XGBoost 最终模型训练
     s06_opt:  legacy 状态机参数网格搜索 (--optimize)
-    s06_cache: 导出 valid 逐窗缓存
-    s07_post: FP 敏感后处理搜参
+    s06_cache: 导出 valid 逐窗缓存（默认不跑；需 --export_window_cache）
+    s07_post: FP 敏感后处理搜参（默认不跑；需 --optimize_postprocess）
     s06_eval: 端到端评估
     s06_xpt: 导出部署产物 (--export_deploy)
     s09_cmp: 我们方案 vs 商用方案对比（默认不跑；需 --commercial_compare --stop_after s09_cmp）
@@ -1060,8 +1064,8 @@ def main():
 
     # ── s06 参数 ──
     # s05 model-search params
-    p.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=False,
-                   help="enable s05 XGBoost param search under a node budget")
+    p.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable s05 XGBoost param search under a node budget; use --no-model_search to disable")
     p.add_argument("--max_model_nodes", type=int, default=400,
                    help="s05 max total XGBoost nodes for --model_search")
     p.add_argument("--model_search_fp_cost", type=float, default=2.0,
@@ -1098,9 +1102,9 @@ def main():
                    help="s06 运行状态机参数优化 (--no-optimize 跳过)")
     p.add_argument("--plot_errors", action=argparse.BooleanOptionalAction, default=True,
                    help="s06 评估后画出错误样本图 (--no-plot_errors 跳过)")
-    p.add_argument("--export_window_cache", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--export_window_cache", action=argparse.BooleanOptionalAction, default=False,
                    help="export window-level NPZ cache for s07 postprocess optimization")
-    p.add_argument("--optimize_postprocess", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--optimize_postprocess", action=argparse.BooleanOptionalAction, default=False,
                    help="run s07 FP-sensitive postprocess optimization on cached windows")
     p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
                    help="split used by s07 postprocess optimization")
@@ -1152,6 +1156,7 @@ def main():
     stage2_ir_flag = "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir"
     s04_skip_vif_flag = "--skip_vif" if args.skip_vif else ""
     model_search_flag = "--model_search" if args.model_search else "--no-model_search"
+    cache_export_flag = " --export_window_cache" if args.export_window_cache else ""
     if not args.dry_run and "s01" not in skip_set and not dataset_has_h5_files(args.dataset_dir):
         print(f"[ERROR] no .h5 files found in dataset_dir={args.dataset_dir!r}")
         print("        Pass --dataset_dir with the real H5 directory, or use --skip s01 when reusing artifacts.")
@@ -1276,8 +1281,8 @@ def main():
             f'--stride_sec {args.stride_sec} '
             f'--skip_initial_windows {args.skip_initial_windows} '
             f'{stage2_ir_flag} '
-            f'--window_output_root window_outputs '
-            f'--export_window_cache '
+            f'--window_output_root window_outputs'
+            f'{cache_export_flag}'
         )
     elif "s06_cache" not in skip_set:
         print("(s06_cache: --no-export_window_cache skipped)")
@@ -1293,8 +1298,8 @@ def main():
             f'--stride_sec {args.stride_sec} '
             f'--skip_initial_windows {args.skip_initial_windows} '
             f'{stage2_ir_flag} '
-            f'--window_output_root window_outputs '
-            f'--export_window_cache '
+            f'--window_output_root window_outputs'
+            f'{cache_export_flag}'
         )
     elif "s06_replay_cache" not in skip_set:
         print("(s06_replay_cache: skipped)")
@@ -1310,8 +1315,7 @@ def main():
             f'--stride_sec {args.stride_sec} '
             f'--skip_initial_windows {args.skip_initial_windows} '
             f'{stage2_ir_flag} '
-            f'--window_output_root window_outputs '
-            f'--export_window_cache '
+            f'--window_output_root window_outputs'
         )
 
     # s07_post: tune the richer FP-sensitive state machine on cached windows.
@@ -1328,7 +1332,7 @@ def main():
             f'--replay_split {args.split}'
         )
     elif "s07_post" not in skip_set:
-        print("(s09_post: --no-optimize_postprocess 跳过)")
+        print("(s07_post: --no-optimize_postprocess 跳过)")
 
     # s06_xpt
     if "s06_xpt" not in skip_set and args.export_deploy:

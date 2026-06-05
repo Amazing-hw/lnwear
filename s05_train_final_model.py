@@ -58,6 +58,14 @@ def get_inner_n_jobs(default=1):
         return max(1, int(default))
 
 
+def group_split_arrays(group_df):
+    """Return sklearn-safe arrays even when pandas stores strings as pyarrow arrays."""
+    group_names = group_df["sample_name"].astype("object").to_numpy()
+    targets = group_df["target"].to_numpy()
+    stratify = targets if group_df["target"].value_counts().min() >= 2 else None
+    return group_names, stratify
+
+
 def split_valid_for_calibration_threshold(df_valid, threshold_fraction=0.5, random_state=42):
     """Split valid by sample group so calibration and threshold selection differ."""
     if "sample_name" not in df_valid.columns or "target" not in df_valid.columns:
@@ -83,17 +91,17 @@ def split_valid_for_calibration_threshold(df_valid, threshold_fraction=0.5, rand
         }
 
     test_size = float(max(0.2, min(0.8, threshold_fraction)))
-    stratify = group_df["target"] if group_df["target"].value_counts().min() >= 2 else None
+    group_names, stratify = group_split_arrays(group_df)
     try:
         calib_groups, threshold_groups = train_test_split(
-            group_df["sample_name"].values,
+            group_names,
             test_size=test_size,
             random_state=random_state,
             stratify=stratify,
         )
     except ValueError:
         calib_groups, threshold_groups = train_test_split(
-            group_df["sample_name"].values,
+            group_names,
             test_size=test_size,
             random_state=random_state,
             stratify=None,
@@ -147,17 +155,17 @@ def split_calibration_for_model_search(df_calib_pool, search_fraction=0.5, rando
         }
 
     test_size = float(max(0.2, min(0.8, search_fraction)))
-    stratify = group_df["target"] if group_df["target"].value_counts().min() >= 2 else None
+    group_names, stratify = group_split_arrays(group_df)
     try:
         calib_groups, search_groups = train_test_split(
-            group_df["sample_name"].values,
+            group_names,
             test_size=test_size,
             random_state=random_state,
             stratify=stratify,
         )
     except ValueError:
         calib_groups, search_groups = train_test_split(
-            group_df["sample_name"].values,
+            group_names,
             test_size=test_size,
             random_state=random_state,
             stratify=None,

@@ -124,18 +124,28 @@ postprocess latency:     first_worn_output_p95 <= 6s
 
 ## 快速开始
 
-完整运行（不含商用 baseline 对比）：
+主流程运行（含 XGBoost 模型搜参；不含商用 baseline 对比、逐窗 NPZ 缓存导出和 s07 后处理搜参）：
 
 ```bash
-python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --model_search
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
-这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、legacy 状态机优化参考、valid/test 逐窗缓存导出、s07 后处理状态机搜参、test 端到端评估、部署产物和部署配方导出。
+这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、legacy 状态机优化参考、test 端到端评估、部署产物和部署配方导出。
+
+逐窗 NPZ 缓存导出和 s07 后处理状态机搜参很耗时，默认不跑。需要时再显式打开：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --export_window_cache \
+  --optimize_postprocess
+```
 
 只打印命令，不执行：
 
 ```bash
-python s08_run_pipeline.py --dry_run --model_search
+python s08_run_pipeline.py --dry_run
 ```
 
 推荐先看 dry-run，确认每一步参数都符合预期。
@@ -152,14 +162,11 @@ s04                 特征筛选
 s04_search          候选特征子集搜索
 s05                 XGBoost 模型训练
 s06_opt             旧版 s06 状态机优化参考
-s06_cache           导出 valid 逐窗口 NPZ
-s06_replay_cache    导出 replay split 逐窗口 NPZ，默认 test
-s07_post            valid 搜后处理参数，并 replay test
 s06_eval            端到端部署评估
 s06_feat/s06_cb     导出部署特征脚本和部署配方
 ```
 
-默认终点是 `s06_cb`，即跑到部署配方导出后停止；商用方案对比暂不纳入默认全流程。需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
+默认终点是 `s06_cb`，即跑到部署配方导出后停止；`s06_cache/s06_replay_cache/s07_post` 和商用方案对比都暂不纳入默认全流程。需要后处理搜参时显式加 `--export_window_cache --optimize_postprocess`；需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
 
 推荐一条命令：
 
@@ -167,19 +174,17 @@ s06_feat/s06_cb     导出部署特征脚本和部署配方
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --model_search \
   --window_sec 3 \
   --stride_sec 1 \
   --skip_initial_windows 3 \
   --no-use_stage2_ir \
   --max_features 15 \
-  --postprocess_split valid \
   --split test
 ```
 
 ## 复杂度受限模型搜参
 
-模型搜参默认关闭；完整搜参全流程请在 `s08_run_pipeline.py` 上显式加 `--model_search`。建议在特征筛选方案稳定后开启，用来比较“更小/更稳的 XGBoost 参数”，而不是靠增大模型复杂度冲指标。
+模型搜参现在默认开启；如果只想快速跑固定默认 XGBoost 参数，可以在 `s08_run_pipeline.py` 上显式加 `--no-model_search`。建议在特征筛选方案稳定后保留默认搜参，用来比较“更小/更稳的 XGBoost 参数”，而不是靠增大模型复杂度冲指标。
 
 一键流水线开启示例：
 
@@ -188,7 +193,6 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 12 \
-  --model_search \
   --max_model_nodes 260 \
   --model_search_fp_cost 2.0 \
   --model_search_size_cost 0.1 \
@@ -354,6 +358,8 @@ artifacts/model_bundle.pkl
 
 ### 6. 导出逐窗口 NPZ
 
+这一步默认不在 `s08_run_pipeline.py` 主流程中执行。需要做后处理参数搜参时，可以单独运行，或在 s08 中显式加 `--export_window_cache`。
+
 ```bash
 python s06_deploy_eval.py \
   --artifact_dir artifacts \
@@ -396,6 +402,8 @@ feature_names_json
 
 ### 7. 后处理搜参与 test replay
 
+这一步默认不在 `s08_run_pipeline.py` 主流程中执行。需要时可以单独运行，或在 s08 中显式加 `--export_window_cache --optimize_postprocess`。
+
 先导出 valid 和 test 两个 split 的窗口缓存：
 
 ```bash
@@ -436,8 +444,7 @@ python s06_deploy_eval.py \
   --method state_machine \
   --window_sec 3 \
   --stride_sec 1 \
-  --skip_initial_windows 3 \
-  --export_window_cache
+  --skip_initial_windows 3
 ```
 
 主要输出：
@@ -505,7 +512,7 @@ artifacts/commercial_compare/
 2. 如果 FP 高，优先看 hard negatives 和 FP proxy 特征；非佩戴误触比 FN 更敏感。
 3. 如果 FN 高，检查正样本召回低的窗口是否来自 Stage1 过严、低质量窗口或特定特征缺失。
 4. 如果 train 高 valid 低，优先检查 split 泄漏、特征漂移和过拟合特征。
-5. 特征筛选稳定后，再开启 `--model_search` 做复杂度受限参数比较。
+5. 特征筛选稳定后，保留默认模型搜参做复杂度受限参数比较；需要快速排查流程时再临时加 `--no-model_search`。
 6. 单窗达标后，再运行 `s07` 搜后处理，不要用状态机掩盖单窗模型问题。
 
 更详细的特征优化计划见：
