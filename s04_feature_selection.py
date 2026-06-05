@@ -178,7 +178,14 @@ except ImportError:
     print("Warning: shap not installed, skipping SHAP importance")
 
 
-META_COLS = ["sample_name", "h5_file", "target", "start_100hz"]
+META_COLS = [
+    "sample_name",
+    "h5_file",
+    "target",
+    "start_100hz",
+    "window_index",
+    "mode",
+]
 
 
 FEATURE_GROUPS = {

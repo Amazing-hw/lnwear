@@ -3,6 +3,7 @@ import h5py
 
 import s01_data_split as s01
 import s03_extract_feature_pool as s03
+import s04_feature_selection as s04
 import s06_deploy_eval as s06
 
 
@@ -282,3 +283,19 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
     assert result["window_end_sec"] == [23.0]
     assert result["window_indices"] == [20]
     assert result["window_targets"] == [1]
+
+
+def test_s04_excludes_window_metadata_from_feature_candidates():
+    import pandas as pd
+
+    df = pd.DataFrame({
+        "sample_name": ["a", "b"],
+        "h5_file": ["a.h5", "b.h5"],
+        "target": [0, 1],
+        "start_100hz": [0, 100],
+        "window_index": [0, 1],
+        "mode": [1, 1],
+        "GREEN_CORR": [0.1, 0.9],
+    })
+
+    assert s04.get_feature_cols(df) == ["GREEN_CORR"]
