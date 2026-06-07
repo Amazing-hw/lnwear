@@ -458,6 +458,27 @@ def build_model_search_grid(args, scale_pos_weight=1.0):
     return grid
 
 
+def is_default_xgb_params(params):
+    default = build_default_xgb_params(scale_pos_weight=params.get("scale_pos_weight", 1.0))
+    keys = [
+        "n_estimators", "max_depth", "learning_rate", "subsample",
+        "colsample_bytree", "min_child_weight", "reg_lambda", "reg_alpha",
+        "objective", "eval_metric", "random_state", "scale_pos_weight",
+    ]
+    for key in keys:
+        if key not in params:
+            return False
+        left = params[key]
+        right = default[key]
+        if isinstance(right, float):
+            if not np.isclose(float(left), float(right)):
+                return False
+        else:
+            if left != right:
+                return False
+    return True
+
+
 def count_xgb_nodes(model):
     booster = model.get_booster()
     tree_dumps = booster.get_dump()
@@ -502,6 +523,105 @@ def score_model_search_candidate(metrics, total_nodes, max_model_nodes=400,
     }
 
 
+def evaluate_accuracy_first_threshold(model, X, y):
+    probs = model.predict_proba(X)[:, 1]
+    best = None
+    best_key = None
+    for threshold in np.linspace(0.05, 0.95, 181):
+        pred = (probs >= threshold).astype(int)
+        accuracy = float(accuracy_score(y, pred))
+        precision = float(precision_score(y, pred, zero_division=0))
+        recall = float(recall_score(y, pred, zero_division=0))
+        f1 = float(f1_score(y, pred, zero_division=0))
+        tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+        fp_rate = float(fp) / float(max(tn + fp, 1))
+        item = {
+            "threshold": float(threshold),
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "fp_rate": fp_rate,
+            "confusion_matrix": {
+                "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)
+            },
+        }
+        key = (accuracy, -fp_rate, f1, precision, recall)
+        if best_key is None or key > best_key:
+            best = item
+            best_key = key
+    try:
+        best["auc"] = float(roc_auc_score(y, probs))
+    except Exception:
+        best["auc"] = None
+    return best
+
+
+def choose_accuracy_first_model_search_record(records, accuracy_tolerance=0.0):
+    eligible = [r for r in records if r.get("eligible")]
+    if not eligible:
+        return None
+    tolerance = max(0.0, float(accuracy_tolerance))
+    best_accuracy = max(float(r.get("selection_accuracy", 0.0)) for r in eligible)
+    candidates = [
+        r for r in eligible
+        if float(r.get("selection_accuracy", 0.0)) >= best_accuracy - tolerance
+    ]
+    chosen = min(
+        candidates,
+        key=lambda r: (
+            int(r.get("total_nodes", 0)),
+            float(r.get("selection_fp_rate", 1.0)),
+            -float(r.get("selection_accuracy", 0.0)),
+            not bool(r.get("is_default_params", False)),
+            int(r.get("rank_input_order", 0)),
+        ),
+    )
+    chosen["chosen_reason"] = (
+        "within_accuracy_tolerance_smallest_model"
+        if float(chosen.get("selection_accuracy", 0.0)) < best_accuracy
+        else "max_accuracy"
+    )
+    return chosen
+
+
+def build_model_search_result_rows(model_search_records):
+    rows = []
+    for r in model_search_records:
+        row = {
+            "rank_input_order": int(r["rank_input_order"]),
+            "eligible": bool(r["eligible"]),
+            "score": _json_safe_float(r["score"]),
+            "fp_rate": _json_safe_float(r["fp_rate"]),
+            "size_ratio": _json_safe_float(r["size_ratio"]),
+            "total_nodes": int(r["total_nodes"]),
+            "avg_nodes_per_tree": _json_safe_float(r["avg_nodes_per_tree"]),
+            "selection_threshold": _json_safe_float(r.get("selection_threshold", 0.5)),
+            "selection_accuracy": _json_safe_float(r.get("selection_accuracy", 0.0)),
+            "selection_fp_rate": _json_safe_float(r.get("selection_fp_rate", r.get("fp_rate", 0.0))),
+            "is_default_params": bool(r.get("is_default_params", False)),
+            "chosen_reason": str(r.get("chosen_reason", "")),
+        }
+        for name, value in (r.get("metrics") or {}).items():
+            if name == "confusion_matrix":
+                cm = value or {}
+                for cm_key in ["TN", "FP", "FN", "TP"]:
+                    row[f"cm_{cm_key}"] = int(cm.get(cm_key, 0))
+            else:
+                row[f"metric_{name}"] = _json_safe_float(value) if value is not None else None
+        for name, value in (r.get("selection_metrics") or {}).items():
+            if name == "confusion_matrix":
+                cm = value or {}
+                for cm_key in ["TN", "FP", "FN", "TP"]:
+                    row[f"selection_cm_{cm_key}"] = int(cm.get(cm_key, 0))
+            elif name not in {"threshold", "accuracy", "fp_rate"}:
+                row[f"selection_metric_{name}"] = _json_safe_float(value) if value is not None else None
+        for name, value in (r.get("params") or {}).items():
+            row[f"param_{name}"] = value
+        rows.append(row)
+    return rows
+
+
 def _json_safe_float(value):
     value = float(value)
     if not np.isfinite(value):
@@ -515,6 +635,11 @@ def _json_safe_model_search_record(record):
     out["fp_rate"] = _json_safe_float(out["fp_rate"])
     out["size_ratio"] = _json_safe_float(out["size_ratio"])
     out["avg_nodes_per_tree"] = _json_safe_float(out["avg_nodes_per_tree"])
+    out["selection_threshold"] = _json_safe_float(out.get("selection_threshold", 0.5))
+    out["selection_accuracy"] = _json_safe_float(out.get("selection_accuracy", 0.0))
+    out["selection_fp_rate"] = _json_safe_float(out.get("selection_fp_rate", out["fp_rate"]))
+    out["is_default_params"] = bool(out.get("is_default_params", False))
+    out["chosen_reason"] = str(out.get("chosen_reason", ""))
     return out
 
 
@@ -530,15 +655,15 @@ def search_xgb_hyperparameters(args, X_train, y_train, X_select, y_select,
                                scale_pos_weight=1.0):
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
     records = []
-    best = None
-    best_model = None
+    models = []
     logger.info("model_search enabled: evaluating %d XGBoost candidates", len(grid))
     for idx, params in enumerate(grid, 1):
         candidate = train_xgb_with_params(params, X_train, y_train)
         metrics = eval_model(candidate, X_select, y_select, threshold=0.5)
+        selection_metrics = evaluate_accuracy_first_threshold(candidate, X_select, y_select)
         total_nodes = count_xgb_nodes(candidate)
         score = score_model_search_candidate(
-            metrics,
+            selection_metrics,
             total_nodes=total_nodes,
             max_model_nodes=args.max_model_nodes,
             fp_cost=args.model_search_fp_cost,
@@ -552,27 +677,44 @@ def search_xgb_hyperparameters(args, X_train, y_train, X_select, y_select,
             "size_ratio": float(score["size_ratio"]),
             "total_nodes": int(total_nodes),
             "avg_nodes_per_tree": float(total_nodes) / float(max(int(params["n_estimators"]), 1)),
+            "selection_threshold": float(selection_metrics["threshold"]),
+            "selection_accuracy": float(selection_metrics["accuracy"]),
+            "selection_fp_rate": float(selection_metrics["fp_rate"]),
+            "selection_metrics": selection_metrics,
+            "is_default_params": bool(is_default_xgb_params(params)),
+            "chosen_reason": "",
             "metrics": metrics,
             "params": params,
         }
         records.append(record)
-        if score["eligible"] and (best is None or score["score"] > best["score"]):
-            best = record
-            best_model = candidate
+        models.append(candidate)
 
-    if best_model is None:
+    best = choose_accuracy_first_model_search_record(
+        records,
+        accuracy_tolerance=args.model_search_accuracy_tolerance,
+    )
+    if best is None:
         raise RuntimeError(
             f"model_search found no candidate under max_model_nodes={args.max_model_nodes}. "
             "Relax --max_model_nodes or shrink the search grid."
         )
+    best_index = int(best["rank_input_order"]) - 1
+    best_model = models[best_index]
 
-    records.sort(key=lambda r: (not r["eligible"], -r["score"], r["total_nodes"]))
+    records.sort(key=lambda r: (
+        not r["eligible"],
+        -float(r.get("selection_accuracy", 0.0)),
+        int(r.get("total_nodes", 0)),
+        float(r.get("selection_fp_rate", 1.0)),
+    ))
     return best_model, {
         "enabled": True,
         "selection_data": "valid_model_selection_split",
         "max_model_nodes": int(args.max_model_nodes),
         "fp_cost": float(args.model_search_fp_cost),
         "size_cost": float(args.model_search_size_cost),
+        "accuracy_tolerance": float(args.model_search_accuracy_tolerance),
+        "selection_policy": "accuracy_first_size_second",
         "grid_size": int(len(grid)),
         "best": _json_safe_model_search_record(best),
         "top_candidates": [_json_safe_model_search_record(r) for r in records[:20]],
@@ -822,6 +964,8 @@ def main(args=None):
                         help="FP penalty in model-search score: accuracy - fp_cost*fp_rate - size_cost*size_ratio")
     parser.add_argument("--model_search_size_cost", type=float, default=0.1,
                         help="model-size penalty in model-search score")
+    parser.add_argument("--model_search_accuracy_tolerance", type=float, default=0.0,
+                        help="accuracy gap allowed when preferring a smaller model in --model_search; default 0.0 means accuracy strictly wins under the node budget")
     parser.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                         help="fraction of the valid calibration pool reserved for model-search selection")
     parser.add_argument("--model_search_n_estimators", type=str, default="20,30,40",
@@ -1098,30 +1242,10 @@ def main(args=None):
     model_search_results_path = None
     if model_search_records:
         model_search_results_path = os.path.join(args.artifact_dir, "model_search_results.csv")
-        rows = []
-        for r in model_search_records:
-            row = {
-                "rank_input_order": int(r["rank_input_order"]),
-                "eligible": bool(r["eligible"]),
-                "score": _json_safe_float(r["score"]),
-                "fp_rate": _json_safe_float(r["fp_rate"]),
-                "size_ratio": _json_safe_float(r["size_ratio"]),
-                "total_nodes": int(r["total_nodes"]),
-                "avg_nodes_per_tree": _json_safe_float(r["avg_nodes_per_tree"]),
-            }
-            for name, value in r["metrics"].items():
-                if name == "confusion_matrix":
-                    cm = value or {}
-                    for cm_key in ["TN", "FP", "FN", "TP"]:
-                        row[f"cm_{cm_key}"] = int(cm.get(cm_key, 0))
-                else:
-                    row[f"metric_{name}"] = _json_safe_float(value) if value is not None else None
-            for name, value in r["params"].items():
-                row[f"param_{name}"] = value
-            rows.append(row)
+        rows = build_model_search_result_rows(model_search_records)
         pd.DataFrame(rows).sort_values(
-            by=["eligible", "score", "total_nodes"],
-            ascending=[False, False, True],
+            by=["eligible", "selection_accuracy", "total_nodes", "selection_fp_rate"],
+            ascending=[False, False, True, True],
         ).to_csv(model_search_results_path, index=False)
         model_search_summary["results_path"] = model_search_results_path
 

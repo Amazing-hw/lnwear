@@ -130,9 +130,18 @@ postprocess latency:     first_worn_output_p95 <= 6s
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
-这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、legacy 状态机优化参考、test 端到端评估、部署产物和部署配方导出。
+这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、test 端到端评估、部署产物和部署配方导出。
 
-逐窗 NPZ 缓存导出和 s07 后处理状态机搜参很耗时，默认不跑。需要时再显式打开：
+legacy s06 状态机优化、逐窗 NPZ 缓存导出和 s07 后处理状态机搜参很耗时，默认不跑。需要时再显式打开：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --optimize
+```
+
+或：
 
 ```bash
 python s08_run_pipeline.py \
@@ -161,12 +170,12 @@ s03                 Stage2 特征池提取
 s04                 特征筛选
 s04_search          候选特征子集搜索
 s05                 XGBoost 模型训练
-s06_opt             旧版 s06 状态机优化参考
+s06_opt             旧版 s06 状态机优化参考（默认不跑；需 --optimize）
 s06_eval            端到端部署评估
 s06_feat/s06_cb     导出部署特征脚本和部署配方
 ```
 
-默认终点是 `s06_cb`，即跑到部署配方导出后停止；`s06_cache/s06_replay_cache/s07_post` 和商用方案对比都暂不纳入默认全流程。需要后处理搜参时显式加 `--export_window_cache --optimize_postprocess`；需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
+默认终点是 `s06_cb`，即跑到部署配方导出后停止；`s06_opt/s06_cache/s06_replay_cache/s07_post` 和商用方案对比都暂不纳入默认全流程。需要 legacy s06 状态机优化时显式加 `--optimize`；需要后处理搜参时显式加 `--export_window_cache --optimize_postprocess`；需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
 
 推荐一条命令：
 
@@ -196,6 +205,7 @@ python s08_run_pipeline.py \
   --max_model_nodes 260 \
   --model_search_fp_cost 2.0 \
   --model_search_size_cost 0.1 \
+  --model_search_accuracy_tolerance 0.0 \
   --model_search_valid_fraction 0.5 \
   --model_search_n_estimators 20,30 \
   --model_search_max_depth 2,3 \
@@ -207,14 +217,16 @@ python s08_run_pipeline.py \
   --model_search_colsample_bytree 0.7,0.8
 ```
 
-搜参评分：
+搜参选择策略：
 
 ```text
-score = window_accuracy - fp_cost * window_fp_rate - size_cost * size_ratio
-size_ratio = total_nodes / max_model_nodes
+1. 每个候选 XGBoost 在 valid_model_selection_split 上扫窗口阈值。
+2. 先找最高 selection_accuracy。
+3. 默认 `model_search_accuracy_tolerance=0.0`，即在节点预算内严格选择窗口 accuracy 最高的模型。
+4. max_model_nodes 仍是硬约束；超过预算的候选不会被选中。
 ```
 
-超过 `--max_model_nodes` 的候选会被过滤。完整候选结果写入：
+如果想在窗口准确率几乎不变时优先更小模型，可以手动设置 `model_search_accuracy_tolerance=0.002`，表示允许最多低 0.2% 的窗口 accuracy 来换更少节点。完整候选结果写入：
 
 ```text
 artifacts/model_search_results.csv

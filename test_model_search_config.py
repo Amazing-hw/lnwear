@@ -116,6 +116,116 @@ def test_model_search_score_penalizes_fp_and_oversized_models():
     assert oversized["score"] == float("-inf")
 
 
+def test_accuracy_first_model_search_prefers_smaller_model_within_tolerance():
+    records = [
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9820,
+            "selection_fp_rate": 0.02,
+            "total_nodes": 390,
+            "is_default_params": False,
+        },
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9805,
+            "selection_fp_rate": 0.02,
+            "total_nodes": 180,
+            "is_default_params": False,
+        },
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9760,
+            "selection_fp_rate": 0.0,
+            "total_nodes": 80,
+            "is_default_params": False,
+        },
+    ]
+
+    chosen = s05.choose_accuracy_first_model_search_record(records, accuracy_tolerance=0.002)
+
+    assert chosen["selection_accuracy"] == 0.9805
+    assert chosen["total_nodes"] == 180
+    assert chosen["chosen_reason"] == "within_accuracy_tolerance_smallest_model"
+
+
+def test_accuracy_first_model_search_default_strictly_prefers_best_accuracy():
+    records = [
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9820,
+            "selection_fp_rate": 0.02,
+            "total_nodes": 390,
+            "is_default_params": False,
+        },
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9805,
+            "selection_fp_rate": 0.02,
+            "total_nodes": 180,
+            "is_default_params": False,
+        },
+    ]
+
+    chosen = s05.choose_accuracy_first_model_search_record(records)
+
+    assert chosen["selection_accuracy"] == 0.9820
+    assert chosen["total_nodes"] == 390
+    assert chosen["chosen_reason"] == "max_accuracy"
+
+
+def test_accuracy_first_model_search_keeps_default_when_smaller_model_is_worse():
+    records = [
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9810,
+            "selection_fp_rate": 0.03,
+            "total_nodes": 360,
+            "is_default_params": True,
+        },
+        {
+            "eligible": True,
+            "selection_accuracy": 0.9760,
+            "selection_fp_rate": 0.01,
+            "total_nodes": 90,
+            "is_default_params": False,
+        },
+    ]
+
+    chosen = s05.choose_accuracy_first_model_search_record(records, accuracy_tolerance=0.002)
+
+    assert chosen["is_default_params"] is True
+    assert chosen["selection_accuracy"] == 0.9810
+    assert chosen["chosen_reason"] == "max_accuracy"
+
+
+def test_model_search_result_rows_include_accuracy_first_fields():
+    rows = s05.build_model_search_result_rows([
+        {
+            "rank_input_order": 1,
+            "eligible": True,
+            "score": 0.98,
+            "fp_rate": 0.02,
+            "size_ratio": 0.5,
+            "total_nodes": 200,
+            "avg_nodes_per_tree": 5.0,
+            "selection_threshold": 0.42,
+            "selection_accuracy": 0.981,
+            "selection_fp_rate": 0.01,
+            "chosen_reason": "max_accuracy",
+            "is_default_params": True,
+            "metrics": {"accuracy": 0.9, "confusion_matrix": {"TN": 9, "FP": 1, "FN": 0, "TP": 10}},
+            "selection_metrics": {"precision": 0.95, "recall": 1.0},
+            "params": {"n_estimators": 40},
+        }
+    ])
+
+    assert rows[0]["selection_threshold"] == 0.42
+    assert rows[0]["selection_accuracy"] == 0.981
+    assert rows[0]["selection_fp_rate"] == 0.01
+    assert rows[0]["is_default_params"] is True
+    assert rows[0]["chosen_reason"] == "max_accuracy"
+
+
 def test_s08_dry_run_exposes_model_search_params_to_s05():
     result = subprocess.run(
         [
@@ -157,6 +267,8 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
     assert " --model_search " in output
     assert "--no-model_search" not in output
     assert "--max_model_nodes 260" in output
+    assert "--model_search_accuracy_tolerance 0.0 " in output
+    assert "--model_search_accuracy_tolerance 0.002 " not in output
     assert '--model_search_n_estimators "20,30"' in output
     assert '--model_search_max_depth "2"' in output
     assert '--model_search_colsample_bytree "0.7,0.8"' in output
@@ -177,6 +289,7 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
 
     output = result.stdout + result.stderr
     assert " --model_search " in output
+    assert " --optimize " not in output
     assert "s07_postprocess_optimize.py" not in output
     assert "--export_window_cache" not in output
     assert "s09_commercial_compare.py" not in output
