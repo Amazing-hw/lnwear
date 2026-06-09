@@ -439,6 +439,48 @@ feature_names_json
 
 这一步默认不在 `s08_run_pipeline.py` 主流程中执行。需要时可以单独运行，或在 s08 中显式加 `--export_window_cache --optimize_postprocess`。
 
+如果已经完成主流程或已经开启 `model_search` 训练好了当前模型，后续只想基于当前 `artifacts` 导出逐窗口 NPZ 并做后处理搜参，推荐直接复用已有模型产物，不重跑 `s01-s05`：
+
+```bash
+python s08_run_pipeline.py \
+  --artifact_dir artifacts \
+  --skip s01,s02,s03,s04,s04_search,s05 \
+  --export_window_cache \
+  --optimize_postprocess \
+  --postprocess_split valid \
+  --split test \
+  --stop_after s07_post
+```
+
+这条命令的实际执行顺序是：
+
+```text
+s06_cache         使用当前 model_bundle.pkl 导出 valid 逐窗口 NPZ
+s06_replay_cache  使用同一个模型导出 test 逐窗口 NPZ
+s07_post          在 valid 缓存上搜索后处理参数，并在 test 缓存上 replay
+```
+
+它会复用当前目录下的模型和配置，例如：
+
+```text
+artifacts/model_bundle.pkl
+artifacts/final_model_config.json
+artifacts/stage1_threshold.json
+artifacts/selected_features.json
+```
+
+输出包括：
+
+```text
+artifacts/window_outputs/valid/
+artifacts/window_outputs/test/
+artifacts/postprocess_opt/postprocess_optimized.json
+artifacts/postprocess_opt/postprocess_search_results.csv
+artifacts/postprocess_opt/postprocess_replay_valid_to_test.json
+```
+
+注意：如果训练主流程使用过非默认参数，例如 `--use_stage2_ir`、不同的 `--window_sec`、`--stride_sec` 或 `--skip_initial_windows`，这里必须保持一致。当前默认是 `--no-use_stage2_ir`、`window_sec=3`、`stride_sec=1`、`skip_initial_windows=3`。
+
 先导出 valid 和 test 两个 split 的窗口缓存：
 
 ```bash
