@@ -50,6 +50,9 @@ new_codex/
 
   s09_commercial_compare.py
     当前项目方案与商业 AdaBoost baseline 对比。
+
+  s10_generalization_audit.py
+    只读取已有评估 artifacts，汇总窗口级、样本级、分层和 hard-negative 诊断，输出商用泛化审计报告。
 ```
 
 ## 数据要求
@@ -124,7 +127,7 @@ postprocess latency:     first_worn_output_p95 <= 6s
 
 ## 快速开始
 
-主流程运行（含 XGBoost 模型搜参；不含商用 baseline 对比、逐窗 NPZ 缓存导出和 s07 后处理搜参）：
+主流程运行（含 XGBoost 模型搜参；不含商用 baseline 对比、逐窗 NPZ 缓存导出、s07 后处理搜参和 s10 泛化审计）：
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
@@ -151,6 +154,16 @@ python s08_run_pipeline.py \
   --optimize_postprocess
 ```
 
+泛化审计只读取已有评估产物，不重新训练模型。需要做商用部署诊断时显式打开：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --run_generalization_audit \
+  --stop_after s10_audit
+```
+
 只打印命令，不执行：
 
 ```bash
@@ -172,10 +185,14 @@ s04_search          候选特征子集搜索
 s05                 XGBoost 模型训练
 s06_opt             旧版 s06 状态机优化参考（默认不跑；需 --optimize）
 s06_eval            端到端部署评估
+s10_audit           商用泛化审计（默认不跑；需 --run_generalization_audit）
+s06_xpt             导出部署产物
 s06_feat/s06_cb     导出部署特征脚本和部署配方
 ```
 
-默认终点是 `s06_cb`，即跑到部署配方导出后停止；`s06_opt/s06_cache/s06_replay_cache/s07_post` 和商用方案对比都暂不纳入默认全流程。需要 legacy s06 状态机优化时显式加 `--optimize`；需要后处理搜参时显式加 `--export_window_cache --optimize_postprocess`；需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
+默认终点是 `s06_cb`，即跑到部署配方导出后停止；`s06_opt/s06_cache/s06_replay_cache/s07_post/s10_audit` 和商用方案对比都暂不纳入默认全流程。需要 legacy s06 状态机优化时显式加 `--optimize`；需要后处理搜参时显式加 `--export_window_cache --optimize_postprocess`；需要泛化审计时显式加 `--run_generalization_audit --stop_after s10_audit`；需要商业 baseline 对比时，再显式加 `--commercial_compare --stop_after s09_cmp`。
+
+如果 `--stop_after` 直接指向可选步骤，例如 `s07_post`、`s09_cmp` 或 `s10_audit`，`s08` 会把该目标视为显式请求，并自动打开必要前置步骤；默认不带这些 stop target 时仍保持精简主流程。
 
 推荐一条命令：
 
@@ -193,7 +210,7 @@ python s08_run_pipeline.py \
 
 ## 复杂度受限模型搜参
 
-模型搜参现在默认开启；如果只想快速跑固定默认 XGBoost 参数，可以在 `s08_run_pipeline.py` 上显式加 `--no-model_search`。建议在特征筛选方案稳定后保留默认搜参，用来比较“更小/更稳的 XGBoost 参数”，而不是靠增大模型复杂度冲指标。
+模型搜参现在默认开启；如果只想快速跑固定默认 XGBoost 参数，可以在 `s08_run_pipeline.py` 上显式加 `--no-model_search`。默认策略是 `staged_group_cv`：只把 `total_nodes <= max_model_nodes` 作为硬约束，在预算内用 train 内部 group CV 选择窗口级泛化性能最稳的模型。
 
 一键流水线开启示例：
 
@@ -203,27 +220,33 @@ python s08_run_pipeline.py \
   --artifact_dir artifacts \
   --max_features 12 \
   --max_model_nodes 260 \
+  --model_search_strategy staged_group_cv \
+  --model_search_max_candidates 600 \
+  --model_search_stage2_top_k 80 \
+  --model_search_cv_folds 3 \
+  --model_search_cv_repeats 2 \
+  --model_search_random_state 42 \
   --model_search_fp_cost 2.0 \
   --model_search_size_cost 0.1 \
   --model_search_accuracy_tolerance 0.0 \
-  --model_search_valid_fraction 0.5 \
-  --model_search_n_estimators 20,30 \
-  --model_search_max_depth 2,3 \
-  --model_search_learning_rate 0.03,0.05 \
-  --model_search_min_child_weight 30,50 \
-  --model_search_reg_lambda 10,20 \
-  --model_search_reg_alpha 1,2 \
-  --model_search_subsample 0.7,0.8 \
-  --model_search_colsample_bytree 0.7,0.8
+  --model_search_n_estimators 20,25,30,35,40,45,50,55,60,70,80 \
+  --model_search_max_depth 2,3,4 \
+  --model_search_learning_rate 0.025,0.03,0.04,0.05,0.06,0.08,0.10 \
+  --model_search_min_child_weight 10,15,20,25,30,40,50 \
+  --model_search_reg_lambda 5,8,10,12,16,20,30 \
+  --model_search_reg_alpha 0,0.5,1,1.5,2,3 \
+  --model_search_subsample 0.70,0.75,0.80,0.85,0.90 \
+  --model_search_colsample_bytree 0.70,0.75,0.80,0.85,0.90
 ```
 
 搜参选择策略：
 
 ```text
-1. 每个候选 XGBoost 在 valid_model_selection_split 上扫窗口阈值。
-2. 先找最高 selection_accuracy。
-3. 默认 `model_search_accuracy_tolerance=0.0`，即在节点预算内严格选择窗口 accuracy 最高的模型。
-4. max_model_nodes 仍是硬约束；超过预算的候选不会被选中。
+1. 从细粒度参数空间中按固定 random_state 抽样，默认最多 600 个候选。
+2. Stage A 在 train 内部 group split 上预筛，保留 top 80，并强制加入固定默认参数 baseline。
+3. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选，每个 fold 内扫窗口阈值。
+4. 在 `max_model_nodes` 预算内按 mean_cv_accuracy、std_cv_accuracy、mean_cv_fp_rate、final_total_nodes 排序。
+5. 默认 `model_search_accuracy_tolerance=0.0`，即不主动牺牲窗口 accuracy 换更小模型。
 ```
 
 如果想在窗口准确率几乎不变时优先更小模型，可以手动设置 `model_search_accuracy_tolerance=0.002`，表示允许最多低 0.2% 的窗口 accuracy 来换更少节点。完整候选结果写入：
@@ -470,7 +493,41 @@ artifacts/window_error_analysis_test_state_machine.json
 artifacts/per_sample_summary.csv
 ```
 
-### 9. 商业 baseline 对比
+### 9. 泛化审计
+
+这一步只读取已有 artifacts，不重新训练模型，也不改变模型或阈值。建议在准备商用部署或发现 test 表现异常时运行：
+
+```bash
+python s10_generalization_audit.py \
+  --artifact_dir artifacts \
+  --split test \
+  --method state_machine \
+  --min_support 10
+```
+
+也可以通过 `s08` 在 `s06_eval` 后自动接上：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --run_generalization_audit \
+  --stop_after s10_audit
+```
+
+输出：
+
+```text
+artifacts/generalization_audit/summary.json
+artifacts/generalization_audit/summary.md
+artifacts/generalization_audit/window_strata.csv
+artifacts/generalization_audit/sample_strata.csv
+artifacts/generalization_audit/action_items.csv
+```
+
+审计会汇总窗口级 accuracy/precision/recall/FP rate/FN rate、样本级 false-worn event rate、positive sample first-worn latency P50/P95，并按 `mode/h5_file/sample_name/record/window_index/time_bin/quality_bin/ood_bin` 分层；如果存在 `subject_id/device_id/session_id`，也会自动纳入分层。小样本分层会标记 `low_support`，避免被少量样本误导。
+
+### 10. 商业 baseline 对比
 
 ```bash
 python s09_commercial_compare.py \
@@ -499,7 +556,10 @@ artifacts/commercial_compare/
 3. **Stage2 单窗能力**  
    看 `end_to_end_eval_*` 里的 `window_model_summary`。这是模型窗口级能力，不看状态机。
 
-4. **窗口错误分层报告**  
+4. **泛化审计汇总**
+   看 `generalization_audit/summary.md` 和 `generalization_audit/action_items.csv`。这里会把 Stage2 单窗、端到端状态机、hard negatives、mode、H5/record、时间位置、quality/OOD 分层放在一起，优先判断性能掉点来自模型、数据、阈值还是状态机。
+
+5. **窗口错误分层报告**
    看 `window_error_analysis_*`：
    - `error_type`：FP/FN 集中情况。
    - `prob_bin`：高置信 FP 或低置信 FN。
@@ -507,14 +567,24 @@ artifacts/commercial_compare/
    - `mode`：是否某个硬件通道模式拖累。
    - `ood_bin` / `quality_bin`：是否来自低质量或分布外窗口。
 
-5. **hard negatives**  
+6. **hard negatives**
    看 `hard_negatives_*`。非佩戴误识别为佩戴是敏感错误，应优先处理高置信 FP。
 
-6. **后处理 valid/test 分离**  
+7. **后处理 valid/test 分离**
    看 `postprocess_replay_valid_to_test.json`。valid 上选参数，test 上只复验，不参与选择。
 
-7. **商业 baseline 对比**  
+8. **商业 baseline 对比**
    看 `commercial_compare/`，确认当前方案相对 5s/1s AdaBoost baseline 的收益和代价。
+
+## 商用性能优化路线
+
+第一优先级是泛化审计。先运行 `s10_generalization_audit.py`，确认当前指标是否代表真实部署：看 FP/FN 是否集中在某个 `mode`、H5/record、人/设备/session、低质量/OOD、早期窗口或 hard negatives。没有这个结论时，不建议继续盲目扩大模型或状态机搜参。
+
+第二优先级是 hard negative 数据闭环和特征增强。如果 FP 集中在 hard negatives，优先补负样本、增强 FP proxy 特征和质量/OOD 特征；如果 FN 集中在低质量或 OOD，优先补对应正样本场景，或加强 Stage1/quality gating。
+
+第三优先级是校准、阈值和状态机约束优化。窗口级能力稳定后，再调整概率校准、单窗阈值、state-machine 连续窗口确认、释放条件和延迟约束，避免用状态机掩盖模型本身的问题。
+
+第四优先级是端侧一致性和上线监控。部署前固定 golden vectors，确认端侧特征、阈值、IR 使用策略、窗口排序和 skip 前 3 个窗口与训练评估完全一致；上线后记录 mode/quality/OOD/hard-negative 触发分布，监控数据漂移。
 
 ## 98% 单窗目标的排查路径
 
@@ -569,6 +639,13 @@ artifacts/
   window_error_analysis_{split}_{method}.csv
   window_error_analysis_{split}_{method}.json
 
+  generalization_audit/
+    summary.json
+    summary.md
+    window_strata.csv
+    sample_strata.csv
+    action_items.csv
+
   deploy_package/
   deploy_cookbook.json
   deploy_xgboost.json
@@ -583,13 +660,13 @@ artifacts/
 语法检查：
 
 ```bash
-python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py
+python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py s10_generalization_audit.py
 ```
 
 运行测试：
 
 ```bash
-python -B -m pytest D:\wearing_liveness\new\tests .\test_model_search_config.py .\test_window_error_reports.py -q --rootdir D:\wearing_liveness\new\new_codex --basetemp .\.pytest_tmp_all -o cache_dir=.pytest_cache_all
+python -B -m pytest D:\wearing_liveness\new\tests .\test_model_search_config.py .\test_window_error_reports.py .\test_generalization_audit.py -q --rootdir D:\wearing_liveness\new\new_codex --basetemp .\.pytest_tmp_all -o cache_dir=.pytest_cache_all
 ```
 
 如果直接从上级目录跑 pytest，在某些 Windows 权限环境里可能会因为默认 Temp 或 `.pytest_cache` 权限导致退出阶段异常。上面的命令把 rootdir、basetemp 和 cache_dir 都固定到当前项目目录，比较稳。

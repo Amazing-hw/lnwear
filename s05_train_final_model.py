@@ -28,7 +28,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, confusion_matrix
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, StratifiedKFold, StratifiedGroupKFold, train_test_split
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -48,6 +48,32 @@ DEFAULT_XGB_PARAMS = {
     "eval_metric": "logloss",
     "random_state": 42,
 }
+
+MODEL_SEARCH_PARAM_KEYS = [
+    "n_estimators",
+    "max_depth",
+    "learning_rate",
+    "subsample",
+    "colsample_bytree",
+    "min_child_weight",
+    "reg_lambda",
+    "reg_alpha",
+]
+
+DEFAULT_MODEL_SEARCH_SPACE = {
+    "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80],
+    "max_depth": [2, 3, 4],
+    "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
+    "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
+    "reg_lambda": [5, 8, 10, 12, 16, 20, 30],
+    "reg_alpha": [0, 0.5, 1, 1.5, 2, 3],
+    "subsample": [0.70, 0.75, 0.80, 0.85, 0.90],
+    "colsample_bytree": [0.70, 0.75, 0.80, 0.85, 0.90],
+}
+
+
+def _model_search_default_csv(name):
+    return ",".join(str(v) for v in DEFAULT_MODEL_SEARCH_SPACE[name])
 
 
 def get_inner_n_jobs(default=1):
@@ -430,8 +456,8 @@ def build_default_xgb_params(scale_pos_weight=1.0):
     return params
 
 
-def build_model_search_grid(args, scale_pos_weight=1.0):
-    axes = {
+def build_model_search_axes(args):
+    return {
         "n_estimators": parse_model_search_values(
             args.model_search_n_estimators, int, "model_search_n_estimators"),
         "max_depth": parse_model_search_values(
@@ -449,13 +475,89 @@ def build_model_search_grid(args, scale_pos_weight=1.0):
         "reg_alpha": parse_model_search_values(
             args.model_search_reg_alpha, float, "model_search_reg_alpha"),
     }
-    grid = []
+
+
+def _model_search_combo_count(axes):
+    total = 1
+    for values in axes.values():
+        total *= len(values)
+    return int(total)
+
+
+def _params_identity(params):
+    ident = []
+    for key in MODEL_SEARCH_PARAM_KEYS + ["scale_pos_weight"]:
+        value = params.get(key)
+        if isinstance(value, float):
+            ident.append((key, round(float(value), 12)))
+        else:
+            ident.append((key, value))
+    return tuple(ident)
+
+
+def _params_from_combo_index(axes, index, scale_pos_weight=1.0):
+    params = build_default_xgb_params(scale_pos_weight=scale_pos_weight)
     keys = list(axes.keys())
-    for values in product(*(axes[k] for k in keys)):
-        params = build_default_xgb_params(scale_pos_weight=scale_pos_weight)
-        params.update(dict(zip(keys, values)))
-        grid.append(params)
-    return grid
+    idx = int(index)
+    chosen = {}
+    for key in reversed(keys):
+        values = axes[key]
+        chosen[key] = values[idx % len(values)]
+        idx //= len(values)
+    params.update({key: chosen[key] for key in keys})
+    return params
+
+
+def _dedupe_model_search_grid(grid):
+    seen = set()
+    out = []
+    for params in grid:
+        ident = _params_identity(params)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(params)
+    return out
+
+
+def _ensure_default_params_in_grid(grid, scale_pos_weight=1.0, max_candidates=0):
+    if any(is_default_xgb_params(params) for params in grid):
+        return _dedupe_model_search_grid(grid)
+    default_params = build_default_xgb_params(scale_pos_weight=scale_pos_weight)
+    cap = int(max_candidates or 0)
+    if cap > 0 and len(grid) >= cap:
+        grid = list(grid[:max(cap - 1, 0)])
+    else:
+        grid = list(grid)
+    grid.append(default_params)
+    return _dedupe_model_search_grid(grid)
+
+
+def build_model_search_grid(args, scale_pos_weight=1.0):
+    axes = build_model_search_axes(args)
+    max_candidates = int(getattr(args, "model_search_max_candidates", 0) or 0)
+    random_state = int(getattr(args, "model_search_random_state", 42))
+    total_combinations = _model_search_combo_count(axes)
+    if max_candidates > 0 and total_combinations > max_candidates:
+        rng = np.random.RandomState(random_state)
+        combo_indices = sorted(
+            rng.choice(total_combinations, size=max_candidates, replace=False).tolist()
+        )
+        grid = [
+            _params_from_combo_index(axes, idx, scale_pos_weight=scale_pos_weight)
+            for idx in combo_indices
+        ]
+    else:
+        grid = []
+        for values in product(*(axes[k] for k in axes.keys())):
+            params = build_default_xgb_params(scale_pos_weight=scale_pos_weight)
+            params.update(dict(zip(axes.keys(), values)))
+            grid.append(params)
+    return _ensure_default_params_in_grid(
+        grid,
+        scale_pos_weight=scale_pos_weight,
+        max_candidates=max_candidates,
+    )
 
 
 def is_default_xgb_params(params):
@@ -585,6 +687,144 @@ def choose_accuracy_first_model_search_record(records, accuracy_tolerance=0.0):
     return chosen
 
 
+def build_repeated_group_cv_splits(y, groups=None, n_folds=3, n_repeats=2, random_state=42):
+    y = np.asarray(y, dtype=int)
+    n_samples = len(y)
+    if n_samples < 2:
+        idx = np.arange(n_samples)
+        return [(idx, idx)], {
+            "fallback": True,
+            "reason": "insufficient_rows",
+            "n_splits": 1,
+            "n_repeats": 1,
+        }
+
+    n_folds = max(2, int(n_folds))
+    n_repeats = max(1, int(n_repeats))
+    if groups is not None:
+        groups = np.asarray(groups, dtype=object)
+    if groups is not None and len(groups) == n_samples:
+        group_df = pd.DataFrame({"group": groups, "target": y}).drop_duplicates("group")
+        group_counts = group_df["target"].value_counts()
+        if len(group_df) >= 2 and group_df["target"].nunique() >= 2 and group_counts.min() >= 2:
+            effective_folds = min(n_folds, int(group_counts.min()), int(len(group_df)))
+            splits = []
+            for repeat in range(n_repeats):
+                cv = StratifiedGroupKFold(
+                    n_splits=effective_folds,
+                    shuffle=True,
+                    random_state=int(random_state) + repeat,
+                )
+                splits.extend(list(cv.split(np.zeros(n_samples), y, groups)))
+            return splits, {
+                "fallback": False,
+                "reason": "stratified_group_kfold",
+                "n_splits": int(effective_folds),
+                "n_repeats": int(n_repeats),
+                "n_groups": int(len(group_df)),
+            }
+
+    class_counts = pd.Series(y).value_counts()
+    if y.size >= 4 and len(class_counts) >= 2 and int(class_counts.min()) >= 2:
+        effective_folds = min(n_folds, int(class_counts.min()), n_samples)
+        splits = []
+        for repeat in range(n_repeats):
+            cv = StratifiedKFold(
+                n_splits=effective_folds,
+                shuffle=True,
+                random_state=int(random_state) + repeat,
+            )
+            splits.extend(list(cv.split(np.zeros(n_samples), y)))
+        return splits, {
+            "fallback": True,
+            "reason": "row_stratified_kfold",
+            "n_splits": int(effective_folds),
+            "n_repeats": int(n_repeats),
+        }
+
+    effective_folds = min(n_folds, n_samples)
+    cv = KFold(n_splits=effective_folds, shuffle=True, random_state=int(random_state))
+    return list(cv.split(np.zeros(n_samples))), {
+        "fallback": True,
+        "reason": "row_kfold",
+        "n_splits": int(effective_folds),
+        "n_repeats": 1,
+    }
+
+
+def _mean_or_none(values):
+    values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+    if not values:
+        return None
+    return float(np.mean(values))
+
+
+def _std_or_none(values):
+    values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+    if not values:
+        return None
+    return float(np.std(values))
+
+
+def summarize_cv_metrics(fold_metrics):
+    return {
+        "mean_cv_accuracy": _mean_or_none([m.get("accuracy") for m in fold_metrics]),
+        "std_cv_accuracy": _std_or_none([m.get("accuracy") for m in fold_metrics]),
+        "mean_cv_fp_rate": _mean_or_none([m.get("fp_rate") for m in fold_metrics]),
+        "mean_cv_precision": _mean_or_none([m.get("precision") for m in fold_metrics]),
+        "mean_cv_recall": _mean_or_none([m.get("recall") for m in fold_metrics]),
+        "cv_folds_completed": int(len(fold_metrics)),
+    }
+
+
+def choose_cv_model_search_record(records, accuracy_tolerance=0.0):
+    eligible = [r for r in records if r.get("eligible")]
+    if not eligible:
+        return None
+    tolerance = max(0.0, float(accuracy_tolerance))
+    default_records = [r for r in eligible if r.get("is_default_params")]
+    default_record = None
+    if default_records:
+        default_record = max(default_records, key=lambda r: float(r.get("mean_cv_accuracy") or 0.0))
+        default_acc = float(default_record.get("mean_cv_accuracy") or 0.0)
+        non_default = [r for r in eligible if not r.get("is_default_params")]
+        best_non_default_acc = max(
+            [float(r.get("mean_cv_accuracy") or 0.0) for r in non_default],
+            default=float("-inf"),
+        )
+        if best_non_default_acc <= default_acc + tolerance:
+            default_record["beats_default_params"] = False
+            default_record["chosen_reason"] = "default_params_baseline_not_beaten"
+            for r in records:
+                if r is not default_record:
+                    r["beats_default_params"] = bool(
+                        float(r.get("mean_cv_accuracy") or 0.0) > default_acc + tolerance
+                    )
+            return default_record
+
+    best_accuracy = max(float(r.get("mean_cv_accuracy") or 0.0) for r in eligible)
+    candidates = [
+        r for r in eligible
+        if float(r.get("mean_cv_accuracy") or 0.0) >= best_accuracy - tolerance
+    ]
+    chosen = min(
+        candidates,
+        key=lambda r: (
+            float(r.get("std_cv_accuracy") if r.get("std_cv_accuracy") is not None else 1.0),
+            float(r.get("mean_cv_fp_rate") if r.get("mean_cv_fp_rate") is not None else 1.0),
+            int(r.get("final_total_nodes", r.get("total_nodes", 0))),
+            not bool(r.get("is_default_params", False)),
+            -float(r.get("mean_cv_accuracy") or 0.0),
+            int(r.get("rank_input_order", 0)),
+        ),
+    )
+    default_acc = float(default_record.get("mean_cv_accuracy") or 0.0) if default_record else float("-inf")
+    for r in records:
+        r["beats_default_params"] = bool(float(r.get("mean_cv_accuracy") or 0.0) > default_acc + tolerance)
+    chosen["chosen_reason"] = "best_cv_accuracy"
+    return chosen
+
+
 def build_model_search_result_rows(model_search_records):
     rows = []
     for r in model_search_records:
@@ -595,11 +835,19 @@ def build_model_search_result_rows(model_search_records):
             "fp_rate": _json_safe_float(r["fp_rate"]),
             "size_ratio": _json_safe_float(r["size_ratio"]),
             "total_nodes": int(r["total_nodes"]),
+            "final_total_nodes": int(r.get("final_total_nodes", r.get("total_nodes", 0))),
             "avg_nodes_per_tree": _json_safe_float(r["avg_nodes_per_tree"]),
             "selection_threshold": _json_safe_float(r.get("selection_threshold", 0.5)),
             "selection_accuracy": _json_safe_float(r.get("selection_accuracy", 0.0)),
             "selection_fp_rate": _json_safe_float(r.get("selection_fp_rate", r.get("fp_rate", 0.0))),
+            "mean_cv_accuracy": _json_safe_float(r.get("mean_cv_accuracy", 0.0)),
+            "std_cv_accuracy": _json_safe_float(r.get("std_cv_accuracy", 0.0)),
+            "mean_cv_fp_rate": _json_safe_float(r.get("mean_cv_fp_rate", 0.0)),
+            "mean_cv_precision": _json_safe_float(r.get("mean_cv_precision", 0.0)),
+            "mean_cv_recall": _json_safe_float(r.get("mean_cv_recall", 0.0)),
+            "cv_folds_completed": int(r.get("cv_folds_completed", 0)),
             "is_default_params": bool(r.get("is_default_params", False)),
+            "beats_default_params": bool(r.get("beats_default_params", False)),
             "chosen_reason": str(r.get("chosen_reason", "")),
         }
         for name, value in (r.get("metrics") or {}).items():
@@ -623,6 +871,8 @@ def build_model_search_result_rows(model_search_records):
 
 
 def _json_safe_float(value):
+    if value is None:
+        return None
     value = float(value)
     if not np.isfinite(value):
         return None
@@ -635,10 +885,21 @@ def _json_safe_model_search_record(record):
     out["fp_rate"] = _json_safe_float(out["fp_rate"])
     out["size_ratio"] = _json_safe_float(out["size_ratio"])
     out["avg_nodes_per_tree"] = _json_safe_float(out["avg_nodes_per_tree"])
+    out["final_total_nodes"] = int(out.get("final_total_nodes", out.get("total_nodes", 0)))
     out["selection_threshold"] = _json_safe_float(out.get("selection_threshold", 0.5))
     out["selection_accuracy"] = _json_safe_float(out.get("selection_accuracy", 0.0))
     out["selection_fp_rate"] = _json_safe_float(out.get("selection_fp_rate", out["fp_rate"]))
+    for key in [
+        "mean_cv_accuracy",
+        "std_cv_accuracy",
+        "mean_cv_fp_rate",
+        "mean_cv_precision",
+        "mean_cv_recall",
+    ]:
+        out[key] = _json_safe_float(out.get(key))
+    out["cv_folds_completed"] = int(out.get("cv_folds_completed", 0))
     out["is_default_params"] = bool(out.get("is_default_params", False))
+    out["beats_default_params"] = bool(out.get("beats_default_params", False))
     out["chosen_reason"] = str(out.get("chosen_reason", ""))
     return out
 
@@ -651,8 +912,8 @@ def train_xgb_with_params(params, X_train, y_train):
     return model
 
 
-def search_xgb_hyperparameters(args, X_train, y_train, X_select, y_select,
-                               scale_pos_weight=1.0):
+def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y_select,
+                                             scale_pos_weight=1.0):
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
     records = []
     models = []
@@ -709,6 +970,7 @@ def search_xgb_hyperparameters(args, X_train, y_train, X_select, y_select,
     ))
     return best_model, {
         "enabled": True,
+        "strategy": "single_split",
         "selection_data": "valid_model_selection_split",
         "max_model_nodes": int(args.max_model_nodes),
         "fp_cost": float(args.model_search_fp_cost),
@@ -719,6 +981,217 @@ def search_xgb_hyperparameters(args, X_train, y_train, X_select, y_select,
         "best": _json_safe_model_search_record(best),
         "top_candidates": [_json_safe_model_search_record(r) for r in records[:20]],
     }, records
+
+
+def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=None,
+                                                scale_pos_weight=1.0):
+    axes = build_model_search_axes(args)
+    total_combinations = _model_search_combo_count(axes)
+    grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
+    cv_splits, cv_meta = build_repeated_group_cv_splits(
+        y_train,
+        groups=groups,
+        n_folds=args.model_search_cv_folds,
+        n_repeats=args.model_search_cv_repeats,
+        random_state=args.model_search_random_state,
+    )
+    if not cv_splits:
+        idx = np.arange(len(y_train))
+        cv_splits = [(idx, idx)]
+        cv_meta = {"fallback": True, "reason": "empty_cv_splits", "n_splits": 1, "n_repeats": 1}
+
+    stage_train_idx, stage_valid_idx = cv_splits[0]
+    stage_records = []
+    logger.info(
+        "model_search staged_group_cv: stage A evaluating %d sampled candidates "
+        "(total_combinations=%d)",
+        len(grid),
+        total_combinations,
+    )
+    for idx, params in enumerate(grid, 1):
+        candidate = train_xgb_with_params(params, X_train[stage_train_idx], y_train[stage_train_idx])
+        selection_metrics = evaluate_accuracy_first_threshold(
+            candidate,
+            X_train[stage_valid_idx],
+            y_train[stage_valid_idx],
+        )
+        total_nodes = count_xgb_nodes(candidate)
+        score = score_model_search_candidate(
+            selection_metrics,
+            total_nodes=total_nodes,
+            max_model_nodes=args.max_model_nodes,
+            fp_cost=args.model_search_fp_cost,
+            size_cost=args.model_search_size_cost,
+        )
+        stage_records.append({
+            "rank_input_order": int(idx),
+            "eligible": bool(score["eligible"]),
+            "score": float(score["score"]),
+            "fp_rate": float(score["fp_rate"]),
+            "size_ratio": float(score["size_ratio"]),
+            "total_nodes": int(total_nodes),
+            "avg_nodes_per_tree": float(total_nodes) / float(max(int(params["n_estimators"]), 1)),
+            "selection_threshold": float(selection_metrics["threshold"]),
+            "selection_accuracy": float(selection_metrics["accuracy"]),
+            "selection_fp_rate": float(selection_metrics["fp_rate"]),
+            "selection_metrics": selection_metrics,
+            "is_default_params": bool(is_default_xgb_params(params)),
+            "chosen_reason": "",
+            "metrics": selection_metrics,
+            "params": params,
+        })
+
+    stage_records.sort(key=lambda r: (
+        not r["eligible"],
+        -float(r.get("selection_accuracy", 0.0)),
+        float(r.get("selection_fp_rate", 1.0)),
+        int(r.get("total_nodes", 0)),
+    ))
+    stage2_top_k = max(1, int(args.model_search_stage2_top_k))
+    stage2_params = [r["params"] for r in stage_records if r["eligible"]][:stage2_top_k]
+    stage2_params = _ensure_default_params_in_grid(
+        stage2_params,
+        scale_pos_weight=scale_pos_weight,
+        max_candidates=0,
+    )
+    logger.info(
+        "model_search staged_group_cv: stage B CV evaluating %d candidates across %d folds",
+        len(stage2_params),
+        len(cv_splits),
+    )
+
+    cv_records = []
+    final_models = []
+    fold_count = len(cv_splits)
+    for idx, params in enumerate(stage2_params, 1):
+        fold_metrics = []
+        for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits, 1):
+            fold_model = train_xgb_with_params(params, X_train[train_idx], y_train[train_idx])
+            fold_metrics.append(evaluate_accuracy_first_threshold(
+                fold_model,
+                X_train[valid_idx],
+                y_train[valid_idx],
+            ))
+        cv_summary = summarize_cv_metrics(fold_metrics)
+        final_model = train_xgb_with_params(params, X_train, y_train)
+        final_total_nodes = count_xgb_nodes(final_model)
+        final_models.append(final_model)
+        mean_accuracy = float(cv_summary.get("mean_cv_accuracy") or 0.0)
+        mean_fp_rate = float(cv_summary.get("mean_cv_fp_rate") or 0.0)
+        size_ratio = (
+            float(final_total_nodes) / float(max(int(args.max_model_nodes), 1))
+            if int(args.max_model_nodes) > 0 else 0.0
+        )
+        eligible = not (int(args.max_model_nodes) > 0 and final_total_nodes > int(args.max_model_nodes))
+        score = (
+            mean_accuracy
+            - float(args.model_search_fp_cost) * mean_fp_rate
+            - float(args.model_search_size_cost) * size_ratio
+        ) if eligible else float("-inf")
+        mean_threshold = _mean_or_none([m.get("threshold") for m in fold_metrics])
+        record = {
+            "rank_input_order": int(idx),
+            "eligible": bool(eligible),
+            "score": float(score),
+            "fp_rate": float(mean_fp_rate),
+            "size_ratio": float(size_ratio),
+            "total_nodes": int(final_total_nodes),
+            "final_total_nodes": int(final_total_nodes),
+            "avg_nodes_per_tree": float(final_total_nodes) / float(max(int(params["n_estimators"]), 1)),
+            "selection_threshold": float(mean_threshold if mean_threshold is not None else 0.5),
+            "selection_accuracy": float(mean_accuracy),
+            "selection_fp_rate": float(mean_fp_rate),
+            "selection_metrics": {
+                "threshold": float(mean_threshold if mean_threshold is not None else 0.5),
+                "accuracy": mean_accuracy,
+                "fp_rate": mean_fp_rate,
+                "precision": cv_summary.get("mean_cv_precision"),
+                "recall": cv_summary.get("mean_cv_recall"),
+            },
+            "metrics": {
+                "accuracy": mean_accuracy,
+                "fp_rate": mean_fp_rate,
+                "precision": cv_summary.get("mean_cv_precision"),
+                "recall": cv_summary.get("mean_cv_recall"),
+            },
+            "is_default_params": bool(is_default_xgb_params(params)),
+            "beats_default_params": False,
+            "chosen_reason": "",
+            "params": params,
+        }
+        record.update(cv_summary)
+        record["cv_folds_completed"] = int(min(record["cv_folds_completed"], fold_count))
+        cv_records.append(record)
+
+    best = choose_cv_model_search_record(
+        cv_records,
+        accuracy_tolerance=args.model_search_accuracy_tolerance,
+    )
+    if best is None:
+        raise RuntimeError(
+            f"model_search found no candidate under max_model_nodes={args.max_model_nodes}. "
+            "Relax --max_model_nodes or shrink the search grid."
+        )
+    best_model = final_models[int(best["rank_input_order"]) - 1]
+
+    cv_records.sort(key=lambda r: (
+        not r["eligible"],
+        -float(r.get("mean_cv_accuracy") or 0.0),
+        float(r.get("std_cv_accuracy") if r.get("std_cv_accuracy") is not None else 1.0),
+        float(r.get("mean_cv_fp_rate") if r.get("mean_cv_fp_rate") is not None else 1.0),
+        int(r.get("final_total_nodes", r.get("total_nodes", 0))),
+    ))
+    default_baseline = next((r for r in cv_records if r.get("is_default_params")), None)
+    return best_model, {
+        "enabled": True,
+        "strategy": "staged_group_cv",
+        "selection_data": "train_group_cv",
+        "selection_policy": "mean_cv_accuracy_std_fp_nodes",
+        "max_model_nodes": int(args.max_model_nodes),
+        "fp_cost": float(args.model_search_fp_cost),
+        "size_cost": float(args.model_search_size_cost),
+        "accuracy_tolerance": float(args.model_search_accuracy_tolerance),
+        "grid_size": int(len(grid)),
+        "stage2_top_k": int(stage2_top_k),
+        "stage2_candidate_count": int(len(stage2_params)),
+        "cv_folds": int(args.model_search_cv_folds),
+        "cv_repeats": int(args.model_search_cv_repeats),
+        "cv_folds_completed": int(fold_count),
+        "random_state": int(args.model_search_random_state),
+        "max_candidates": int(args.model_search_max_candidates),
+        "parameter_space": {
+            "total_combinations": int(total_combinations),
+            "sampled_grid_size": int(len(grid)),
+            "axes": {k: list(v) for k, v in axes.items()},
+        },
+        "cv_split": cv_meta,
+        "default_baseline": _json_safe_model_search_record(default_baseline) if default_baseline else None,
+        "best": _json_safe_model_search_record(best),
+        "top_candidates": [_json_safe_model_search_record(r) for r in cv_records[:20]],
+    }, cv_records
+
+
+def search_xgb_hyperparameters(args, X_train, y_train, X_select=None, y_select=None,
+                               scale_pos_weight=1.0, groups=None):
+    strategy = getattr(args, "model_search_strategy", "single_split")
+    if strategy == "staged_group_cv":
+        return _search_xgb_hyperparameters_staged_group_cv(
+            args,
+            X_train,
+            y_train,
+            groups=groups,
+            scale_pos_weight=scale_pos_weight,
+        )
+    if X_select is None or y_select is None:
+        raise ValueError("single_split model_search requires X_select and y_select")
+    return _search_xgb_hyperparameters_single_split(
+        args,
+        X_train,
+        y_train,
+        X_select,
+        y_select,
+        scale_pos_weight=scale_pos_weight,
+    )
 
 
 def compute_threshold_curve(model, X, y, beta=0.5):
@@ -958,6 +1431,9 @@ def main(args=None):
                         help="whether Stage2 feature pools used IR channel values")
     parser.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=False,
                         help="search XGBoost params under a node-count budget before final calibration")
+    parser.add_argument("--model_search_strategy", type=str, default="staged_group_cv",
+                        choices=["staged_group_cv", "single_split"],
+                        help="model search strategy; staged_group_cv uses train-group CV and preserves valid for calibration/threshold")
     parser.add_argument("--max_model_nodes", type=int, default=400,
                         help="maximum allowed total XGBoost tree nodes during --model_search; <=0 disables the cap")
     parser.add_argument("--model_search_fp_cost", type=float, default=2.0,
@@ -967,22 +1443,40 @@ def main(args=None):
     parser.add_argument("--model_search_accuracy_tolerance", type=float, default=0.0,
                         help="accuracy gap allowed when preferring a smaller model in --model_search; default 0.0 means accuracy strictly wins under the node budget")
     parser.add_argument("--model_search_valid_fraction", type=float, default=0.5,
-                        help="fraction of the valid calibration pool reserved for model-search selection")
-    parser.add_argument("--model_search_n_estimators", type=str, default="20,30,40",
+                        help="fraction of the valid calibration pool reserved for single_split model-search selection")
+    parser.add_argument("--model_search_max_candidates", type=int, default=600,
+                        help="maximum sampled candidates from the search grid; <=0 disables sampling")
+    parser.add_argument("--model_search_stage2_top_k", type=int, default=80,
+                        help="number of stage-A candidates kept for staged_group_cv")
+    parser.add_argument("--model_search_cv_folds", type=int, default=3,
+                        help="group-CV folds for staged_group_cv")
+    parser.add_argument("--model_search_cv_repeats", type=int, default=2,
+                        help="group-CV repeats for staged_group_cv")
+    parser.add_argument("--model_search_random_state", type=int, default=42,
+                        help="random seed for deterministic candidate sampling and CV splits")
+    parser.add_argument("--model_search_n_estimators", type=str,
+                        default=_model_search_default_csv("n_estimators"),
                         help="comma-separated n_estimators candidates for --model_search")
-    parser.add_argument("--model_search_max_depth", type=str, default="2,3",
+    parser.add_argument("--model_search_max_depth", type=str,
+                        default=_model_search_default_csv("max_depth"),
                         help="comma-separated max_depth candidates for --model_search")
-    parser.add_argument("--model_search_learning_rate", type=str, default="0.03,0.05,0.08",
+    parser.add_argument("--model_search_learning_rate", type=str,
+                        default=_model_search_default_csv("learning_rate"),
                         help="comma-separated learning_rate candidates for --model_search")
-    parser.add_argument("--model_search_min_child_weight", type=str, default="20,30,50",
+    parser.add_argument("--model_search_min_child_weight", type=str,
+                        default=_model_search_default_csv("min_child_weight"),
                         help="comma-separated min_child_weight candidates for --model_search")
-    parser.add_argument("--model_search_reg_lambda", type=str, default="10,20",
+    parser.add_argument("--model_search_reg_lambda", type=str,
+                        default=_model_search_default_csv("reg_lambda"),
                         help="comma-separated reg_lambda candidates for --model_search")
-    parser.add_argument("--model_search_reg_alpha", type=str, default="1,2",
+    parser.add_argument("--model_search_reg_alpha", type=str,
+                        default=_model_search_default_csv("reg_alpha"),
                         help="comma-separated reg_alpha candidates for --model_search")
-    parser.add_argument("--model_search_subsample", type=str, default="0.7,0.8,0.9",
+    parser.add_argument("--model_search_subsample", type=str,
+                        default=_model_search_default_csv("subsample"),
                         help="comma-separated subsample candidates for --model_search")
-    parser.add_argument("--model_search_colsample_bytree", type=str, default="0.7,0.8,0.9",
+    parser.add_argument("--model_search_colsample_bytree", type=str,
+                        default=_model_search_default_csv("colsample_bytree"),
                         help="comma-separated colsample_bytree candidates for --model_search")
     parser.add_argument("--ood_q_low", type=float, default=0.05)
     parser.add_argument("--ood_q_high", type=float, default=0.95)
@@ -1031,12 +1525,21 @@ def main(args=None):
         threshold_fraction=args.threshold_valid_fraction,
         random_state=args.calibration_random_state,
     )
-    if args.model_search:
+    if args.model_search and args.model_search_strategy == "single_split":
         df_model_select, df_calib, model_selection_split = split_calibration_for_model_search(
             df_calib_pool,
             search_fraction=args.model_search_valid_fraction,
             random_state=args.calibration_random_state,
         )
+    elif args.model_search:
+        df_model_select = df_calib_pool.copy()
+        df_calib = df_calib_pool
+        model_selection_split = {
+            "fallback": False,
+            "reason": "train_group_cv",
+            "model_selection_groups": None,
+            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+        }
     else:
         df_model_select = df_calib_pool.copy()
         df_calib = df_calib_pool
@@ -1053,6 +1556,10 @@ def main(args=None):
         df_train,
         selected_features,
         fill_values=fill_values
+    )
+    train_groups = (
+        df_train["sample_name"].astype("object").to_numpy()
+        if "sample_name" in df_train.columns else None
     )
 
     X_valid, y_valid, _ = prepare_xy(
@@ -1138,6 +1645,7 @@ def main(args=None):
             X_model_select,
             y_model_select,
             scale_pos_weight=scale_pos_weight,
+            groups=train_groups,
         )
         model_search_summary["split"] = model_selection_split
         logger.info("model_search best score=%.6f total_nodes=%d params=%s",
@@ -1243,10 +1751,24 @@ def main(args=None):
     if model_search_records:
         model_search_results_path = os.path.join(args.artifact_dir, "model_search_results.csv")
         rows = build_model_search_result_rows(model_search_records)
-        pd.DataFrame(rows).sort_values(
-            by=["eligible", "selection_accuracy", "total_nodes", "selection_fp_rate"],
-            ascending=[False, False, True, True],
-        ).to_csv(model_search_results_path, index=False)
+        results_df = pd.DataFrame(rows)
+        if "cv_folds_completed" in results_df.columns and int(results_df["cv_folds_completed"].max()) > 0:
+            results_df = results_df.sort_values(
+                by=[
+                    "eligible",
+                    "mean_cv_accuracy",
+                    "std_cv_accuracy",
+                    "mean_cv_fp_rate",
+                    "final_total_nodes",
+                ],
+                ascending=[False, False, True, True, True],
+            )
+        else:
+            results_df = results_df.sort_values(
+                by=["eligible", "selection_accuracy", "total_nodes", "selection_fp_rate"],
+                ascending=[False, False, True, True],
+            )
+        results_df.to_csv(model_search_results_path, index=False)
         model_search_summary["results_path"] = model_search_results_path
 
     model_bundle = {

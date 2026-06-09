@@ -3,7 +3,7 @@
 """
 主控脚本：一键运行完整训练、搜参、评估和部署导出流程。
 
-推荐一条命令（含 XGBoost 模型搜参；不含商用 baseline 对比、NPZ 缓存导出和 s07 后处理搜参）:
+推荐一条命令（含 XGBoost 模型搜参；不含商用 baseline 对比、NPZ 缓存导出、s07 后处理搜参和 s10 泛化审计）:
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 这条命令会默认跑到 s06_cb：
@@ -11,7 +11,7 @@
     s02 Stage1 固定阈值
     s03 3s/1s Stage2 特征窗口
     s04 特征筛选 + s04_search 候选子集搜索
-    s05 XGBoost 训练；默认执行复杂度受限搜参
+    s05 XGBoost 训练；默认执行节点预算约束下的 staged group-CV 搜参
     s06_eval 用当前已固化/默认状态机做 test 端到端评估
     s06_xpt/s06_feat/s06_plot/s06_cb 导出部署产物、特征脚本、错误图和部署配方
 
@@ -19,11 +19,16 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --optimize
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --export_window_cache --optimize_postprocess
 
+泛化审计只读取已有评估 artifacts，不重新训练；需要时显式运行：
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --run_generalization_audit --stop_after s10_audit
+
 商用 baseline 对比暂不属于默认全流程；需要时显式运行：
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_compare --stop_after s09_cmp
 
+如果 --stop_after 直接指向 s07_post/s09_cmp/s10_audit，脚本会视为显式请求并自动打开对应可选步骤。
+
 用法:
-    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/商用对比）
+    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/s10 审计/商用对比）
     python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
     # 需要时再打开 NPZ 缓存导出和 s07 后处理搜参
@@ -48,6 +53,7 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
     s06_cache: 导出 valid 逐窗缓存（默认不跑；需 --export_window_cache）
     s07_post: FP 敏感后处理搜参（默认不跑；需 --optimize_postprocess）
     s06_eval: 端到端评估
+    s10_audit: 商用泛化审计（默认不跑；需 --run_generalization_audit）
     s06_xpt: 导出部署产物 (--export_deploy)
     s09_cmp: 我们方案 vs 商用方案对比（默认不跑；需 --commercial_compare --stop_after s09_cmp）
 """
@@ -1066,6 +1072,9 @@ def main():
     # s05 model-search params
     p.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=True,
                    help="enable s05 XGBoost param search under a node budget; use --no-model_search to disable")
+    p.add_argument("--model_search_strategy", default="staged_group_cv",
+                   choices=["staged_group_cv", "single_split"],
+                   help="s05 model search strategy")
     p.add_argument("--max_model_nodes", type=int, default=400,
                    help="s05 max total XGBoost nodes for --model_search")
     p.add_argument("--model_search_fp_cost", type=float, default=2.0,
@@ -1076,21 +1085,31 @@ def main():
                    help="s05 accuracy gap allowed when preferring a smaller model; default 0.0 means accuracy strictly wins under the node budget")
     p.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                    help="fraction of valid calibration pool used for model search")
-    p.add_argument("--model_search_n_estimators", default="20,30,40",
+    p.add_argument("--model_search_max_candidates", type=int, default=600,
+                   help="maximum sampled s05 model-search candidates")
+    p.add_argument("--model_search_stage2_top_k", type=int, default=80,
+                   help="number of stage-A candidates kept for s05 staged_group_cv")
+    p.add_argument("--model_search_cv_folds", type=int, default=3,
+                   help="s05 staged_group_cv folds")
+    p.add_argument("--model_search_cv_repeats", type=int, default=2,
+                   help="s05 staged_group_cv repeats")
+    p.add_argument("--model_search_random_state", type=int, default=42,
+                   help="s05 model-search sampling/CV seed")
+    p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60,70,80",
                    help="comma-separated s05 n_estimators candidates")
-    p.add_argument("--model_search_max_depth", default="2,3",
+    p.add_argument("--model_search_max_depth", default="2,3,4",
                    help="comma-separated s05 max_depth candidates")
-    p.add_argument("--model_search_learning_rate", default="0.03,0.05,0.08",
+    p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10",
                    help="comma-separated s05 learning_rate candidates")
-    p.add_argument("--model_search_min_child_weight", default="20,30,50",
+    p.add_argument("--model_search_min_child_weight", default="10,15,20,25,30,40,50",
                    help="comma-separated s05 min_child_weight candidates")
-    p.add_argument("--model_search_reg_lambda", default="10,20",
+    p.add_argument("--model_search_reg_lambda", default="5,8,10,12,16,20,30",
                    help="comma-separated s05 reg_lambda candidates")
-    p.add_argument("--model_search_reg_alpha", default="1,2",
+    p.add_argument("--model_search_reg_alpha", default="0,0.5,1,1.5,2,3",
                    help="comma-separated s05 reg_alpha candidates")
-    p.add_argument("--model_search_subsample", default="0.7,0.8,0.9",
+    p.add_argument("--model_search_subsample", default="0.70,0.75,0.80,0.85,0.90",
                    help="comma-separated s05 subsample candidates")
-    p.add_argument("--model_search_colsample_bytree", default="0.7,0.8,0.9",
+    p.add_argument("--model_search_colsample_bytree", default="0.70,0.75,0.80,0.85,0.90",
                    help="comma-separated s05 colsample_bytree candidates")
     # s06 eval / calibration params
     p.add_argument("--calibration_method", default="isotonic", choices=["none", "isotonic"])
@@ -1126,6 +1145,10 @@ def main():
                    help="s09 commercial comparison FP cost")
     p.add_argument("--keep_window_probs", action="store_true",
                    help="keep per-window probabilities in s09 commercial comparison details")
+    p.add_argument("--run_generalization_audit", action=argparse.BooleanOptionalAction, default=False,
+                   help="run optional s10 generalization audit after s06_eval")
+    p.add_argument("--audit_min_support", type=int, default=10,
+                   help="minimum sample/window count before a stratum is treated as reliable in s10")
     p.add_argument("--export_deploy_cookbook", action=argparse.BooleanOptionalAction, default=True,
                    help="导出部署配方给嵌入式同事 (--no-export_deploy_cookbook 跳过)")
 
@@ -1147,6 +1170,8 @@ def main():
         ("s06_replay_cache", "导出 replay 逐窗 NPZ 缓存"),
         ("s07_post",  "FP 敏感后处理搜参"),
         ("s06_eval",  "端到端评估"),
+        ("s10_audit", "泛化审计"),
+        ("s06_xpt",   "导出部署产物"),
         ("s06_feat",  "导出特征提取脚本"),
         ("s06_plot",  "画错误样本图"),
         ("s06_cb",    "导出部署配方"),
@@ -1155,6 +1180,29 @@ def main():
 
     skip_set = {s.strip() for s in args.skip.split(",") if s.strip()}
     stop_after = args.stop_after
+    step_keys = [key for key, _ in all_steps]
+    if stop_after not in step_keys:
+        print(f"[ERROR] unknown --stop_after={stop_after!r}; choose one of: {','.join(step_keys)}")
+        sys.exit(2)
+
+    auto_enabled = []
+    if stop_after in {"s06_cache", "s06_replay_cache", "s07_post", "s09_cmp"}:
+        if "s06_cache" not in skip_set and not args.export_window_cache:
+            args.export_window_cache = True
+            auto_enabled.append("--export_window_cache")
+    if (stop_after in {"s07_post", "s09_cmp"} or args.optimize_postprocess):
+        if "s07_post" not in skip_set and not args.optimize_postprocess:
+            args.optimize_postprocess = True
+            auto_enabled.append("--optimize_postprocess")
+    if stop_after == "s09_cmp" and "s09_cmp" not in skip_set and not args.commercial_compare:
+        args.commercial_compare = True
+        auto_enabled.append("--commercial_compare")
+    if stop_after == "s10_audit" and "s10_audit" not in skip_set and not args.run_generalization_audit:
+        args.run_generalization_audit = True
+        auto_enabled.append("--run_generalization_audit")
+    if auto_enabled:
+        print("[auto] enabled for --stop_after target: " + ", ".join(auto_enabled))
+
     stage2_ir_flag = "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir"
     s04_skip_vif_flag = "--skip_vif" if args.skip_vif else ""
     model_search_flag = "--model_search" if args.model_search else "--no-model_search"
@@ -1242,11 +1290,17 @@ def main():
             f'--step_sec {args.stride_sec} '
             f'{stage2_ir_flag} '
             f'{model_search_flag} '
+            f'--model_search_strategy {args.model_search_strategy} '
             f'--max_model_nodes {args.max_model_nodes} '
             f'--model_search_fp_cost {args.model_search_fp_cost} '
             f'--model_search_size_cost {args.model_search_size_cost} '
             f'--model_search_accuracy_tolerance {args.model_search_accuracy_tolerance} '
             f'--model_search_valid_fraction {args.model_search_valid_fraction} '
+            f'--model_search_max_candidates {args.model_search_max_candidates} '
+            f'--model_search_stage2_top_k {args.model_search_stage2_top_k} '
+            f'--model_search_cv_folds {args.model_search_cv_folds} '
+            f'--model_search_cv_repeats {args.model_search_cv_repeats} '
+            f'--model_search_random_state {args.model_search_random_state} '
             f'--model_search_n_estimators "{args.model_search_n_estimators}" '
             f'--model_search_max_depth "{args.model_search_max_depth}" '
             f'--model_search_learning_rate "{args.model_search_learning_rate}" '
@@ -1320,6 +1374,18 @@ def main():
             f'{stage2_ir_flag} '
             f'--window_output_root window_outputs'
         )
+
+    # s10_audit: read-only commercial generalization audit over existing artifacts.
+    if "s10_audit" not in skip_set and args.run_generalization_audit:
+        commands["s10_audit"] = (
+            f'"{PYTHON}" "{_script_path("s10_generalization_audit")}" '
+            f'--artifact_dir "{args.artifact_dir}" '
+            f'--split {args.split} '
+            f'--method state_machine '
+            f'--min_support {args.audit_min_support}'
+        )
+    elif "s10_audit" not in skip_set:
+        print("(s10_audit: --no-run_generalization_audit skipped)")
 
     # s07_post: tune the richer FP-sensitive state machine on cached windows.
     if "s07_post" not in skip_set and args.optimize_postprocess:

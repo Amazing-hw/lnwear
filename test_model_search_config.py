@@ -11,6 +11,23 @@ import s05_train_final_model as s05
 ROOT = Path(__file__).resolve().parent
 
 
+def _model_search_args(**overrides):
+    values = {
+        "model_search_n_estimators": "20,25,30,35,40,45,50,55,60,70,80",
+        "model_search_max_depth": "2,3,4",
+        "model_search_learning_rate": "0.025,0.03,0.04,0.05,0.06,0.08,0.10",
+        "model_search_min_child_weight": "10,15,20,25,30,40,50",
+        "model_search_reg_lambda": "5,8,10,12,16,20,30",
+        "model_search_reg_alpha": "0,0.5,1,1.5,2,3",
+        "model_search_subsample": "0.70,0.75,0.80,0.85,0.90",
+        "model_search_colsample_bytree": "0.70,0.75,0.80,0.85,0.90",
+        "model_search_max_candidates": 600,
+        "model_search_random_state": 42,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
 def _sample_name_series(values):
     try:
         return pd.Series(values, dtype="string[pyarrow]")
@@ -69,7 +86,7 @@ def test_parse_model_search_grid_exposes_adjustable_values():
 
     grid = s05.build_model_search_grid(args, scale_pos_weight=1.25)
 
-    assert len(grid) == 3 * 2 * 2 * 2 * 2 * 2 * 2 * 2
+    assert len(grid) == 3 * 2 * 2 * 2 * 2 * 2 * 2 * 2 + 1
     assert {
         "n_estimators": 20,
         "max_depth": 2,
@@ -84,6 +101,45 @@ def test_parse_model_search_grid_exposes_adjustable_values():
         "eval_metric": "logloss",
         "random_state": 42,
     } in grid
+    assert any(s05.is_default_xgb_params(params) for params in grid)
+
+
+def test_default_model_search_axes_have_fine_n_estimators():
+    args = _model_search_args()
+
+    axes = s05.build_model_search_axes(args)
+    n_estimators = set(axes["n_estimators"])
+
+    assert {25, 35, 45, 55}.issubset(n_estimators)
+
+
+def test_model_search_grid_force_includes_default_params_when_custom_grid_excludes_it():
+    args = _model_search_args(
+        model_search_n_estimators="20",
+        model_search_max_depth="2",
+        model_search_learning_rate="0.03",
+        model_search_min_child_weight="30",
+        model_search_reg_lambda="20",
+        model_search_reg_alpha="2",
+        model_search_subsample="0.7",
+        model_search_colsample_bytree="0.7",
+        model_search_max_candidates=10,
+    )
+
+    grid = s05.build_model_search_grid(args, scale_pos_weight=1.0)
+
+    assert any(s05.is_default_xgb_params(params) for params in grid)
+
+
+def test_model_search_grid_sampling_is_deterministic_and_keeps_default():
+    args = _model_search_args(model_search_max_candidates=25, model_search_random_state=7)
+
+    grid1 = s05.build_model_search_grid(args, scale_pos_weight=1.0)
+    grid2 = s05.build_model_search_grid(args, scale_pos_weight=1.0)
+
+    assert len(grid1) == 25
+    assert grid1 == grid2
+    assert any(s05.is_default_xgb_params(params) for params in grid1)
 
 
 def test_model_search_score_penalizes_fp_and_oversized_models():
@@ -198,6 +254,68 @@ def test_accuracy_first_model_search_keeps_default_when_smaller_model_is_worse()
     assert chosen["chosen_reason"] == "max_accuracy"
 
 
+def test_cv_model_search_keeps_default_until_candidate_beats_it():
+    records = [
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.982,
+            "std_cv_accuracy": 0.01,
+            "mean_cv_fp_rate": 0.03,
+            "final_total_nodes": 360,
+            "is_default_params": True,
+        },
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.982,
+            "std_cv_accuracy": 0.005,
+            "mean_cv_fp_rate": 0.01,
+            "final_total_nodes": 120,
+            "is_default_params": False,
+        },
+    ]
+
+    chosen = s05.choose_cv_model_search_record(records, accuracy_tolerance=0.0)
+
+    assert chosen["is_default_params"] is True
+    assert chosen["chosen_reason"] == "default_params_baseline_not_beaten"
+
+
+def test_cv_model_search_prefers_better_candidate_and_filters_oversized():
+    records = [
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.982,
+            "std_cv_accuracy": 0.01,
+            "mean_cv_fp_rate": 0.03,
+            "final_total_nodes": 360,
+            "is_default_params": True,
+        },
+        {
+            "eligible": False,
+            "mean_cv_accuracy": 0.990,
+            "std_cv_accuracy": 0.01,
+            "mean_cv_fp_rate": 0.01,
+            "final_total_nodes": 999,
+            "is_default_params": False,
+        },
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.984,
+            "std_cv_accuracy": 0.02,
+            "mean_cv_fp_rate": 0.04,
+            "final_total_nodes": 300,
+            "is_default_params": False,
+        },
+    ]
+
+    chosen = s05.choose_cv_model_search_record(records, accuracy_tolerance=0.0)
+
+    assert chosen["is_default_params"] is False
+    assert chosen["mean_cv_accuracy"] == 0.984
+    assert chosen["beats_default_params"] is True
+    assert chosen["chosen_reason"] == "best_cv_accuracy"
+
+
 def test_model_search_result_rows_include_accuracy_first_fields():
     rows = s05.build_model_search_result_rows([
         {
@@ -207,10 +325,18 @@ def test_model_search_result_rows_include_accuracy_first_fields():
             "fp_rate": 0.02,
             "size_ratio": 0.5,
             "total_nodes": 200,
+            "final_total_nodes": 200,
             "avg_nodes_per_tree": 5.0,
             "selection_threshold": 0.42,
             "selection_accuracy": 0.981,
             "selection_fp_rate": 0.01,
+            "mean_cv_accuracy": 0.982,
+            "std_cv_accuracy": 0.003,
+            "mean_cv_fp_rate": 0.01,
+            "mean_cv_precision": 0.96,
+            "mean_cv_recall": 0.97,
+            "cv_folds_completed": 6,
+            "beats_default_params": True,
             "chosen_reason": "max_accuracy",
             "is_default_params": True,
             "metrics": {"accuracy": 0.9, "confusion_matrix": {"TN": 9, "FP": 1, "FN": 0, "TP": 10}},
@@ -222,6 +348,11 @@ def test_model_search_result_rows_include_accuracy_first_fields():
     assert rows[0]["selection_threshold"] == 0.42
     assert rows[0]["selection_accuracy"] == 0.981
     assert rows[0]["selection_fp_rate"] == 0.01
+    assert rows[0]["mean_cv_accuracy"] == 0.982
+    assert rows[0]["std_cv_accuracy"] == 0.003
+    assert rows[0]["final_total_nodes"] == 200
+    assert rows[0]["cv_folds_completed"] == 6
+    assert rows[0]["beats_default_params"] is True
     assert rows[0]["is_default_params"] is True
     assert rows[0]["chosen_reason"] == "max_accuracy"
 
@@ -267,6 +398,12 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
     assert " --model_search " in output
     assert "--no-model_search" not in output
     assert "--max_model_nodes 260" in output
+    assert "--model_search_strategy staged_group_cv" in output
+    assert "--model_search_max_candidates 600" in output
+    assert "--model_search_stage2_top_k 80" in output
+    assert "--model_search_cv_folds 3" in output
+    assert "--model_search_cv_repeats 2" in output
+    assert "--model_search_random_state 42" in output
     assert "--model_search_accuracy_tolerance 0.0 " in output
     assert "--model_search_accuracy_tolerance 0.002 " not in output
     assert '--model_search_n_estimators "20,30"' in output
@@ -289,6 +426,7 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
 
     output = result.stdout + result.stderr
     assert " --model_search " in output
+    assert "--model_search_strategy staged_group_cv" in output
     assert " --optimize " not in output
     assert "s07_postprocess_optimize.py" not in output
     assert "--export_window_cache" not in output
