@@ -218,6 +218,16 @@ def _json_float_map(values, feature_names):
     return out
 
 
+def _json_clip_map(clip_bounds, feature_names):
+    """Convert clip_bounds dict to a JSON-safe form with only selected features."""
+    out = {}
+    for name in feature_names:
+        bound = clip_bounds.get(name)
+        if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
+            out[name] = [float(bound[0]), float(bound[1])]
+    return out
+
+
 def build_selected_feature_formulas(selected_features):
     recipe, *_ = _build_full_feature_recipe(selected_features)
     for name in selected_features:
@@ -235,56 +245,80 @@ def build_selected_feature_formulas(selected_features):
     return recipe
 
 
-def _render_selected_feature_extractor(selected_features, fill_values, formulas, scripts_dir):
+def _standalone_feature_engine_source(scripts_dir):
+    """Return the window-level feature engine inlined into the deploy script."""
+    source_path = os.path.join(str(scripts_dir), "s03_extract_feature_pool.py")
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"feature engine source not found: {source_path}")
+    with open(source_path, "r", encoding="utf-8") as f:
+        source = f.read()
+
+    redundant_start = source.index("_REDUNDANT_FEATURES = {")
+    redundant_end = source.index("# =========================================================", redundant_start)
+    redundant_source = source[redundant_start:redundant_end].strip()
+
+    engine_start = source.index("def safe_div")
+    engine_end = source.index("def _downsample_ppg", engine_start)
+    engine_source = source[engine_start:engine_end].strip()
+    engine_source = engine_source.replace(
+        "训练（s03）和部署（s06）都调用此函数，保证一致性。",
+        "Training and deployment use the same exported feature logic.",
+    )
+    return "\n\n".join([
+        "EPS = 1e-12",
+        redundant_source,
+        "_BUTTER_CACHE = {}",
+        engine_source,
+    ])
+
+
+def _render_selected_feature_extractor(selected_features, fill_values, clip_bounds, formulas, scripts_dir,
+                                       window_model_threshold=0.5):
     order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
     fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
+    clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
     formulas_json = json.dumps(formulas, ensure_ascii=False, indent=2)
-    scripts_dir_json = json.dumps(str(scripts_dir), ensure_ascii=False)
+    threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
+    feature_engine_source = _standalone_feature_engine_source(scripts_dir)
 
     return f'''# -*- coding: utf-8 -*-
 """Auto-generated selected-feature extractor for watch wearing-liveness.
 
 This reference deployment script exports only the selected model features.
-It delegates preprocessing and feature math to s03_extract_feature_pool so
-training/evaluation/export stay numerically aligned.
+It is self-contained and does not import project training/evaluation scripts.
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
+from collections import OrderedDict
 
 import numpy as np
-from scipy.signal import coherence
+from scipy.signal import butter, correlate, coherence, filtfilt, find_peaks, medfilt
 
 
 FEATURE_ORDER = {order_json}
 FILL_VALUES = {fill_json}
+CLIP_BOUNDS = {clip_json}
 FEATURE_FORMULAS = {formulas_json}
+WINDOW_MODEL_THRESHOLD = {threshold_json}
 
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_CANDIDATE_CODE_DIRS = [
-    _SCRIPT_DIR,
-    _SCRIPT_DIR.parent,
-    Path({scripts_dir_json}),
-]
-for _code_dir in _CANDIDATE_CODE_DIRS:
-    if (_code_dir / "s03_extract_feature_pool.py").exists():
-        sys.path.insert(0, str(_code_dir))
-        break
-
-from s03_extract_feature_pool import (  # noqa: E402
-    extract_acc_features,
-    extract_acc_ppg_cross_features,
-    extract_feature_pool_from_window,
-)
+{feature_engine_source}
 
 
 def _clean_value(name, value):
     if value is None or not np.isfinite(value):
         return float(FILL_VALUES.get(name, 0.0))
-    return float(value)
+    v = float(value)
+    # Apply training clip bounds (IQR-based, matches s05 clip_outliers)
+    bound = CLIP_BOUNDS.get(name)
+    if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
+        lo, hi = float(bound[0]), float(bound[1])
+        if v < lo:
+            v = lo
+        elif v > hi:
+            v = hi
+    return v
 
 
 def _add_acc_ppg_coherence(features, acc, g_mean_bp, fs):
@@ -326,20 +360,21 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
         return_preprocessed=True,
     )
     features.update(extract_acc_features(acc, fs=fs, prefix="ACC"))
+    features.update(extract_acc_tremor_features(acc, fs=fs, prefix="ACC"))
     features.update(
         extract_acc_ppg_cross_features(
             acc,
-            preprocessed["g_mean_bp"],
+            preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"]),
             preprocessed["ir_bp"],
             fs=fs,
         )
     )
-    _add_acc_ppg_coherence(features, acc, preprocessed["g_mean_bp"], fs)
+    _add_acc_ppg_coherence(features, acc, preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"]), fs)
     features["mode"] = float(mode)
 
     missing = [name for name in FEATURE_ORDER if name not in features]
     if missing:
-        raise KeyError("Selected features missing from s03 extractor: " + ", ".join(missing))
+        raise KeyError("Selected features missing from standalone deploy extractor: " + ", ".join(missing))
 
     return {{name: _clean_value(name, features[name]) for name in FEATURE_ORDER}}
 
@@ -348,6 +383,11 @@ def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     """Return the selected feature vector in model order."""
     feature_dict = extract_feature_dict(ir, ambient, g1, g2, g3, acc=acc, fs=fs, mode=mode)
     return [feature_dict[name] for name in FEATURE_ORDER]
+
+
+def classify_probability(probability):
+    """Return the window-level label from a model probability."""
+    return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
 
 
 if __name__ == "__main__":
@@ -377,12 +417,15 @@ def export_feature_extractor_script(artifact_dir):
     bundle = joblib.load(bp)
     selected = list(bundle["feature_names"])
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
+    clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
     formulas = build_selected_feature_formulas(selected)
     script_text = _render_selected_feature_extractor(
         selected,
         fill_values,
+        clip_bounds,
         formulas,
         scripts_dir=SCRIPTS_DIR,
+        window_model_threshold=float(bundle.get("threshold", 0.5)),
     )
 
     out_path = os.path.join(artifact_dir, "deploy_feature_extractor.py")
@@ -782,6 +825,7 @@ def export_deploy_cookbook(artifact_dir):
     bundle = _joblib.load(bundle_path)
     selected = bundle["feature_names"]
     fill_values = bundle["fill_values"]
+    clip_bounds = bundle.get("clip_bounds", {})
     threshold = float(bundle["threshold"])
     model = bundle["model"]
     raw = bundle.get("raw_model", model)
@@ -828,15 +872,23 @@ def export_deploy_cookbook(artifact_dir):
         "C_xgboost_inference": {
             "_note": "拿到 feature_vec 后的推理步骤",
             "fill_values": fill_values,
+            "clip_bounds": clip_bounds,
+            "preprocess_order": [
+                "1. select feature_order",
+                "2. fill NaN/inf with fill_values",
+                "3. clip each selected feature by clip_bounds",
+            ],
             "fill_rule": "feature_vec[i] 为 NaN/inf 时用 fill_values[feature_name] 替换",
+            "clip_rule": "fill 后对每个入选特征执行 clip(lower, upper)，边界来自训练集 IQR（s05 clip_outliers k=1.5）",
             "model_threshold": threshold,
             "n_estimators": n_estimators,
             "model_json": _json.loads(booster.save_config()),
             "inference": [
                 "1. feature_vec = [compute_feature(f) for f in feature_order]",
                 "2. for i, v in enumerate(feature_vec): if isnan(v) or isinf(v): feature_vec[i] = fill_values[feature_order[i]]",
-                "3. proba = xgboost_predict(model, feature_vec)  // → float in [0,1]",
-                "4. window_pred = 1 if proba >= threshold else 0",
+                "3. for i, v in enumerate(feature_vec): feature_vec[i] = clamp(v, clip_bounds[feature_order[i]][0], clip_bounds[feature_order[i]][1])",
+                "4. proba = xgboost_predict(model, feature_vec)  // → float in [0,1]",
+                "5. window_pred = 1 if proba >= threshold else 0",
             ],
         },
 
@@ -855,7 +907,7 @@ def export_deploy_cookbook(artifact_dir):
         "D_stage3_postprocess": {
             "_note": "对 XGBoost 输出的逐窗概率做时序平滑",
             "algorithm": "EMA + hysteresis + cooldown",
-            "params": {"alpha": 0.4, "T_on": 0.75, "T_off": 0.35, "K_on": 5, "K_off": 3, "cooldown_sec": 2.0},
+            "params": {"alpha": 0.4, "T_on": 0.75, "T_off": 0.35, "K_on": 5, "K_off": 3, "cooldown_sec": 5.0},
             "pseudocode": [
                 "score[t] = alpha * quality[t] * proba[t] + (1-alpha*quality[t]) * score[t-1]",
                 "IF state==0 and count(score>T_on) >= K_on and cooldown_expired: state=1, reset counter",
@@ -885,6 +937,13 @@ def export_deploy_cookbook(artifact_dir):
         _json.dump({
             "feature_names": selected,
             "feature_order": selected,
+            "fill_values": fill_values,
+            "clip_bounds": clip_bounds,
+            "preprocess_order": [
+                "select feature_order",
+                "fill NaN/inf with fill_values",
+                "clip by clip_bounds",
+            ],
             "n_estimators": n_estimators,
             "threshold": threshold,
             "model": _json.loads(booster.save_config()),

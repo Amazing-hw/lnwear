@@ -697,6 +697,47 @@ artifacts/
   report_plots/
 ```
 
+## 特征工程
+
+当前候选特征池 ~170 个（含元数据），来自 3 个批次的扩展：
+
+### 特征分组
+
+| 信号源 | 通道 | 特征组 | 说明 |
+|---|---|---|---|
+| PPG Green | G_mean, G1, G2, G3 | 单通道 (DC/AC/FFT/autocorr) | 每通道 10 个基础特征 |
+| PPG Green | G1/G2/G3 空间 | 不均衡/空间向量/相关性 | 120° 对称 LED 空间特征（16 个） |
+| PPG Green | G1/G2/G3 per-ch | 通道间共识 (min/max/range/cv) | 倾斜方向检测（32 个） |
+| PPG IR | IR | 单通道 + FFT harmonic + SNR | 红外脉搏通道（15 个） |
+| PPG Ambient | Ambient | 单通道 + spectral + 波形 | 环境光抑制（8 个） |
+| ACC | X/Y/Z 三轴 | 基础 (per-axis) + 幅值 + 震颤 | 加速度检测（19 个） |
+| ACC-PPG | cross | 相干性 + BP 相关 | 运动-脉搏交叉（4 个） |
+| 跨通道 | GREEN-IR-AMB | 相关性/比值/泄漏 | 光学串扰建模（14 个） |
+| 信号质量 | GREEN/IR | 饱和度/削顶率 | 传感器接触质量（4 个） |
+| 通用 | — | Hjorth/Entropy/Deriv/Temporal | 波形形态学（24 个） |
+| 元数据 | — | SIG_LEN/SIG_SEC/mode 等 | 窗口元信息（4 个） |
+
+### Tier 历史
+
+| Tier | 新增内容 | 增量 |
+|---|---|---|
+| 原始 | 基础 PPG + 空间 + 跨通道 | ~76 |
+| Tier 1 | ACC per-axis + 震颤检测 | ~16 |
+| Tier 2 | IR FFT harmonic/SNR + AMB spectral + 信号质量 + ACC 姿态 | ~16 |
+| Tier 3 | G1/G2/G3 per-channel + 通道间 consensus + dropout indicators | ~65 |
+| 冗余剔除 | AC_RMS (保留 AC_MAD) + AUTO_CORR_LAG_SEC + Hjorth_Complexity 等 | -21 |
+
+### 特征筛选
+
+`s04_feature_selection.py` 负责从 ~170 候选特征中选出 `max_features` 个（默认 15）。流程：
+
+```text
+clean_features_by_train（缺失/低方差/高相关/VIF）
+  → fast_group_preselection（按特征组预筛 Top4）
+  → cross_validate_importance（5-fold Permutation + SHAP）
+  → 按 deployment_score 排序选取 max_features
+```
+
 ## 测试与验收
 
 语法检查：
@@ -708,7 +749,7 @@ python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_featur
 运行测试：
 
 ```bash
-python -B -m pytest D:\wearing_liveness\new\tests .\test_model_search_config.py .\test_window_error_reports.py .\test_generalization_audit.py -q --rootdir D:\wearing_liveness\new\new_codex --basetemp .\.pytest_tmp_all -o cache_dir=.pytest_cache_all
+python -B -m pytest D:\wearing_liveness\new\tests .\test_model_search_config.py .\test_window_error_reports.py .\test_generalization_audit.py .\test_deploy_feature_extractor.py -q --rootdir D:\wearing_liveness\new\new_codex --basetemp .\.pytest_tmp_all -o cache_dir=.pytest_cache_all
 ```
 
 如果直接从上级目录跑 pytest，在某些 Windows 权限环境里可能会因为默认 Temp 或 `.pytest_cache` 权限导致退出阶段异常。上面的命令把 rootdir、basetemp 和 cache_dir 都固定到当前项目目录，比较稳。
@@ -756,9 +797,126 @@ skip_initial_windows
 use_stage2_ir
 selected feature order
 fill values
+clip bounds
 XGBoost model
 window_model_threshold
 postprocess state machine params
 ```
 
 如果 `use_stage2_ir=false`，部署侧进入 Stage2 特征提取前也要把 IR 信号置零；Stage1 仍继续使用真实 IR。
+
+窗口级工程化识别只需要两类核心产物：
+
+```text
+deploy_feature_extractor.py
+final_model.json
+```
+
+`deploy_feature_extractor.py` 是自包含脚本：它内联了所需的 Stage2 窗口级预处理和特征计算逻辑，不依赖 `s03_extract_feature_pool.py`、`s08_run_pipeline.py` 或其他训练/评估脚本。工程侧用它按 `FEATURE_ORDER` 生成特征向量，用 `final_model.json` 计算窗口佩戴概率，再用脚本内置的 `WINDOW_MODEL_THRESHOLD` 或 `classify_probability(probability)` 得到窗口级 0/1 识别结果。
+
+### 训练与推理的预处理管道
+
+训练侧（s05）和推理侧（s06 / deploy_feature_extractor.py）执行相同的预处理语义：
+
+```text
+训练侧 (s05):
+  raw features (from s03 CSV)
+    → ① clip_outliers(k=1.5, IQR-based)
+        用 train 的 Q1-1.5*IQR / Q3+1.5*IQR 裁剪极端值
+        valid 用 train 的裁剪边界，避免 valid IQR 泄漏
+    → ② prepare_fill_values
+        对裁剪后的 train 计算每个特征的中位数
+    → ③ apply_fill: inf → NaN → fillna(train median)
+    → ④ XGBoost 训练
+
+推理侧 (s06 apply_preprocess):
+  raw features (from s03 extract_feature_pool_from_window)
+    → ① inf → NaN
+    → ② fillna(fill_values)
+    → ③ clip(clip_bounds)
+    → ④ XGBoost 推理
+
+推理侧 (deploy_feature_extractor.py, 独立部署脚本):
+  raw features (standalone extraction via _clean_value)
+    → ① inf/None → fill_values (FILL_VALUES dict)
+    → ② clip(clip_bounds) (CLIP_BOUNDS dict)
+    → ③ 返回特征向量
+```
+
+关键差异说明：
+
+```text
+训练侧先 clip 再 fill，推理侧先 fill 再 clip。
+fill_values 是 train median（通常落在 clip 范围内），因此顺序差异在绝大多数情况下不影响结果。
+
+训练侧的 fill_values 是在 clip_outliers 之后重新计算的（s05 prepare_fill_values），
+而非复用 s04 clean_features_by_train 的 fill_values。
+s04 的 fill_values 仅供诊断参考，实际部署使用的是 model_bundle.pkl 中的 fill_values。
+```
+
+### clip_outliers 参数
+
+```text
+方法: IQR-based 异常值裁剪
+k = 1.5 (标准 Tukey 参数)
+训练时从 train 学边界 → 用 train 边界裁剪 train 和 valid
+valid 不自算 IQR（防止数据泄漏）
+推理侧通过 clip_bounds JSON 应用相同的裁剪逻辑。
+```
+
+### s03 特征提取中的 NaN/inf 处理
+
+```text
+s03 extract_feature_pool_from_window 末尾：
+  if v is None or not np.isfinite(v):
+      feat[k] = 0.0
+
+这是特征提取层面的"兜底"处理，所有无法计算的值（除零、log(0)、空信号等）
+在写入特征池 CSV 之前就被替换为 0.0。
+
+这意味着：
+  - s04/s05 从 CSV 读取特征时已经看不到 NaN/inf（大部分已被 s03 消除）
+  - 下游的 inf→NaN→fill 链是防御性的额外保护（处理 s03 未覆盖的边界情况）
+  - 0.0 可能偏离特征分布的合理默认值，但会被 s05 clip_outliers 收敛到 IQR 下界
+
+训练和推理使用相同的 s03 代码，因此这一行为在两端一致，
+不构成训练-部署 gap。
+```
+
+### 部署产物的预处理信息
+
+三个部署产物都包含完整的 fill + clip 信息：
+
+```text
+1. deploy_package/model_params.json
+   {
+     "fill_values": {...},          ← 每个特征的 train median
+     "clip_bounds": {...},          ← 每个特征的 [lower, upper] IQR 边界
+   }
+
+2. deploy_xgboost.json
+   {
+     "fill_values": {...},
+     "clip_bounds": {...},
+     "preprocess_order": ["select feature_order", "fill NaN/inf with fill_values", "clip by clip_bounds"],
+     ...
+   }
+
+3. deploy_feature_extractor.py（独立 Python 脚本）
+   - FILL_VALUES = {...}            ← 硬编码字典
+   - CLIP_BOUNDS = {...}            ← 硬编码字典
+   - _clean_value() 先 fill 再 clip
+   - 零外部依赖（仅 numpy + scipy）
+```
+
+### 状态机后处理参数
+
+```text
+alpha = 0.4          EMA 平滑系数（越小越平滑）
+median_k = 1         中值滤波窗口（1=不滤波）
+T_on = 0.75          从未佩戴→佩戴的 score 阈值
+T_off = 0.35         从佩戴→未佩戴的 score 阈值
+K_on = 5             连续超过 T_on 次数才触发佩戴
+K_off = 3            连续低于 T_off 次数才触发未佩戴
+cooldown_sec = 5     两次状态翻转之间的最小间隔（防止频繁抖动）
+```

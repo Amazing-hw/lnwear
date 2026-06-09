@@ -113,6 +113,9 @@ _REDUNDANT_FEATURES = {
     "GREEN_Temporal_valley_ratio", "IRX_Temporal_valley_ratio", "AMBX_Temporal_valley_ratio",
     # -- AC_RMS ≈ 1.48 × AC_MAD (MAD 更鲁棒，保留 MAD) --
     "GREEN_AC_RMS", "IRX_AC_RMS", "AMBX_AC_RMS",
+    "G1_AC_RMS", "G2_AC_RMS", "G3_AC_RMS",
+    # -- AUTO_CORR_LAG_SEC ≈ 1/DOM_FREQ --
+    "G1_AUTO_CORR_LAG_SEC", "G2_AUTO_CORR_LAG_SEC", "G3_AUTO_CORR_LAG_SEC",
     # -- Hjorth_Activity = var(bp) ≈ (AC_RMS)²，仅 IRX/AMBX 砍 --
     "IRX_Hjorth_Activity", "AMBX_Hjorth_Activity",
     # -- Hjorth_Complexity 二阶导出，极不稳定 --
@@ -1179,10 +1182,17 @@ def _acc_magnitude(acc_window):
 def extract_acc_features(acc_window, fs=100.0, prefix="ACC"):
     feats = OrderedDict()
 
+    _all_keys = ["MAG_MEAN", "MAG_STD", "MAG_MAD", "AXIS_STD_SUM",
+                 "GRAVITY_DOM_RATIO", "BP_RMS", "DIFF_MAD", "STILL_SCORE",
+                 "MAG_P50", "MAG_P90", "YSUM",
+                 "X_MEAN", "X_STD", "X_ENERGY",
+                 "Y_MEAN", "Y_STD", "Y_ENERGY",
+                 "Z_MEAN", "Z_STD", "Z_ENERGY",
+                 "AXIS_MEAN_SUM", "MAG_ENERGY", "MAG_P2P",
+                 "TILT_ANGLE", "DOM_AXIS", "GRAVITY_RATIO"]
+
     if acc_window is None or len(acc_window) < 4:
-        for k in ["MAG_MEAN", "MAG_STD", "MAG_MAD", "AXIS_STD_SUM",
-                  "GRAVITY_DOM_RATIO", "BP_RMS", "DIFF_MAD", "STILL_SCORE",
-                  "MAG_P50", "MAG_P90", "YSUM"]:
+        for k in _all_keys:
             feats[f"{prefix}_{k}"] = 0.0
         return feats
 
@@ -1194,12 +1204,49 @@ def extract_acc_features(acc_window, fs=100.0, prefix="ACC"):
     mag_mean = float(np.mean(mag))
     mag_std = float(np.std(mag))
     mag_mad = robust_mad(mag)
+    mag_energy = float(np.sum(mag ** 2))
+    mag_p2p = float(np.max(mag) - np.min(mag))
 
     axis_std = np.std(acc, axis=0)
     axis_std_sum = float(np.sum(axis_std))
 
     axis_mean_abs = np.abs(np.mean(acc, axis=0))
     dom_axis_ratio = float(np.max(axis_mean_abs) / (np.sum(axis_mean_abs) + 1e-8))
+
+    # Per-axis features (Tier 1): mean, std, energy
+    n_axes = acc.shape[1]
+    axis_labels = ["X", "Y", "Z"]
+    axis_means = np.mean(acc, axis=0)
+    axis_energies = np.sum(acc ** 2, axis=0)
+    for i in range(min(n_axes, 3)):
+        lbl = axis_labels[i]
+        feats[f"{prefix}_{lbl}_MEAN"] = float(axis_means[i])
+        feats[f"{prefix}_{lbl}_STD"] = float(axis_std[i])
+        feats[f"{prefix}_{lbl}_ENERGY"] = float(axis_energies[i])
+    for i in range(n_axes, 3):
+        lbl = axis_labels[i]
+        feats[f"{prefix}_{lbl}_MEAN"] = 0.0
+        feats[f"{prefix}_{lbl}_STD"] = 0.0
+        feats[f"{prefix}_{lbl}_ENERGY"] = 0.0
+    feats[f"{prefix}_AXIS_MEAN_SUM"] = float(np.sum(np.abs(axis_means)))
+
+    # ACC orientation (Tier 2): tilt angle from gravity vector
+    # When worn, one axis typically points down (gravity); off-wrist orientation is random.
+    _grav = axis_means.copy()
+    _grav_norm = float(np.sqrt(np.sum(_grav ** 2)))
+    if _grav_norm > 1e-8:
+        _grav_unit = _grav / _grav_norm
+        # Tilt angle: angle between gravity vector and vertical (Z-up assumed)
+        # cos(theta) = |gz| / |g|, theta=0 means device flat, theta=90 means vertical
+        feats[f"{prefix}_TILT_ANGLE"] = float(np.degrees(np.arccos(np.clip(np.abs(_grav_unit[2]) if n_axes >= 3 else 0.0, 0.0, 1.0))))
+        # Dominant axis index (0=X, 1=Y, 2=Z)
+        feats[f"{prefix}_DOM_AXIS"] = float(np.argmax(np.abs(_grav_unit)))
+        # Gravity concentration: how much of total ACC energy is in the gravity component
+        feats[f"{prefix}_GRAVITY_RATIO"] = float(_grav_norm / (mag_mean + 1e-8))
+    else:
+        feats[f"{prefix}_TILT_ANGLE"] = 0.0
+        feats[f"{prefix}_DOM_AXIS"] = 0.0
+        feats[f"{prefix}_GRAVITY_RATIO"] = 0.0
 
     mag_centered = mag - np.mean(mag)
     try:
@@ -1217,6 +1264,8 @@ def extract_acc_features(acc_window, fs=100.0, prefix="ACC"):
     feats[f"{prefix}_YSUM"] = mag_mean
     feats[f"{prefix}_MAG_STD"] = mag_std
     feats[f"{prefix}_MAG_MAD"] = mag_mad
+    feats[f"{prefix}_MAG_ENERGY"] = mag_energy
+    feats[f"{prefix}_MAG_P2P"] = mag_p2p
     feats[f"{prefix}_AXIS_STD_SUM"] = axis_std_sum
     feats[f"{prefix}_GRAVITY_DOM_RATIO"] = dom_axis_ratio
     feats[f"{prefix}_BP_RMS"] = bp_rms
@@ -1224,6 +1273,61 @@ def extract_acc_features(acc_window, fs=100.0, prefix="ACC"):
     feats[f"{prefix}_STILL_SCORE"] = still_score
     feats[f"{prefix}_MAG_P50"] = float(np.percentile(mag, 50))
     feats[f"{prefix}_MAG_P90"] = float(np.percentile(mag, 90))
+
+    return feats
+
+
+def extract_acc_tremor_features(acc_window, fs=100.0, prefix="ACC"):
+    """Tier 1: 加速度震颤检测特征。
+
+    人体生理性震颤（8-12Hz）和自主运动（0.5-3Hz）在频谱上有明显差异。
+    静止物体（桌面）加速度≈噪声，频谱平坦；手腕有微动+震颤峰值。
+    25Hz ACC 可检测到 ~3-12Hz 的震颤频段。
+    """
+    feats = OrderedDict()
+    _tremor_keys = ["TREMOR_PEAK_FREQ", "TREMOR_PEAK_POWER",
+                    "TREMOR_POWER_RATIO", "LOW_MOTION_RATIO"]
+    if acc_window is None or len(acc_window) < 8:
+        for k in _tremor_keys:
+            feats[f"{prefix}_{k}"] = 0.0
+        return feats
+
+    acc = np.asarray(acc_window, dtype=np.float64)
+    if acc.ndim == 1:
+        acc = acc.reshape(-1, 1)
+
+    mag = _acc_magnitude(acc)
+    mag = mag - np.mean(mag)
+
+    n = len(mag)
+    # Welch-style: simple FFT with hamming window
+    window = np.hamming(n) if n > 0 else np.ones(n)
+    mag_win = mag * window
+    fft = np.abs(np.fft.rfft(mag_win))
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    total_pow = float(np.sum(fft ** 2)) + EPS
+
+    # Tremor band: 3-12 Hz (physiological + essential tremor)
+    tremor_mask = (freqs >= 3.0) & (freqs <= 12.0)
+    tremor_pow = float(np.sum(fft[tremor_mask] ** 2)) if np.any(tremor_mask) else 0.0
+
+    # Low motion band: 0.5-3 Hz (voluntary movement)
+    low_mask = (freqs >= 0.5) & (freqs <= 3.0)
+    low_pow = float(np.sum(fft[low_mask] ** 2)) if np.any(low_mask) else 0.0
+
+    if tremor_pow > EPS and np.any(tremor_mask):
+        tremor_freqs = freqs[tremor_mask]
+        tremor_fft = fft[tremor_mask]
+        peak_idx = int(np.argmax(tremor_fft))
+        feats[f"{prefix}_TREMOR_PEAK_FREQ"] = float(tremor_freqs[peak_idx])
+        feats[f"{prefix}_TREMOR_PEAK_POWER"] = float(tremor_fft[peak_idx] ** 2)
+    else:
+        feats[f"{prefix}_TREMOR_PEAK_FREQ"] = 0.0
+        feats[f"{prefix}_TREMOR_PEAK_POWER"] = 0.0
+
+    feats[f"{prefix}_TREMOR_POWER_RATIO"] = float(tremor_pow / total_pow)
+    feats[f"{prefix}_LOW_MOTION_RATIO"] = float(low_pow / total_pow)
 
     return feats
 
@@ -1601,8 +1705,9 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None):
     )
 
     feat.update(extract_acc_features(acc_window, fs=fs, prefix="ACC"))
+    feat.update(extract_acc_tremor_features(acc_window, fs=fs, prefix="ACC"))
 
-    green_bp = preprocessed.get("g1_bp") if ppg.shape[1] > 2 else None
+    green_bp = preprocessed.get("g_top2_bp") if ppg.shape[1] > 2 else None
     ir_bp = preprocessed.get("ir_bp")
     if green_bp is not None and ir_bp is not None:
         feat.update(extract_acc_ppg_cross_features(acc_window, green_bp, ir_bp, fs=fs))
@@ -1691,7 +1796,10 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     fft_cache = {
         'green': compute_fft_cache(g_mean_bp, fs, fmin=0.5, fmax=5.0),
         'ir': compute_fft_cache(ir_bp, fs, fmin=0.5, fmax=5.0),
-        'amb': compute_fft_cache(amb_bp, fs, fmin=0.5, fmax=5.0)
+        'amb': compute_fft_cache(amb_bp, fs, fmin=0.5, fmax=5.0),
+        'g1': compute_fft_cache(g1_bp, fs, fmin=0.5, fmax=5.0),
+        'g2': compute_fft_cache(g2_bp, fs, fmin=0.5, fmax=5.0),
+        'g3': compute_fft_cache(g3_bp, fs, fmin=0.5, fmax=5.0),
     }
 
     # 3s/75-point robust deployment features: low-cost, stable on short windows.
@@ -1789,6 +1897,88 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     feat.update(spatial_feat)
 
     # =====================================================
+    # 4a2. GREEN_TOP2 aggregation signal (Tier 3)
+    #       Per-channel quality → select best 2 of 3 channels.
+    #       TOP2 is robust to single-channel dropout (watch tilt):
+    #       the worst channel is excluded, preserving signal quality.
+    # =====================================================
+    _ch_ac_rms = np.array([
+        float(np.sqrt(np.mean(g1_bp ** 2))),
+        float(np.sqrt(np.mean(g2_bp ** 2))),
+        float(np.sqrt(np.mean(g3_bp ** 2))),
+    ])
+    _top2_idx = np.argsort(_ch_ac_rms)[-2:]  # indices of 2 highest AC channels
+    _ch_bp = [g1_bp, g2_bp, g3_bp]
+    _ch_raw = [g1_raw, g2_raw, g3_raw]
+    g_top2_bp = np.mean([_ch_bp[i] for i in _top2_idx], axis=0)
+    g_top2_raw = np.mean([_ch_raw[i] for i in _top2_idx], axis=0)
+    feat["G_TOP2_CHANNEL_COUNT"] = float(len(_top2_idx))  # always 2, for consistency
+    feat["G_TOP2_WORST_IDX"] = float(np.argmin(_ch_ac_rms))  # which channel was excluded
+
+    # =====================================================
+    # 4b. Per-channel G1/G2/G3 individual features (Tier 3)
+    #     Extract the same lightweight features from each
+    #     green channel independently. Combined with consensus
+    #     statistics below, this captures directional tilt
+    #     patterns without needing 3 separate models.
+    # =====================================================
+    _ch_data = [
+        ("G1", g1_raw, g1_bp, g1_dc, fft_cache['g1']),
+        ("G2", g2_raw, g2_bp, g2_dc, fft_cache['g2']),
+        ("G3", g3_raw, g3_bp, g3_dc, fft_cache['g3']),
+    ]
+    for _pf, _raw, _bp, _dc, _fc in _ch_data:
+        feat.update(extract_single_channel_features(
+            _raw, _bp, _dc, fs, _pf, fft_cache=_fc
+        ))
+
+    # =====================================================
+    # 4c. Cross-channel consensus statistics (Tier 3)
+    #     For each base feature, compute min/max/range/cv
+    #     across G1/G2/G3. The 120-degree symmetric LED layout
+    #     means the *pattern* of channel deviations encodes
+    #     tilt direction — e.g. G1 low + G2/G3 normal = tilted
+    #     toward G1 direction (still on skin), while all 3 low
+    #     = genuinely off-wrist.
+    # =====================================================
+    _consensus_base = [
+        "DC_MEDIAN", "AC_RMS", "AC_MAD", "AC_DC_RATIO",
+        "DERIV_MAD", "FFT_PEAK_MEDIAN_RATIO", "DOM_FREQ",
+        "AUTO_CORR_PEAK",
+    ]
+    for _base in _consensus_base:
+        _vals = []
+        for _pf, _, _, _, _ in _ch_data:
+            _v = feat.get(f"{_pf}_{_base}", 0.0)
+            _vals.append(float(_v))
+        _arr = np.array(_vals, dtype=np.float64)
+        # _mean skipped: numerically ≈ GREEN_* / G_mean_* (already extracted)
+        feat[f"G_consensus_{_base}_min"] = float(np.min(_arr))
+        feat[f"G_consensus_{_base}_max"] = float(np.max(_arr))
+        feat[f"G_consensus_{_base}_range"] = float(np.max(_arr) - np.min(_arr))
+        _mean_abs = np.mean(np.abs(_arr))
+        feat[f"G_consensus_{_base}_cv"] = float(np.std(_arr) / (_mean_abs + EPS))
+        # top2_mean: mean of best 2 channels, robust to single-channel dropout
+        _sorted = np.sort(_arr)
+        feat[f"G_consensus_{_base}_top2_mean"] = float(np.mean(_sorted[-2:]))
+
+    # =====================================================
+    # 4d. Channel dropout indicators (Tier 3)
+    #     Count how many channels appear "dark" and which
+    #     direction the dropout vector points.
+    # =====================================================
+    _ch_ac = np.array([feat.get(f"{p}_AC_RMS", 0.0) for p in ["G1", "G2", "G3"]])
+    _ch_ac_thr = 0.05 * np.max(_ch_ac) if np.max(_ch_ac) > EPS else EPS
+    _dropout_mask = _ch_ac < _ch_ac_thr
+    feat["G_DROPOUT_COUNT"] = float(np.sum(_dropout_mask))
+    feat["G_MIN_CHANNEL_ID"] = float(np.argmin(_ch_ac))  # always report weakest channel
+    # Dropout direction: angle of the vector from G1/G2/G3 AC values
+    # in the 120-degree coordinate system (same transform as spatial vmag)
+    _vx_drop = _ch_ac[0] - 0.5 * _ch_ac[1] - 0.5 * _ch_ac[2]
+    _vy_drop = (np.sqrt(3.0) / 2.0) * (_ch_ac[1] - _ch_ac[2])
+    feat["G_DROPOUT_ANGLE"] = float(np.degrees(np.arctan2(_vy_drop, _vx_drop + EPS)))
+
+    # =====================================================
     # 5. 光学通道交叉特征（使用FFT缓存）
     # =====================================================
     feat.update(extract_cross_channel_features(
@@ -1877,6 +2067,80 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     feat["corr_Ambient_vmag"] = safe_corr(amb_raw, g_vmag)
 
     # =====================================================
+    # 7b. IR FFT harmonic + SNR features (Tier 2)
+    #     IR is the primary pulse-sensing channel; FFT harmonic structure
+    #     is a strong indicator of real PPG vs noise/static.
+    # =====================================================
+    for _ch_label, _ch_cache in [("IR", fft_cache['ir'])]:
+        _fc = _ch_cache
+        if _fc.get('band_spec') is not None and len(_fc['band_spec']) > 0:
+            _bs = _fc['band_spec']
+            _bf = _fc['band_freqs']
+            # SNR
+            _in_band = float(np.sum(_bs ** 2))
+            _out_band = float(np.sum(_fc['spec'] ** 2)) - _in_band
+            feat[f"{_ch_label}_FFT_SNR"] = float(_in_band / (_out_band + EPS))
+            # Harmonic ratio
+            _f0_idx = int(np.argmax(_bs))
+            _f0 = _bf[_f0_idx]
+            _f0_power = float(_bs[_f0_idx] ** 2)
+            _h2_mask = (_bf >= _f0 * 2 - 0.3) & (_bf <= _f0 * 2 + 0.3)
+            if np.any(_h2_mask):
+                _h2_power = float(np.max(_bs[_h2_mask] ** 2))
+                feat[f"{_ch_label}_FFT_harmonic_ratio"] = float(_h2_power / (_f0_power + EPS))
+                feat[f"{_ch_label}_FFT_harmonic_present"] = 1.0 if _h2_power > _f0_power * 0.1 else 0.0
+            else:
+                feat[f"{_ch_label}_FFT_harmonic_ratio"] = 0.0
+                feat[f"{_ch_label}_FFT_harmonic_present"] = 0.0
+            # Peak width
+            _peak_val = np.max(_bs)
+            _above_half = _bs > _peak_val * 0.5
+            feat[f"{_ch_label}_FFT_peak_width_Hz"] = float(_bf[_above_half][-1] - _bf[_above_half][0]) if np.any(_above_half) else 0.0
+        else:
+            for _suffix in ["FFT_SNR", "FFT_harmonic_ratio", "FFT_harmonic_present", "FFT_peak_width_Hz"]:
+                feat[f"{_ch_label}_{_suffix}"] = 0.0
+
+    # =====================================================
+    # 7c. AMB spectral features (Tier 2)
+    #     Ambient light spectrum helps distinguish skin-contact (light blocked)
+    #     from off-wrist (ambient fluctuations visible).
+    # =====================================================
+    _fc_amb = fft_cache['amb']
+    if _fc_amb.get('band_spec') is not None and len(_fc_amb['band_spec']) > 0:
+        _bs = _fc_amb['band_spec']
+        _bf = _fc_amb['band_freqs']
+        feat["AMB_DOM_FREQ"] = float(_bf[int(np.argmax(_bs))])
+        feat["AMB_FFT_PEAK_MEDIAN_RATIO"] = float(_fc_amb.get('peak_ratio', 0.0))
+    else:
+        feat["AMB_DOM_FREQ"] = 0.0
+        feat["AMB_FFT_PEAK_MEDIAN_RATIO"] = 0.0
+
+    # =====================================================
+    # 7d. Per-channel skewness/kurtosis for AMB (Tier 2)
+    #     GREEN and IRX already have these; AMB waveform shape
+    #     indicates ambient light modulation patterns.
+    # =====================================================
+    _m_amb = float(np.mean(amb_bp))
+    _s_amb = float(np.std(amb_bp))
+    if _s_amb > EPS:
+        feat["AMBX_bp_skewness"] = float(np.mean((amb_bp - _m_amb) ** 3) / (_s_amb ** 3))
+        feat["AMBX_bp_kurtosis"] = float(np.mean((amb_bp - _m_amb) ** 4) / (_s_amb ** 4))
+    else:
+        feat["AMBX_bp_skewness"] = 0.0
+        feat["AMBX_bp_kurtosis"] = 0.0
+
+    # =====================================================
+    # 7e. Signal quality indicators (Tier 2)
+    #     Detect sensor saturation, clipping, and poor contact.
+    # =====================================================
+    for _ch_label, _ch_raw in [("GREEN", g_mean_raw), ("IR", ir_raw)]:
+        _sat_thr = 0.98 * np.max(_ch_raw)
+        feat[f"{_ch_label}_SAT_FRAC"] = float(np.mean(_ch_raw >= _sat_thr))
+        _d = np.diff(_ch_raw)
+        _clip_eps = 1e-10
+        feat[f"{_ch_label}_CLIP_RATE"] = float(np.mean(np.abs(_d) < _clip_eps))
+
+    # =====================================================
     # 8. 新增特征: Hjorth参数
     # =====================================================
     feat.update(extract_hjorth_parameters(g_mean_bp, prefix="GREEN"))
@@ -1906,8 +2170,43 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     feat.update(extract_temporal_dynamic_features(amb_bp, fs, prefix="AMBX"))
 
     # =====================================================
+    # 11b. GTOP2 waveform features (Tier 3)
+    #       Same Hjorth/Derivative/Temporal features from
+    #       the top-2 green channels. Uncontaminated by the
+    #       worst channel when watch is tilted.
+    #       SampEn skipped: O(N²) not worth duplicating.
+    # =====================================================
+    feat.update(extract_hjorth_parameters(g_top2_bp, prefix="GTOP2"))
+    feat.update(extract_derivative_features(g_top2_bp, fs, prefix="GTOP2"))
+    feat.update(extract_temporal_dynamic_features(g_top2_bp, fs, prefix="GTOP2"))
+
+    # =====================================================
     # 12. 清理异常数值 + 移除已知冗余特征
     # =====================================================
+    # 注意: 此处将 None / NaN / inf 统一替换为 0.0，这是 s03 层面的"兜底"处理。
+    # 这意味着下游 s04/s05 从 CSV 读取特征时通常不会看到 NaN/inf（已被 0.0 替代）。
+    # 0.0 不一定是该特征的合理默认值，但后续会被 s05 clip_outliers 裁剪到 IQR 下界，
+    # 且 s05/s06 的 fill+clip 链会在此基础上做额外的防御性处理。
+    # 训练与推理使用相同的 s03 代码，因此这一行为在两端一致，不构成训练-部署 gap。
+
+    # ---- Invalid feature count (before NaN→0.0 fill) ----
+    # Count features that could not be computed. This lets XGBoost
+    # distinguish "genuinely low value" from "computation failed".
+    # Computed BEFORE the 0.0 fill below so we capture the true invalid count.
+    _invalid_total = 0
+    _invalid_ppg = 0
+    _invalid_green = 0
+    for k, v in feat.items():
+        if v is None or not np.isfinite(v):
+            _invalid_total += 1
+            if any(k.startswith(p) for p in ["GREEN", "G_", "G1", "G2", "G3", "GTOP2", "IRX", "AMBX", "IR_", "AMB_", "IR_over", "Ambient", "log_IR", "corr_"]):
+                if any(k.startswith(p) for p in ["GREEN", "G_", "G1", "G2", "G3", "GTOP2"]):
+                    _invalid_green += 1
+                _invalid_ppg += 1
+    feat["TOTAL_INVALID_COUNT"] = float(_invalid_total)
+    feat["PPG_INVALID_COUNT"] = float(_invalid_ppg)
+    feat["GREEN_INVALID_COUNT"] = float(_invalid_green)
+
     for k in list(feat.keys()):
         if k in _REDUNDANT_FEATURES:
             del feat[k]
@@ -1922,6 +2221,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     if return_preprocessed:
         preprocessed = {
             'g1_bp': g1_bp, 'g2_bp': g2_bp, 'g3_bp': g3_bp,
+            'g_top2_bp': g_top2_bp, 'g_top2_raw': g_top2_raw,
             'ir_bp': ir_bp, 'amb_bp': amb_bp,
             'g_mean_bp': g_mean_bp
         }
@@ -2021,7 +2321,8 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                 )
                 if acc_seg is not None and len(acc_seg) > 0:
                     feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                    green_bp = preprocessed.get("g1_bp")
+                    feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
+                    green_bp = preprocessed.get("g_top2_bp")
                     ir_bp = preprocessed.get("ir_bp")
                     if green_bp is not None and ir_bp is not None:
                         feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
@@ -2097,7 +2398,8 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                 acc_seg = align_acc_window(acc_25, len(ppg_25), start, win_25,
                                            fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
                 feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                green_bp = preprocessed.get("g1_bp")
+                feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
+                green_bp = preprocessed.get("g_top2_bp")
                 ir_bp = preprocessed.get("ir_bp")
                 if green_bp is not None and ir_bp is not None:
                     feat.update(extract_acc_ppg_cross_features(

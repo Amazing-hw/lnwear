@@ -41,7 +41,7 @@ def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
     monkeypatch.setattr(
         s03,
         "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "ir_bp": np.ones(75)}),
+        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "g_top2_bp": np.ones(75), "ir_bp": np.ones(75)}),
     )
 
     rows = s03._extract_rows_for_sample(
@@ -94,7 +94,7 @@ def test_s06_prewindowed_inference_emits_existing_windows(monkeypatch):
     monkeypatch.setattr(
         s06,
         "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "ir_bp": np.ones(75)}),
+        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "g_top2_bp": np.ones(75), "ir_bp": np.ones(75)}),
     )
     monkeypatch.setattr(
         s06,
@@ -204,7 +204,7 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
     monkeypatch.setattr(
         s03,
         "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "ir_bp": np.ones(75)}),
+        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "g_top2_bp": np.ones(75), "ir_bp": np.ones(75)}),
     )
 
     rows = s03._extract_rows_for_sample(
@@ -260,7 +260,7 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
     monkeypatch.setattr(
         s06,
         "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "ir_bp": np.ones(75)}),
+        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "g_top2_bp": np.ones(75), "ir_bp": np.ones(75)}),
     )
     monkeypatch.setattr(
         s06,

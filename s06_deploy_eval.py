@@ -53,6 +53,7 @@ from s03_extract_feature_pool import (
     extract_feature_pool_from_window,
     align_acc_window,
     extract_acc_features,
+    extract_acc_tremor_features,
     extract_acc_ppg_cross_features,
     validate_h5_file,
     load_grouped_window_metadata,
@@ -71,7 +72,7 @@ DEFAULT_POSTPROCESS_CONFIG = {
     "T_off": 0.35,
     "K_on": 5,
     "K_off": 3,
-    "cooldown_sec": 2,
+    "cooldown_sec": 5,
 }
 
 STAGE1_PRIMITIVE_SEC = 1.0
@@ -139,12 +140,13 @@ def assert_bundle_ok(bundle):
 
 
 def apply_preprocess(feat_dict_list, bundle=None):
-    """列对齐 + 缺失填充（无标准化）"""
+    """列对齐 + inf处理 + 缺失填充 + clip（与训练侧 s05 一致）"""
     b = bundle if bundle is not None else _BUNDLE
     assert b is not None, "must call load_bundle() first"
 
     feature_names = b["feature_names"]
     fill_values = b["fill_values"]
+    clip_bounds = b.get("clip_bounds", {})  # 向后兼容旧 bundle（无 clip_bounds）
 
     df = pd.DataFrame(feat_dict_list)
 
@@ -154,7 +156,13 @@ def apply_preprocess(feat_dict_list, bundle=None):
     df = df[feature_names]
 
     for c in feature_names:
+        df[c] = df[c].replace([np.inf, -np.inf], np.nan)
         df[c] = df[c].fillna(fill_values[c])
+    for c, bound in clip_bounds.items():
+        if c not in df.columns or not isinstance(bound, (list, tuple)) or len(bound) != 2:
+            continue
+        lo, hi = float(bound[0]), float(bound[1])
+        df[c] = df[c].clip(lower=lo, upper=hi)
 
     return df.values.astype(np.float64)
 
@@ -180,7 +188,7 @@ def predict_label_windows(feat_dict_list, bundle=None):
 # =========================================================
 
 class WearStateMachine:
-    def __init__(self, alpha=0.4, T_on=0.75, T_off=0.35, K_on=5, K_off=3, cooldown_sec=2):
+    def __init__(self, alpha=0.4, T_on=0.75, T_off=0.35, K_on=5, K_off=3, cooldown_sec=5):
         self.alpha = alpha
         self.T_on = T_on
         self.T_off = T_off
@@ -483,7 +491,8 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
                     acc_seg = None
             if acc_seg is not None and len(acc_seg) > 0:
                 feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                green_bp = preprocessed.get("g1_bp")
+                feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
+                green_bp = preprocessed.get("g_top2_bp")
                 ir_bp = preprocessed.get("ir_bp")
                 if green_bp is not None and ir_bp is not None:
                     feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
@@ -664,7 +673,8 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
                     acc_seg = align_acc_window(acc_25, len(ppg_25), s2_start, win_25,
                                                fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
                     feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                    green_bp = preprocessed.get("g1_bp")
+                    feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
+                    green_bp = preprocessed.get("g_top2_bp")
                     ir_bp = preprocessed.get("ir_bp")
                     if green_bp is not None and ir_bp is not None:
                         feat.update(extract_acc_ppg_cross_features(
@@ -2264,7 +2274,6 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     从已有的 artifacts 中读取：
       - stage1_threshold.json
       - model_bundle.pkl
-      - selected_features.json
       - final_model_config.json (可选)
 
     产生：
@@ -2292,8 +2301,6 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     with open(stage1_path, "r", encoding="utf-8") as f:
         stage1 = json.load(f)
     bundle = joblib.load(bundle_path)
-    with open(features_path, "r", encoding="utf-8") as f:
-        features = json.load(f)
     postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
     if _os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -2301,7 +2308,17 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
         if "postprocess" in fcfg:
             postprocess_cfg.update(fcfg["postprocess"])
 
-    selected_features = features["selected_features"]
+    selected_features = list(bundle["feature_names"])
+    if _os.path.exists(features_path):
+        try:
+            with open(features_path, "r", encoding="utf-8") as f:
+                features = json.load(f)
+            stale_selected = list(features.get("selected_features", []))
+            if stale_selected and stale_selected != selected_features:
+                print("[WARN] selected_features.json differs from model_bundle.pkl; "
+                      "deploy package uses bundle['feature_names']")
+        except Exception as e:
+            print(f"[WARN] selected_features.json could not be read: {e}")
     model = bundle["model"]
     raw = bundle.get("raw_model", model)
     booster = raw.get_booster()
