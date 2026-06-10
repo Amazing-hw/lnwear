@@ -371,6 +371,18 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
         )
     )
     _add_acc_ppg_coherence(features, acc, preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"]), fs)
+    # ACC energy to green AC ratio (运动能量 vs 脉搏能量)
+    _g_bp = preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"])
+    _g_ac = float(np.sqrt(np.mean(_g_bp ** 2))) if _g_bp is not None else 0.0
+    _acc_energy = float(features.get("ACC_MAG_ENERGY", 0.0))
+    features["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
+    # Ambient Stage1 soft features (环境光软特征)
+    _ir_dc = float(np.median(ir)) if ir is not None and len(ir) > 0 else 0.0
+    _amb_dc = float(np.median(ambient)) if ambient is not None and len(ambient) > 0 else 0.0
+    _amb_ratio = float(_amb_dc / max(_ir_dc, EPS))
+    features["AMB_STAGE1_RATIO"] = _amb_ratio
+    features["AMB_STAGE1_PASS"] = 1.0 if (_ir_dc >= 1e2 and _amb_ratio < 2.0) else 0.0
+    features["IR_DC_LEVEL"] = _ir_dc
     features["mode"] = float(mode)
 
     missing = [name for name in FEATURE_ORDER if name not in features]
@@ -1200,15 +1212,15 @@ def main():
                    help="number of stage-1 structure candidates advanced to stage-2 refine")
     p.add_argument("--model_search_stage2_top_k", type=int, default=80,
                    help="number of stage-A candidates kept for s05 staged_group_cv")
-    p.add_argument("--model_search_feature_counts", type=str, default="",
-                   help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15)。留空则使用 --max_features 固定值")
+    p.add_argument("--model_search_feature_counts", type=str, default="10,12,15,18,20",
+                   help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。留空则用 --max_features")
     p.add_argument("--model_search_cv_folds", type=int, default=3,
                    help="s05 staged_group_cv folds")
     p.add_argument("--model_search_cv_repeats", type=int, default=2,
                    help="s05 staged_group_cv repeats")
     p.add_argument("--model_search_random_state", type=int, default=42,
                    help="s05 model-search sampling/CV seed")
-    p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60,70,80",
+    p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60",
                    help="comma-separated s05 n_estimators candidates")
     p.add_argument("--model_search_max_depth", default="2,3,4",
                    help="comma-separated s05 max_depth candidates")

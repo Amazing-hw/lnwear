@@ -61,7 +61,7 @@ MODEL_SEARCH_PARAM_KEYS = [
 ]
 
 DEFAULT_MODEL_SEARCH_SPACE = {
-    "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 80],
+    "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60],
     "max_depth": [2, 3, 4],
     "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
     "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
@@ -1404,13 +1404,113 @@ def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
     return info
 
 
+def _compute_scale_pos_weight(args, neg_count, pos_count, p_train_pos):
+    """计算 scale_pos_weight，返回 (sw, strategy_str)。"""
+    if args.legacy_scale_pos_weight:
+        sw = (neg_count / pos_count) if pos_count > 0 else 1.0
+        return sw, "legacy_neg_over_pos"
+    if args.target_deploy_ratio is not None:
+        r = float(args.target_deploy_ratio)
+        r = min(max(r, 1e-6), 1 - 1e-6)
+        if 0.0 < p_train_pos < 1.0:
+            sw = (r * (1 - p_train_pos)) / ((1 - r) * p_train_pos)
+        else:
+            sw = 1.0
+        return sw, f"target_deploy_ratio={r}"
+    return 1.0, "balanced_1.0"
+
+
+def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
+                 calibration_threshold_split, scale_pos_weight):
+    """用 top-k 特征训练并返回完整结果。
+
+    返回 dict: model, search_summary, search_records, features, fill_values,
+                clip_bounds, X_valid, y_valid, model_select_split, df_calib
+    """
+    # clip
+    df_train, clip_bounds = clip_outliers(df_train_raw, features, k=1.5, return_bounds=True)
+    df_valid = clip_outliers(df_valid_raw, features, k=1.5, bounds=clip_bounds)
+
+    # fill
+    fill_values = prepare_fill_values(df_train, features)
+    X_train, y_train, _ = prepare_xy(df_train, features, fill_values=fill_values)
+    X_valid, y_valid, _ = prepare_xy(df_valid, features, fill_values=fill_values)
+
+    # model selection split
+    df_calib_pool = df_valid
+    if args.model_search and args.model_search_strategy == "single_split":
+        df_model_select, df_calib, model_select_split = split_calibration_for_model_search(
+            df_calib_pool,
+            search_fraction=args.model_search_valid_fraction,
+            random_state=args.calibration_random_state,
+        )
+    elif args.model_search:
+        df_model_select = df_calib_pool.copy()
+        df_calib = df_calib_pool
+        model_select_split = {
+            "fallback": False, "reason": "train_group_cv",
+            "model_selection_groups": None,
+            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+        }
+    else:
+        df_model_select = df_calib_pool.copy()
+        df_calib = df_calib_pool
+        model_select_split = {
+            "fallback": False, "reason": "model_search_disabled",
+            "model_selection_groups": None,
+            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+        }
+
+    X_model_select, y_model_select, _ = prepare_xy(
+        df_model_select, features, fill_values=fill_values)
+
+    # train
+    model_search_records = []
+    model_search_summary = {
+        "enabled": False, "selection_data": None,
+        "max_model_nodes": int(args.max_model_nodes),
+        "fp_cost": float(args.model_search_fp_cost),
+        "size_cost": float(args.model_search_size_cost),
+        "fixed_params": build_default_xgb_params(scale_pos_weight=scale_pos_weight),
+    }
+    if args.model_search:
+        raw_model, model_search_summary, model_search_records = search_xgb_hyperparameters(
+            args, X_train, y_train, X_model_select, y_model_select,
+            scale_pos_weight=scale_pos_weight, groups=train_groups,
+        )
+        model_search_summary["split"] = model_select_split
+    else:
+        raw_model = train_xgb_with_params(
+            build_default_xgb_params(scale_pos_weight=scale_pos_weight),
+            X_train, y_train,
+        )
+        model_search_summary["split"] = model_select_split
+
+    total_nodes = count_xgb_nodes(raw_model)
+    best_score = float(model_search_summary.get("best", {}).get("score", float("-inf")))
+    valid_default = eval_model(raw_model, X_valid, y_valid, threshold=0.5)
+    valid_acc = float(valid_default.get("accuracy", 0.0))
+
+    logger.info(f"  [k={k}] features={len(features)} nodes={total_nodes} "
+                f"valid_acc={valid_acc:.4f} search_score={best_score:.4f}")
+
+    return {
+        "k": k, "features": list(features), "model": raw_model,
+        "fill_values": fill_values, "clip_bounds": clip_bounds,
+        "X_valid": X_valid, "y_valid": y_valid, "df_calib": df_calib,
+        "search_summary": model_search_summary, "search_records": model_search_records,
+        "valid_acc": valid_acc, "search_score": best_score,
+        "total_nodes": total_nodes,
+    }
+
+
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument("--max_features", type=int, default=None,
                         help="从 ranked_features.json 取 top-k 特征；默认 None 时回退到 selected_features.json")
-    parser.add_argument("--model_search_feature_counts", type=str, default="",
-                        help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15)。留空则使用 --max_features 固定值")
+    parser.add_argument("--model_search_feature_counts", type=str, default="10,12,15,18,20",
+                        help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。留空则使用 --max_features 固定值")
     parser.add_argument(
         "--threshold_objective", type=str, default="fbeta",
         choices=["f1", "precision", "recall", "fbeta", "precision_constrained"],
@@ -1525,82 +1625,155 @@ def main(args=None):
     df_train_raw = pd.read_csv(feature_pool_train_path)
     df_valid_raw = pd.read_csv(feature_pool_valid_path)
 
-    # 异常值裁剪：从 train 学边界，应用到 train 与 valid（保持分布一致，避免 valid 自带 IQR 泄漏）
-    logger.info("应用异常值裁剪 (train 学边界 → train/valid 同步应用)...")
-    df_train, clip_bounds = clip_outliers(df_train_raw, selected_features, k=1.5,
-                                          return_bounds=True)
-    df_valid = clip_outliers(df_valid_raw, selected_features, k=1.5, bounds=clip_bounds)
+    # ── 特征数量搜参：解析 --model_search_feature_counts ──
+    _fc_str = getattr(args, "model_search_feature_counts", "") or ""
+    _feature_counts = []
+    if _fc_str.strip():
+        for _part in _fc_str.split(","):
+            _part = _part.strip()
+            if _part.isdigit():
+                _feature_counts.append(int(_part))
+        _feature_counts = sorted(set(_feature_counts))
 
-    # 质量阈值 / OOD 分位数都基于裁剪后的 train，特征池里所有可用的列都覆盖到（quality 看固定 3 个特征）
-    quality_thresholds = learn_quality_thresholds(df_train, QUALITY_FEATURES_DEFAULT)
-    feature_quantiles = compute_feature_quantiles(
-        df_train, selected_features,
-        q_low=args.ood_q_low, q_high=args.ood_q_high
-    )
-    df_calib_pool, df_threshold, calibration_threshold_split = split_valid_for_calibration_threshold(
-        df_valid,
-        threshold_fraction=args.threshold_valid_fraction,
-        random_state=args.calibration_random_state,
-    )
-    if args.model_search and args.model_search_strategy == "single_split":
-        df_model_select, df_calib, model_selection_split = split_calibration_for_model_search(
-            df_calib_pool,
-            search_fraction=args.model_search_valid_fraction,
+    # ── 多 k 分支 / 单 k 分支 ──
+    if _feature_counts and os.path.exists(ranked_features_path):
+        # ============ 多 k 搜参 ============
+        if not args.model_search:
+            logger.warning("model_search_feature_counts 已指定但 model_search 未启用，"
+                           "仅用默认 XGBoost 参数遍历不同 k 值。")
+
+        with open(ranked_features_path, "r", encoding="utf-8") as _f:
+            _ranked = json.load(_f)
+
+        _max_k = min(max(_feature_counts), len(_ranked))
+        _ks = [k for k in _feature_counts if k <= _max_k]
+        if not _ks:
+            _ks = [min(args.max_features if args.max_features is not None else 15, len(_ranked))]
+
+        logger.info(f"特征数搜参: 测试 k ∈ {_ks}（共 {len(_ks)} 个候选，"
+                    f"ranked_features 共 {len(_ranked)} 个）")
+
+        # 前置：计算一次 scale_pos_weight（不随 k 变化）
+        _all_features = [r["feature"] for r in _ranked]
+        _df_tmp, _ = clip_outliers(df_train_raw, _all_features[:min(10, len(_all_features))], k=1.5)
+        _fv_tmp = prepare_fill_values(_df_tmp, _df_tmp.columns.tolist())
+        _X_tmp, _y_tmp, _ = prepare_xy(_df_tmp, _df_tmp.columns.tolist(), fill_values=_fv_tmp)
+        _train_groups = (df_train_raw["sample_name"].astype("object").to_numpy()
+                         if "sample_name" in df_train_raw.columns else None)
+        _neg_count = int(np.sum(_y_tmp == 0))
+        _pos_count = int(np.sum(_y_tmp == 1))
+        _p_train_pos = _pos_count / float(max(_neg_count + _pos_count, 1))
+        _sw, _sw_strategy = _compute_scale_pos_weight(args, _neg_count, _pos_count, _p_train_pos)
+
+        _best_result = None
+        _best_score = float("-inf")
+        for _k in _ks:
+            _feats = [r["feature"] for r in _ranked[:_k]]
+            _result = _train_for_k(
+                args, _k, _feats, df_train_raw, df_valid_raw,
+                _train_groups, None, _sw,
+            )
+            _result["search_summary"]["scale_pos_weight"] = _sw
+            _score = _result["search_score"] if args.model_search else _result["valid_acc"]
+            _result["_combined_score"] = _score
+            if _score > _best_score:
+                _best_score = _score
+                _best_result = _result
+
+        logger.info(f"特征数搜参完成: best k={_best_result['k']} score={_best_score:.4f}")
+        selected_features = _best_result["features"]
+        raw_model = _best_result["model"]
+        fill_values = _best_result["fill_values"]
+        clip_bounds = _best_result["clip_bounds"]
+        X_valid = _best_result["X_valid"]
+        y_valid = _best_result["y_valid"]
+        df_calib = _best_result["df_calib"]
+        model_search_summary = _best_result["search_summary"]
+        model_search_records = _best_result["search_records"]
+        model_search_summary["feature_search"] = {
+            "enabled": True,
+            "candidates_tested": _ks,
+            "best_k": int(_best_result["k"]),
+            "selection_metric": "search_score" if args.model_search else "valid_accuracy",
+            "best_score": float(_best_score),
+        }
+        # 单 k 分支下后续需要的变量
+        scale_pos_weight = _sw
+        scale_pos_weight_strategy = _sw_strategy
+        calibration_threshold_split = None  # 多 k 分支下不需要 threshold split（用 valid 全量）
+        X_threshold = X_valid
+        y_threshold = y_valid
+        X_calib = X_valid
+        y_calib = y_valid
+        train_groups = _train_groups
+        neg_count, pos_count = _neg_count, _pos_count
+        p_train_pos = _p_train_pos
+        feature_quantiles = compute_feature_quantiles(
+            clip_outliers(df_train_raw, selected_features, k=1.5, bounds=clip_bounds)[0],
+            selected_features, q_low=args.ood_q_low, q_high=args.ood_q_high,
+        )
+
+    else:
+        # ============ 单 k 分支（原有逻辑）============
+        logger.info("应用异常值裁剪 (train 学边界 → train/valid 同步应用)...")
+        df_train, clip_bounds = clip_outliers(df_train_raw, selected_features, k=1.5,
+                                              return_bounds=True)
+        df_valid = clip_outliers(df_valid_raw, selected_features, k=1.5, bounds=clip_bounds)
+
+        quality_thresholds = learn_quality_thresholds(df_train, QUALITY_FEATURES_DEFAULT)
+        feature_quantiles = compute_feature_quantiles(
+            df_train, selected_features,
+            q_low=args.ood_q_low, q_high=args.ood_q_high
+        )
+        df_calib_pool, df_threshold, calibration_threshold_split = split_valid_for_calibration_threshold(
+            df_valid,
+            threshold_fraction=args.threshold_valid_fraction,
             random_state=args.calibration_random_state,
         )
-    elif args.model_search:
-        df_model_select = df_calib_pool.copy()
-        df_calib = df_calib_pool
-        model_selection_split = {
-            "fallback": False,
-            "reason": "train_group_cv",
-            "model_selection_groups": None,
-            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
-        }
-    else:
-        df_model_select = df_calib_pool.copy()
-        df_calib = df_calib_pool
-        model_selection_split = {
-            "fallback": False,
-            "reason": "model_search_disabled",
-            "model_selection_groups": None,
-            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
-        }
+        if args.model_search and args.model_search_strategy == "single_split":
+            df_model_select, df_calib, model_selection_split = split_calibration_for_model_search(
+                df_calib_pool,
+                search_fraction=args.model_search_valid_fraction,
+                random_state=args.calibration_random_state,
+            )
+        elif args.model_search:
+            df_model_select = df_calib_pool.copy()
+            df_calib = df_calib_pool
+            model_selection_split = {
+                "fallback": False,
+                "reason": "train_group_cv",
+                "model_selection_groups": None,
+                "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+            }
+        else:
+            df_model_select = df_calib_pool.copy()
+            df_calib = df_calib_pool
+            model_selection_split = {
+                "fallback": False,
+                "reason": "model_search_disabled",
+                "model_selection_groups": None,
+                "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+            }
 
-    fill_values = prepare_fill_values(df_train, selected_features)
+        fill_values = prepare_fill_values(df_train, selected_features)
 
-    X_train, y_train, _ = prepare_xy(
-        df_train,
-        selected_features,
-        fill_values=fill_values
-    )
-    train_groups = (
-        df_train["sample_name"].astype("object").to_numpy()
-        if "sample_name" in df_train.columns else None
-    )
+        X_train, y_train, _ = prepare_xy(
+            df_train, selected_features, fill_values=fill_values)
+        train_groups = (
+            df_train["sample_name"].astype("object").to_numpy()
+            if "sample_name" in df_train.columns else None
+        )
 
-    X_valid, y_valid, _ = prepare_xy(
-        df_valid,
-        selected_features,
-        fill_values=fill_values
-    )
-    X_calib, y_calib, _ = prepare_xy(
-        df_calib,
-        selected_features,
-        fill_values=fill_values
-    )
-    X_model_select, y_model_select, _ = prepare_xy(
-        df_model_select,
-        selected_features,
-        fill_values=fill_values
-    )
-    X_threshold, y_threshold, _ = prepare_xy(
-        df_threshold,
-        selected_features,
-        fill_values=fill_values
-    )
+        X_valid, y_valid, _ = prepare_xy(
+            df_valid, selected_features, fill_values=fill_values)
+        X_calib, y_calib, _ = prepare_xy(
+            df_calib, selected_features, fill_values=fill_values)
+        X_model_select, y_model_select, _ = prepare_xy(
+            df_model_select, selected_features, fill_values=fill_values)
+        X_threshold, y_threshold, _ = prepare_xy(
+            df_threshold, selected_features, fill_values=fill_values)
 
-    # 样本权重策略
+        # 样本权重策略
     #
     # 旧行为 (legacy)：scale_pos_weight = neg/pos
     #   问题：与 target_aware_stride（pos=3s, neg=1s）叠加，会双倍偏置模型预测正类，
@@ -1619,63 +1792,85 @@ def main(args=None):
     n_total = max(neg_count + pos_count, 1)
     p_train_pos = pos_count / float(n_total)
 
-    scale_pos_weight_strategy = "balanced_1.0"
-    if args.legacy_scale_pos_weight:
-        scale_pos_weight = (neg_count / pos_count) if pos_count > 0 else 1.0
-        scale_pos_weight_strategy = "legacy_neg_over_pos"
-    elif args.target_deploy_ratio is not None:
-        r = float(args.target_deploy_ratio)
-        r = min(max(r, 1e-6), 1 - 1e-6)
-        if 0.0 < p_train_pos < 1.0:
-            scale_pos_weight = (r * (1 - p_train_pos)) / ((1 - r) * p_train_pos)
+    if not _feature_counts:
+        scale_pos_weight_strategy = "balanced_1.0"
+        if args.legacy_scale_pos_weight:
+            scale_pos_weight = (neg_count / pos_count) if pos_count > 0 else 1.0
+            scale_pos_weight_strategy = "legacy_neg_over_pos"
+        elif args.target_deploy_ratio is not None:
+            r = float(args.target_deploy_ratio)
+            r = min(max(r, 1e-6), 1 - 1e-6)
+            if 0.0 < p_train_pos < 1.0:
+                scale_pos_weight = (r * (1 - p_train_pos)) / ((1 - r) * p_train_pos)
+            else:
+                scale_pos_weight = 1.0
+            scale_pos_weight_strategy = f"target_deploy_ratio={r}"
         else:
             scale_pos_weight = 1.0
-        scale_pos_weight_strategy = f"target_deploy_ratio={r}"
-    else:
-        scale_pos_weight = 1.0
 
-    logger.info("样本分布统计:")
-    logger.info(f"  负样本(target=0): {neg_count}")
-    logger.info(f"  正样本(target=1): {pos_count}")
-    logger.info(f"  train 正类占比 p_train_pos: {p_train_pos:.4f}")
-    logger.info(f"  scale_pos_weight 策略: {scale_pos_weight_strategy}")
-    logger.info(f"  scale_pos_weight: {scale_pos_weight:.4f}")
-    if args.target_deploy_ratio is None and not args.legacy_scale_pos_weight:
-        logger.info("  提示：未指定 --target_deploy_ratio。FP 高代价场景建议先估部署条件分布再传入。")
+        logger.info("样本分布统计:")
+        logger.info(f"  负样本(target=0): {neg_count}")
+        logger.info(f"  正样本(target=1): {pos_count}")
+        logger.info(f"  train 正类占比 p_train_pos: {p_train_pos:.4f}")
+        logger.info(f"  scale_pos_weight 策略: {scale_pos_weight_strategy}")
+        logger.info(f"  scale_pos_weight: {scale_pos_weight:.4f}")
+        if args.target_deploy_ratio is None and not args.legacy_scale_pos_weight:
+            logger.info("  提示：未指定 --target_deploy_ratio。FP 高代价场景建议先估部署条件分布再传入。")
 
-    # 部署约束: 总节点数 ≤500。深度3满树=15节点，强正则化下实际~8-10。/树
-    # 40树 × 8-10 ≈ 320-400 设计节点数
-    model_search_records = []
-    model_search_summary = {
-        "enabled": False,
-        "selection_data": None,
-        "max_model_nodes": int(args.max_model_nodes),
-        "fp_cost": float(args.model_search_fp_cost),
-        "size_cost": float(args.model_search_size_cost),
-        "fixed_params": build_default_xgb_params(scale_pos_weight=scale_pos_weight),
-    }
-    if args.model_search:
-        raw_model, model_search_summary, model_search_records = search_xgb_hyperparameters(
-            args,
-            X_train,
-            y_train,
-            X_model_select,
-            y_model_select,
-            scale_pos_weight=scale_pos_weight,
-            groups=train_groups,
-        )
-        model_search_summary["split"] = model_selection_split
-        logger.info("model_search best score=%.6f total_nodes=%d params=%s",
-                    model_search_summary["best"]["score"],
-                    model_search_summary["best"]["total_nodes"],
-                    model_search_summary["best"]["params"])
-    else:
-        raw_model = train_xgb_with_params(
-            build_default_xgb_params(scale_pos_weight=scale_pos_weight),
-            X_train,
-            y_train,
-        )
-        model_search_summary["split"] = model_selection_split
+        model_search_records = []
+        model_search_summary = {
+            "enabled": False,
+            "selection_data": None,
+            "max_model_nodes": int(args.max_model_nodes),
+            "fp_cost": float(args.model_search_fp_cost),
+            "size_cost": float(args.model_search_size_cost),
+            "fixed_params": build_default_xgb_params(scale_pos_weight=scale_pos_weight),
+        }
+        if args.model_search:
+            raw_model, model_search_summary, model_search_records = search_xgb_hyperparameters(
+                args, X_train, y_train, X_model_select, y_model_select,
+                scale_pos_weight=scale_pos_weight, groups=train_groups,
+            )
+            model_search_summary["split"] = model_selection_split
+            logger.info("model_search best score=%.6f total_nodes=%d params=%s",
+                        model_search_summary["best"]["score"],
+                        model_search_summary["best"]["total_nodes"],
+                        model_search_summary["best"]["params"])
+        else:
+            raw_model = train_xgb_with_params(
+                build_default_xgb_params(scale_pos_weight=scale_pos_weight),
+                X_train, y_train,
+            )
+            model_search_summary["split"] = model_selection_split
+
+    # 确保 quality_thresholds 已初始化（多 k 分支可能跳过）
+    try:
+        _ = quality_thresholds
+    except NameError:
+        _df_qc, _ = clip_outliers(df_train_raw, selected_features, k=1.5, return_bounds=True)
+        quality_thresholds = learn_quality_thresholds(_df_qc, QUALITY_FEATURES_DEFAULT)
+
+    # 确保 scale_pos_weight_strategy 已初始化
+    try:
+        _ = scale_pos_weight_strategy
+    except NameError:
+        scale_pos_weight_strategy = "balanced_1.0"
+
+    # 确保 calibration_threshold_split / model_selection_split 已初始化（多 k 分支未设置）
+    try:
+        _ = calibration_threshold_split
+    except NameError:
+        calibration_threshold_split = {
+            "fallback": True, "reason": "multi_k_full_valid",
+            "calibration_groups": None, "threshold_groups": None,
+        }
+    try:
+        _ = model_selection_split
+    except NameError:
+        model_selection_split = {
+            "fallback": True, "reason": "multi_k_search",
+            "model_selection_groups": None, "calibration_groups": None,
+        }
 
     # Platt 概率校准 (校准器包裹原始模型)
     model = raw_model

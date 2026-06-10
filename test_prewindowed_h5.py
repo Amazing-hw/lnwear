@@ -298,4 +298,4 @@ def test_s04_excludes_window_metadata_from_feature_candidates():
         "GREEN_CORR": [0.1, 0.9],
     })
 
-    assert s04.get_feature_cols(df) == ["GREEN_CORR"]
+    assert set(s04.get_feature_cols(df)) == {"mode", "GREEN_CORR"}

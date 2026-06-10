@@ -229,7 +229,7 @@ python s08_run_pipeline.py \
   --model_search_fp_cost 2.0 \
   --model_search_size_cost 0.1 \
   --model_search_accuracy_tolerance 0.0 \
-  --model_search_n_estimators 20,25,30,35,40,45,50,55,60,70,80 \
+  --model_search_n_estimators 20,25,30,35,40,45,50,55,60 \
   --model_search_max_depth 2,3,4 \
   --model_search_learning_rate 0.025,0.03,0.04,0.05,0.06,0.08,0.10 \
   --model_search_min_child_weight 10,15,20,25,30,40,50 \
