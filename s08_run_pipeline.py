@@ -1162,7 +1162,8 @@ def main():
                    help="运行到此步骤后停止；默认 s06_cb，即导出部署配方后停止")
 
     # ── s03 参数 ──
-    p.add_argument("--window_sec", type=int, default=3, help="Stage2 窗口秒数")
+    p.add_argument("--window_sec", type=int, default=3, choices=[3, 5],
+                   help="Stage2 窗口秒数：3s (75点@25Hz) 或 5s (125点@25Hz)")
     p.add_argument("--stride_sec", type=int, default=1, help="Stage2 滑窗步长（秒）")
     p.add_argument("--skip_initial_windows", type=int, default=3,
                    help="drop this many leading Stage2 windows per sample")

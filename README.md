@@ -116,11 +116,16 @@ numpy, scipy, pandas, scikit-learn, xgboost, joblib, h5py, matplotlib, pytest
 ```text
 Stage1 primitive window: 1s
 Stage1 decision gate:    连续 3 个 primitive 通过后开启 Stage2
-Stage2 window:           3s
+Stage2 window:           3s (也支持 5s，通过 --window_sec 5 切换)
 Stage2 stride:           1s
 skip_initial_windows:    3
 use_stage2_ir:           false
 postprocess latency:     first_worn_output_p95 <= 6s
+```
+
+Stage2 窗长选择：
+- `--window_sec 3`（默认）：75 点@25Hz，响应快，适合实时佩戴检测
+- `--window_sec 5`：125 点@25Hz，频域分辨率更高（0.2Hz），适合需要精确心率频段的场景
 ```
 
 `use_stage2_ir=false` 只影响 Stage2：特征提取前把 IR 信号置零。Stage1 始终使用真实 IR 做 DC/ACDC 门控。
@@ -194,7 +199,7 @@ s06_feat/s06_cb     导出部署特征脚本和部署配方
 
 如果 `--stop_after` 直接指向可选步骤，例如 `s07_post`、`s09_cmp` 或 `s10_audit`，`s08` 会把该目标视为显式请求，并自动打开必要前置步骤；默认不带这些 stop target 时仍保持精简主流程。
 
-推荐一条命令：
+推荐一条命令（默认 3s 窗口，自动多 k 搜参）：
 
 ```bash
 python s08_run_pipeline.py \
@@ -204,13 +209,43 @@ python s08_run_pipeline.py \
   --stride_sec 1 \
   --skip_initial_windows 3 \
   --no-use_stage2_ir \
-  --max_features 15 \
+  --max_features 20 \
+  --model_search \
+  --model_search_feature_counts "10,12,15,18,20" \
+  --max_model_nodes 500 \
   --split test
+```
+
+5s 窗口版本：
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --window_sec 5 \
+  --max_features 20 \
+  --model_search_feature_counts "10,12,15,18,20"
 ```
 
 ## 复杂度受限模型搜参
 
-模型搜参现在默认开启；如果只想快速跑固定默认 XGBoost 参数，可以在 `s08_run_pipeline.py` 上显式加 `--no-model_search`。默认策略是 `staged_group_cv`：只把 `total_nodes <= max_model_nodes` 作为硬约束，在预算内用 train 内部 group CV 选择窗口级泛化性能最稳的模型。
+模型搜参默认开启，同时默认启用**特征数量搜参**（测试 k ∈ {10,12,15,18,20} 选出最优特征数）。如果只想快速跑固定默认 XGBoost 参数和固定特征数，可以在 `s08_run_pipeline.py` 上显式加 `--no-model_search`。默认策略是 `staged_group_cv`：只把 `total_nodes <= max_model_nodes` 作为硬约束，在预算内用 train 内部 group CV 选择窗口级泛化性能最稳的模型和特征数。
+
+### 搜索空间
+
+| 参数 | 候选值 | 候选数 |
+|---|---|---|
+| 特征数量 k | 10, 12, 15, 18, 20 | 5 |
+| n_estimators | 20, 25, 30, 35, 40, 45, 50, 55, 60 | 9 |
+| max_depth | 2, 3, 4 | 3 |
+| learning_rate | 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10 | 7 |
+| min_child_weight | 10, 15, 20, 25, 30, 40, 50 | 7 |
+| reg_lambda | 5, 8, 10, 12, 16, 20, 30 | 7 |
+| reg_alpha | 0, 0.5, 1, 1.5, 2, 3 | 6 |
+| subsample | 0.70, 0.75, 0.80, 0.85, 0.90 | 5 |
+| colsample_bytree | 0.70, 0.75, 0.80, 0.85, 0.90 | 5 |
+| **总计** | | **~8.9M × 5k** |
+
+通过 `--model_search_feature_counts ""` 可禁用特征数搜参，仅用 `--max_features` 固定值。
 
 一键流水线开启示例：
 
@@ -218,7 +253,8 @@ python s08_run_pipeline.py \
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --max_features 12 \
+  --max_features 20 \
+  --model_search_feature_counts "10,12,15,18,20" \
   --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
   --model_search_max_candidates 600 \
@@ -226,9 +262,6 @@ python s08_run_pipeline.py \
   --model_search_cv_folds 3 \
   --model_search_cv_repeats 2 \
   --model_search_random_state 42 \
-  --model_search_fp_cost 2.0 \
-  --model_search_size_cost 0.1 \
-  --model_search_accuracy_tolerance 0.0 \
   --model_search_n_estimators 20,25,30,35,40,45,50,55,60 \
   --model_search_max_depth 2,3,4 \
   --model_search_learning_rate 0.025,0.03,0.04,0.05,0.06,0.08,0.10 \
@@ -242,25 +275,15 @@ python s08_run_pipeline.py \
 搜参选择策略：
 
 ```text
-1. 从细粒度参数空间中按固定 random_state 抽样，默认最多 600 个候选。
-2. Stage A 在 train 内部 group split 上预筛，保留 top 80，并强制加入固定默认参数 baseline。
-3. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选，每个 fold 内扫窗口阈值。
-4. 在 `max_model_nodes` 预算内按 mean_cv_accuracy、std_cv_accuracy、mean_cv_fp_rate、final_total_nodes 排序。
-5. 默认 `model_search_accuracy_tolerance=0.0`，即不主动牺牲窗口 accuracy 换更小模型。
+1. 对每个 k ∈ {10,12,15,18,20}，从 ranked_features.json 取 top-k 特征。
+2. 每个 k 内，从参数空间按固定 random_state 抽样最多 600 个 XGBoost 候选。
+3. Stage A 在 train 内部 group split 上预筛，保留 top 80。
+4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
+5. 在 max_model_nodes 预算内，选最优 (k × params) 组合。
+6. 最优特征集 + 最优模型 → model_bundle.pkl → 自动传递到所有部署产物。
 ```
 
-如果想在窗口准确率几乎不变时优先更小模型，可以手动设置 `model_search_accuracy_tolerance=0.002`，表示允许最多低 0.2% 的窗口 accuracy 来换更少节点。完整候选结果写入：
-
-```text
-artifacts/model_search_results.csv
-```
-
-最佳参数、节点数和模型复杂度信息写入：
-
-```text
-artifacts/final_model_config.json
-artifacts/model_bundle.pkl
-```
+完整候选结果写入 `artifacts/model_search_results.csv`。最佳参数和特征数写入 `artifacts/final_model_config.json` 和 `artifacts/model_bundle.pkl`。
 
 ## 分步运行
 

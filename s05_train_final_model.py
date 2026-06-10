@@ -1447,18 +1447,20 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
     elif args.model_search:
         df_model_select = df_calib_pool.copy()
         df_calib = df_calib_pool
+        _calib_groups = (calibration_threshold_split or {}).get("calibration_groups")
         model_select_split = {
             "fallback": False, "reason": "train_group_cv",
             "model_selection_groups": None,
-            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+            "calibration_groups": _calib_groups,
         }
     else:
         df_model_select = df_calib_pool.copy()
         df_calib = df_calib_pool
+        _calib_groups_disabled = (calibration_threshold_split or {}).get("calibration_groups")
         model_select_split = {
             "fallback": False, "reason": "model_search_disabled",
             "model_selection_groups": None,
-            "calibration_groups": calibration_threshold_split.get("calibration_groups"),
+            "calibration_groups": _calib_groups_disabled,
         }
 
     X_model_select, y_model_select, _ = prepare_xy(
@@ -1655,9 +1657,10 @@ def main(args=None):
 
         # 前置：计算一次 scale_pos_weight（不随 k 变化）
         _all_features = [r["feature"] for r in _ranked]
-        _df_tmp, _ = clip_outliers(df_train_raw, _all_features[:min(10, len(_all_features))], k=1.5)
-        _fv_tmp = prepare_fill_values(_df_tmp, _df_tmp.columns.tolist())
-        _X_tmp, _y_tmp, _ = prepare_xy(_df_tmp, _df_tmp.columns.tolist(), fill_values=_fv_tmp)
+        _feats_tmp = _all_features[:min(10, len(_all_features))]
+        _df_tmp = clip_outliers(df_train_raw, _feats_tmp, k=1.5)
+        _fv_tmp = prepare_fill_values(_df_tmp, _feats_tmp)
+        _X_tmp, _y_tmp, _ = prepare_xy(_df_tmp, _feats_tmp, fill_values=_fv_tmp)
         _train_groups = (df_train_raw["sample_name"].astype("object").to_numpy()
                          if "sample_name" in df_train_raw.columns else None)
         _neg_count = int(np.sum(_y_tmp == 0))
@@ -1709,7 +1712,7 @@ def main(args=None):
         neg_count, pos_count = _neg_count, _pos_count
         p_train_pos = _p_train_pos
         feature_quantiles = compute_feature_quantiles(
-            clip_outliers(df_train_raw, selected_features, k=1.5, bounds=clip_bounds)[0],
+            clip_outliers(df_train_raw, selected_features, k=1.5, bounds=clip_bounds),
             selected_features, q_low=args.ood_q_low, q_high=args.ood_q_high,
         )
 
@@ -1787,12 +1790,11 @@ def main(args=None):
     #   按部署时 Stage2 输入的期望 P(target=1 | Stage1 pass) 重加权，
     #   使训练 effective 分布 ≈ 部署条件分布。
     #   公式: scale_pos_weight = r * (1 - p_train) / ((1 - r) * p_train)
-    neg_count = int(np.sum(y_train == 0))
-    pos_count = int(np.sum(y_train == 1))
-    n_total = max(neg_count + pos_count, 1)
-    p_train_pos = pos_count / float(n_total)
-
     if not _feature_counts:
+        neg_count = int(np.sum(y_train == 0))
+        pos_count = int(np.sum(y_train == 1))
+        n_total = max(neg_count + pos_count, 1)
+        p_train_pos = pos_count / float(n_total)
         scale_pos_weight_strategy = "balanced_1.0"
         if args.legacy_scale_pos_weight:
             scale_pos_weight = (neg_count / pos_count) if pos_count > 0 else 1.0
@@ -2028,7 +2030,8 @@ def main(args=None):
             "calibration_data": "valid_calibration_split",
             "threshold_selection_data": "valid_threshold_split",
             "test_used": False,
-            "feature_selection_data": fs.get("selection_policy", {}).get("selection_data", "unknown"),
+            "feature_selection_data": (fs.get("selection_policy", {}).get("selection_data", "unknown")
+                                         if "fs" in dir() else "multi_k_ranked"),
         },
 
         "class_balance": {
