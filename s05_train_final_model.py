@@ -1407,6 +1407,10 @@ def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
+    parser.add_argument("--max_features", type=int, default=None,
+                        help="从 ranked_features.json 取 top-k 特征；默认 None 时回退到 selected_features.json")
+    parser.add_argument("--model_search_feature_counts", type=str, default="",
+                        help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15)。留空则使用 --max_features 固定值")
     parser.add_argument(
         "--threshold_objective", type=str, default="fbeta",
         choices=["f1", "precision", "recall", "fbeta", "precision_constrained"],
@@ -1434,7 +1438,7 @@ def main(args=None):
     parser.add_argument("--model_search_strategy", type=str, default="staged_group_cv",
                         choices=["staged_group_cv", "single_split"],
                         help="model search strategy; staged_group_cv uses train-group CV and preserves valid for calibration/threshold")
-    parser.add_argument("--max_model_nodes", type=int, default=400,
+    parser.add_argument("--max_model_nodes", type=int, default=500,
                         help="maximum allowed total XGBoost tree nodes during --model_search; <=0 disables the cap")
     parser.add_argument("--model_search_fp_cost", type=float, default=2.0,
                         help="FP penalty in model-search score: accuracy - fp_cost*fp_rate - size_cost*size_ratio")
@@ -1446,6 +1450,8 @@ def main(args=None):
                         help="fraction of the valid calibration pool reserved for single_split model-search selection")
     parser.add_argument("--model_search_max_candidates", type=int, default=600,
                         help="maximum sampled candidates from the search grid; <=0 disables sampling")
+    parser.add_argument("--model_search_stage1_top_k", type=int, default=4,
+                        help="number of stage-1 structure candidates advanced to stage-2 refine")
     parser.add_argument("--model_search_stage2_top_k", type=int, default=80,
                         help="number of stage-A candidates kept for staged_group_cv")
     parser.add_argument("--model_search_cv_folds", type=int, default=3,
@@ -1496,10 +1502,21 @@ def main(args=None):
     if args is None:
         args = parser.parse_args()
 
-    with open(os.path.join(args.artifact_dir, "selected_features.json"), "r", encoding="utf-8") as f:
-        fs = json.load(f)
+    selected_features_path = os.path.join(args.artifact_dir, "selected_features.json")
+    ranked_features_path = os.path.join(args.artifact_dir, "ranked_features.json")
 
-    selected_features = fs["selected_features"]
+    # 若存在 ranked_features.json，从中取 top-k（支持不同 max_features）；
+    # 否则回退到 selected_features.json（向后兼容）。
+    if os.path.exists(ranked_features_path):
+        with open(ranked_features_path, "r", encoding="utf-8") as f:
+            ranked = json.load(f)
+        _k = min(args.max_features if args.max_features is not None else 15, len(ranked))
+        selected_features = [r["feature"] for r in ranked[:_k]]
+        logger.info(f"从 ranked_features.json 取 top {_k} 特征（共 {len(ranked)} 个候选）")
+    else:
+        with open(selected_features_path, "r", encoding="utf-8") as f:
+            fs = json.load(f)
+        selected_features = fs["selected_features"]
 
     feature_pool_train_path = os.path.join(args.artifact_dir, "feature_pool_train.csv")
     feature_pool_valid_path = os.path.join(args.artifact_dir, "feature_pool_valid.csv")

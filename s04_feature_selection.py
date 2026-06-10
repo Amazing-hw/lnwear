@@ -183,8 +183,8 @@ META_COLS = [
     "h5_file",
     "target",
     "start_100hz",
+    "start_sec",
     "window_index",
-    "mode",
 ]
 
 
@@ -220,7 +220,7 @@ FEATURE_GROUPS = {
     "green_stats": [
         "G_mean_mean", "G_mean_std", "G_mean_diff_std", "G_mean_acdc",
         "GREEN_DC_MEDIAN", "GREEN_DC_IQR", "GREEN_AC_RMS", "GREEN_AC_MAD",
-        "GREEN_AC_DC_RATIO", "GREEN_DERIV_MAD", "GREEN_CORR",
+        "GREEN_AC_DC_RATIO", "GREEN_DERIV_MAD",
     ],
     # -- Ambient 统计(11) - limit 1 --
     "ambient_stats": [
@@ -229,13 +229,14 @@ FEATURE_GROUPS = {
         "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
         "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
     ],
-    # -- 绿光三通道空间(11) - limit 2 --
+    # -- 绿光三通道空间(13) - limit 2 --
     "green_spatial": [
         "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
         "G_rangeNorm_mean", "G_rangeNorm_p90",
         "G_spatial_vmag_mean", "G_spatial_vmag_p90",
         "G_spatial_vmag_iqr", "G_spatial_vmag_std",
         "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
+        "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
     ],
     # -- 绿光三通道一致性(3) - limit 1 --
     "green_3ch_consistency": [
@@ -254,11 +255,16 @@ FEATURE_GROUPS = {
         "GREEN_IR_RAW_CORR", "GREEN_IR_BP_CORR", "GREEN_IR_ENV_CORR",
         "GREEN_IR_MAX_XCORR",
     ],
-    # -- Ambient 交叉泄露(6) - limit 1 --
+    # -- Ambient 交叉泄露(8) - limit 1 --
     "amb_cross": [
         "GREEN_AMB_BP_CORR", "IR_AMB_BP_CORR",
         "GREEN_AMB_ENV_CORR", "IR_AMB_ENV_CORR",
         "GREEN_AMB_LEAK", "IR_AMB_LEAK",
+        "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
+    ],
+    # -- 环境光 Stage1 软特征(3) - limit 1 --
+    "ambient_stage1": [
+        "AMB_STAGE1_RATIO", "AMB_STAGE1_PASS", "IR_DC_LEVEL",
     ],
     # -- 周期性/频域: FFT + Autocorr + 谐波 (limit 2) --
     "frequency": [
@@ -271,6 +277,9 @@ FEATURE_GROUPS = {
         "GREEN_IR_DOM_FREQ_DIFF",
         "GREEN_FFT_peak_width_Hz", "GREEN_FFT_SNR",
         "GREEN_FFT_harmonic_ratio", "GREEN_FFT_harmonic_present",
+        "IR_FFT_SNR", "IR_FFT_harmonic_ratio",
+        "IR_FFT_harmonic_present", "IR_FFT_peak_width_Hz",
+        "AMB_DOM_FREQ", "AMB_FFT_PEAK_MEDIAN_RATIO",
     ],
     # -- 空间-光强耦合(5) - limit 1 --
     "spatial_coupling": [
@@ -291,7 +300,7 @@ FEATURE_GROUPS = {
         "GREEN_bp_skewness", "IRX_bp_skewness",
         "GREEN_bp_kurtosis", "IRX_bp_kurtosis",
     ],
-    # -- ACC(10) - limit 2 --
+    # -- ACC 核心 (13) - limit 2 --
     "acc_features": [
         "ACC_MAG_MEAN", "ACC_MAG_STD", "ACC_MAG_MAD",
         "ACC_AXIS_STD_SUM", "ACC_GRAVITY_DOM_RATIO",
@@ -299,7 +308,25 @@ FEATURE_GROUPS = {
         "ACC_MAG_P50", "ACC_MAG_P90",
         "ACC_GREEN_BP_CORR", "ACC_IR_BP_CORR",
         "ACC_PPG_coherence_mean", "ACC_PPG_coherence_max",
-    ],    # -- Meta --
+        "ACC_ENERGY_TO_GREEN_AC",
+    ],
+    # -- ACC 分轴统计 (12) - limit 1 --
+    "acc_per_axis": [
+        "ACC_X_MEAN", "ACC_Y_MEAN", "ACC_Z_MEAN",
+        "ACC_X_STD", "ACC_Y_STD", "ACC_Z_STD",
+        "ACC_X_ENERGY", "ACC_Y_ENERGY", "ACC_Z_ENERGY",
+        "ACC_AXIS_MEAN_SUM", "ACC_MAG_ENERGY", "ACC_MAG_P2P",
+    ],
+    # -- ACC 震颤检测 (4) - limit 1 --
+    "acc_tremor": [
+        "ACC_TREMOR_PEAK_FREQ", "ACC_TREMOR_PEAK_POWER",
+        "ACC_TREMOR_POWER_RATIO", "ACC_LOW_MOTION_RATIO",
+    ],
+    # -- ACC 姿态/重力 (3) - limit 1 --
+    "acc_orientation": [
+        "ACC_TILT_ANGLE", "ACC_DOM_AXIS", "ACC_GRAVITY_RATIO",
+    ],
+    # -- Meta --
     "meta": ["SIG_LEN", "SIG_SEC"],
     "mode": ["mode"],
 }
@@ -317,11 +344,15 @@ GROUP_LIMITS_DEFAULT = {
     "ir_g_amplitude": 1,
     "ir_g_correlation": 1,
     "amb_cross": 1,
+    "ambient_stage1": 1,
     "frequency": 2,
     "spatial_coupling": 1,
     "signal_complexity": 2,
     "waveform_morphology": 2,
     "acc_features": 2,
+    "acc_per_axis": 1,
+    "acc_tremor": 1,
+    "acc_orientation": 1,
     "meta": 0,
     "mode": 1,
     "other": 2,
@@ -2001,6 +2032,20 @@ def main(args=None):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     print(f"\n特征选择结果已保存: {out_path}")
+
+    # 输出完整排序列表（供 s05 搜参时测试不同 max_features）
+    ranked = sorted(combined_summary, key=lambda x: x["combined_score"], reverse=True)
+    ranked_path = os.path.join(args.artifact_dir, "ranked_features.json")
+    with open(ranked_path, "w", encoding="utf-8") as f:
+        json.dump([{
+            "feature": r["feature"],
+            "group": r["group"],
+            "combined_score": r["combined_score"],
+            "freq": r.get("freq", 0),
+            "avg_importance": r.get("avg_importance", 0),
+            "shap_imp": r.get("shap_imp", 0.0),
+        } for r in ranked], f, indent=2, ensure_ascii=False)
+    print(f"特征排序列表已保存: {ranked_path}")
 
 
     export_feature_selection_report_plot(result, args.artifact_dir)

@@ -272,16 +272,45 @@ def _is_25hz_sample(sample):
     return "sleep_25hz" in name.lower()
 def stage1_ambient_check(ppg, ambient_ratio_threshold=0.8):
     """Stage1 环境光检查: median(ambient) / median(ir) < threshold。
-    比值过高说明环境光异常强或传感器未贴紧皮肤。"""
+
+    比对值过高说明环境光异常强或传感器未贴紧皮肤。
+    此函数保留用于极端硬过滤；比值本身作为特征写入特征池，让模型学习决策边界。
+    """
     if is_prewindowed_signal(ppg):
         ppg = flatten_prewindowed_signal(ppg)
     if ppg is None or ppg.shape[1] < 2:
         return True  # no ambient channel, pass
     ir_dc = float(np.median(ppg[:, 0]))
     amb_dc = float(np.median(ppg[:, 1]))
-    if ir_dc < 1e3:
-        return False  # IR too low, unreliable
-    return (amb_dc / ir_dc) < ambient_ratio_threshold
+    # 只过滤极端无效情况（IR 完全无信号，或环境光绝对淹没了IR）
+    if ir_dc < 1e2:
+        return False
+    return (amb_dc / ir_dc) < 2.0
+
+def compute_ambient_stage1_features(raw_window):
+    """计算环境光 Stage1 软特征（供模型学习，不硬过滤）。
+
+    返回 dict 含 AMB_STAGE1_RATIO / AMB_STAGE1_PASS / IR_DC_LEVEL。
+    用于区分"真离腕"和"佩戴但环境光强"。"""
+    feats = {}
+    if raw_window is None:
+        feats["AMB_STAGE1_RATIO"] = 0.0
+        feats["AMB_STAGE1_PASS"] = 1.0
+        feats["IR_DC_LEVEL"] = 0.0
+        return feats
+    ppg_flat = flatten_prewindowed_signal(raw_window) if is_prewindowed_signal(raw_window) else raw_window
+    if ppg_flat is None or ppg_flat.shape[1] < 2:
+        feats["AMB_STAGE1_RATIO"] = 0.0
+        feats["AMB_STAGE1_PASS"] = 1.0
+        feats["IR_DC_LEVEL"] = 0.0
+        return feats
+    ir_dc = float(np.median(ppg_flat[:, 0]))
+    amb_dc = float(np.median(ppg_flat[:, 1]))
+    ratio = float(amb_dc / max(ir_dc, EPS))
+    feats["AMB_STAGE1_RATIO"] = ratio
+    feats["AMB_STAGE1_PASS"] = 1.0 if stage1_ambient_check(raw_window) else 0.0
+    feats["IR_DC_LEVEL"] = ir_dc
+    return feats
 
 
 def downsample_to_5hz(signal, fs_original=100, fs_target=5):
@@ -2067,6 +2096,22 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     feat["corr_Ambient_vmag"] = safe_corr(amb_raw, g_vmag)
 
     # =====================================================
+    # 7a2. 坏接触/离腕质量比值特征 (Tier 3)
+    #      Ratio 型特征，跨设备/肤色鲁棒，区分：
+    #      贴腕静止 vs 离腕环境光干扰 vs 松戴漏光
+    # =====================================================
+    _g_ac_rms = float(np.sqrt(np.mean(g_mean_bp ** 2)))
+    _amb_ac_rms = float(np.sqrt(np.mean(amb_bp ** 2)))
+    _g_dc = float(np.median(g_mean_raw))
+    _amb_dc = float(np.median(amb_raw))
+    _ch_dc_vals = np.array([float(np.median(g1_raw)), float(np.median(g2_raw)), float(np.median(g3_raw))])
+    _ch_ac_vals = np.array([float(np.sqrt(np.mean(g1_bp ** 2))), float(np.sqrt(np.mean(g2_bp ** 2))), float(np.sqrt(np.mean(g3_bp ** 2)))])
+    feat["AMB_AC_TO_GREEN_AC"] = safe_div(_amb_ac_rms, _g_ac_rms)
+    feat["AMB_DC_TO_GREEN_DC"] = safe_div(_amb_dc, abs(_g_dc))
+    feat["GCH_DC_RANGE_RATIO"] = safe_div(float(np.max(_ch_dc_vals) - np.min(_ch_dc_vals)), abs(float(np.mean(_ch_dc_vals))))
+    feat["GCH_AC_RANGE_RATIO"] = safe_div(float(np.max(_ch_ac_vals) - np.min(_ch_ac_vals)), abs(float(np.mean(_ch_ac_vals))))
+
+    # =====================================================
     # 7b. IR FFT harmonic + SNR features (Tier 2)
     #     IR is the primary pulse-sensing channel; FFT harmonic structure
     #     is a strong indicator of real PPG vs noise/static.
@@ -2326,10 +2371,18 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                     ir_bp = preprocessed.get("ir_bp")
                     if green_bp is not None and ir_bp is not None:
                         feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
+                    if green_bp is not None:
+                        _g_ac = float(np.sqrt(np.mean(green_bp ** 2)))
+                        _acc_energy = float(feat.get("ACC_MAG_ENERGY", 0.0))
+                        feat["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
+                    else:
+                        feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
+                feat.update(compute_ambient_stage1_features(raw_window))
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
                 feat["target"] = int(window_target)
                 feat["start_100hz"] = int(window_number * stride_len)
+                feat["start_sec"] = float(window_number * stride_len / max(fs, 1))
                 feat["window_index"] = int(window_number)
                 feat["mode"] = int(mode)
                 rows.append(feat)
@@ -2423,11 +2476,19 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                         except Exception:
                             feat["ACC_PPG_coherence_mean"] = 0.0
                             feat["ACC_PPG_coherence_max"] = 0.0
+                if green_bp is not None:
+                    _g_ac = float(np.sqrt(np.mean(green_bp ** 2)))
+                    _acc_energy = float(feat.get("ACC_MAG_ENERGY", 0.0))
+                    feat["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
+                else:
+                    feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
 
+            feat.update(compute_ambient_stage1_features(window))
             feat["sample_name"] = sample["sample_name"]
             feat["h5_file"] = sample["h5_file"]
             feat["target"] = int(sample["target"])
             feat["start_100hz"] = int(start * (fs / FEATURE_FS))  # 映射回原始 fs 坐标
+            feat["start_sec"] = float(start / FEATURE_FS)
             feat["mode"] = int(mode)
             rows.append(feat)
         except Exception as e:
@@ -2669,7 +2730,7 @@ def main(args=None):
         if len(df) > 0 and "target" in df.columns:
             print(f"  target=0: {np.sum(df['target'].values == 0)}")
             print(f"  target=1: {np.sum(df['target'].values == 1)}")
-            meta_cols = ["sample_name", "h5_file", "target", "start_100hz"]
+            meta_cols = ["sample_name", "h5_file", "target", "start_100hz", "start_sec"]
             print(f"  特征列数: {len([c for c in df.columns if c not in meta_cols])}")
 
 if __name__ == "__main__":

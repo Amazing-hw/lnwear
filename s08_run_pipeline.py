@@ -151,6 +151,7 @@ EXTRA_FEATURE_FORMULAS = {
     },
     "SIG_LEN": {"formula": "len(window)", "intermediate_signals": {}},
     "SIG_SEC": {"formula": "len(window) / fs", "intermediate_signals": {}},
+    "start_sec": {"formula": "window start time in seconds (fs-independent)", "intermediate_signals": {}},
     "mode": {
         "formula": "green-channel hardware mode supplied by caller",
         "intermediate_signals": {},
@@ -518,6 +519,9 @@ def _build_full_feature_recipe(selected_features):
         "g_mean_dc":  "median(g_mean_raw)",
         "acc_mag":    "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
         "acc_mag_bp": "bandpass(acc_mag - mean(acc_mag), 0.5Hz, 5.0Hz, 4th_order, fs=25)",
+        "acc_x":      "acc[:, 0]",
+        "acc_y":      "acc[:, 1]",
+        "acc_z":      "acc[:, 2]",
     }
 
     # ---- 通用函数 ----
@@ -612,6 +616,15 @@ def _build_full_feature_recipe(selected_features):
         "AMBX_AUTO_CORR_PEAK":{"depends": ["amb_bp"], "formula": "autocorr_peak_lag(amb_bp, 25, 40, 180)[0]"},
         "AMBX_AUTO_CORR_LAG_SEC":{"depends": ["amb_bp"], "formula": "autocorr_peak_lag(amb_bp, 25, 40, 180)[1]"},
 
+        # == IR FFT harmonic + SNR (Tier 2, from s03 7b) ==
+        "IR_FFT_SNR":               {"depends": ["ir_bp"], "formula": "sum(FFT(ir_bp)^2 over 0.5-5Hz) / (total_power - band_power + 1e-12)"},
+        "IR_FFT_harmonic_ratio":    {"depends": ["ir_bp"], "formula": "max_power_near(2*IR_DOM_FREQ, +/-0.3Hz) / (IR_DOM_FREQ_power + 1e-12)"},
+        "IR_FFT_harmonic_present":  {"depends": ["ir_bp"], "formula": "1 if second_harmonic_power > 0.1 * fundamental_power else 0"},
+        "IR_FFT_peak_width_Hz":     {"depends": ["ir_bp"], "formula": "FFT peak width at 50% of max within 0.5-5Hz"},
+        # == AMB spectral (Tier 2, from s03 7c) ==
+        "AMB_DOM_FREQ":              {"depends": ["amb_bp"], "formula": "fft_peak_features(amb_bp, 25, 0.5, 5.0)[1]"},
+        "AMB_FFT_PEAK_MEDIAN_RATIO": {"depends": ["amb_bp"], "formula": "fft_peak_features(amb_bp, 25, 0.5, 5.0)[0]"},
+
         "GREEN_FFT_peak_width_Hz": {"depends": ["g_mean_bp", "fft_spec", "fft_freqs"],
                                      "formula": "spec,freqs=fft_peak_features内部结果; band=0.5-5Hz; "
                                                 "above_half=band_spec>max(band_spec)*0.5; "
@@ -643,6 +656,10 @@ def _build_full_feature_recipe(selected_features):
         "G_ch_dc_max_min_ratio":{"depends": ["g1_raw", "g2_raw", "g3_raw"],
                                  "formula": "dc=[median(g1),median(g2),median(g3)]; "
                                             "return max(|dc|)/min(|dc|+1e-12)"},
+        "GCH_DC_RANGE_RATIO":  {"depends": ["g1_raw", "g2_raw", "g3_raw"],
+                                 "formula": "(max(ch_dc)-min(ch_dc))/|mean(ch_dc)| across G1/G2/G3"},
+        "GCH_AC_RANGE_RATIO":  {"depends": ["g1_bp", "g2_bp", "g3_bp"],
+                                 "formula": "(max(ch_ac)-min(ch_ac))/|mean(ch_ac)| across G1/G2/G3"},
 
         # == Green 3ch consistency ==
         "G_bp_corr_mean":  {"depends": ["g1_bp", "g2_bp", "g3_bp"],
@@ -673,6 +690,13 @@ def _build_full_feature_recipe(selected_features):
         "IR_AMB_ENV_CORR":    {"depends": ["ir_bp", "amb_bp"], "formula": "safe_corr(smooth_envelope(ir_bp,25), smooth_envelope(amb_bp,25))"},
         "GREEN_AMB_LEAK":     {"depends": ["g_mean_bp", "amb_bp"], "formula": "|GREEN_AMB_BP_CORR| * sqrt(mean(amb_bp^2)) / (sqrt(mean(g_mean_bp^2))+1e-12)"},
         "IR_AMB_LEAK":        {"depends": ["ir_bp", "amb_bp"], "formula": "|IR_AMB_BP_CORR| * sqrt(mean(amb_bp^2)) / (sqrt(mean(ir_bp^2))+1e-12)"},
+        "AMB_AC_TO_GREEN_AC":  {"depends": ["amb_bp", "g_mean_bp"], "formula": "safe_div(sqrt(mean(amb_bp^2)), sqrt(mean(g_mean_bp^2)))"},
+        "AMB_DC_TO_GREEN_DC":  {"depends": ["amb_raw", "g_mean_raw"], "formula": "safe_div(median(amb_raw), |median(g_mean_raw)|)"},
+
+        # == Ambient Stage1 soft features ==
+        "AMB_STAGE1_RATIO":    {"depends": ["ir_raw", "amb_raw"], "formula": "median(amb_raw) / median(ir_raw)"},
+        "AMB_STAGE1_PASS":     {"depends": ["ir_raw", "amb_raw"], "formula": "1 if ir_dc >= 100 and amb/ir < 2.0 else 0"},
+        "IR_DC_LEVEL":         {"depends": ["ir_raw"], "formula": "median(ir_raw)"},
 
         # == Spatial coupling ==
         "corr_Gmean_G_imbalance": {"depends": ["g_mean_raw", "g1_raw", "g2_raw", "g3_raw"],
@@ -766,6 +790,32 @@ def _build_full_feature_recipe(selected_features):
         "ACC_MAG_P90":      {"depends": ["acc_mag"], "formula": "percentile(acc_mag, 90)"},
         "ACC_GREEN_BP_CORR":{"depends": ["acc_mag_bp", "g_mean_bp"], "formula": "|safe_corr(acc_mag_bp, g_mean_bp)|"},
         "ACC_IR_BP_CORR":   {"depends": ["acc_mag_bp", "ir_bp"], "formula": "|safe_corr(acc_mag_bp, ir_bp)|"},
+        "ACC_ENERGY_TO_GREEN_AC":{"depends": ["acc_mag", "g_mean_bp"], "formula": "safe_div(sum(acc_mag^2), sqrt(mean(g_mean_bp^2)))"},
+
+        # == ACC per-axis (Tier 1) ==
+        "ACC_X_MEAN":       {"depends": ["acc_x"], "formula": "mean(acc_x)"},
+        "ACC_Y_MEAN":       {"depends": ["acc_y"], "formula": "mean(acc_y)"},
+        "ACC_Z_MEAN":       {"depends": ["acc_z"], "formula": "mean(acc_z)"},
+        "ACC_X_STD":        {"depends": ["acc_x"], "formula": "std(acc_x)"},
+        "ACC_Y_STD":        {"depends": ["acc_y"], "formula": "std(acc_y)"},
+        "ACC_Z_STD":        {"depends": ["acc_z"], "formula": "std(acc_z)"},
+        "ACC_X_ENERGY":     {"depends": ["acc_x"], "formula": "sum(acc_x^2)"},
+        "ACC_Y_ENERGY":     {"depends": ["acc_y"], "formula": "sum(acc_y^2)"},
+        "ACC_Z_ENERGY":     {"depends": ["acc_z"], "formula": "sum(acc_z^2)"},
+        "ACC_AXIS_MEAN_SUM":{"depends": ["acc"], "formula": "sum(|mean(acc, axis=0)|)"},
+        "ACC_MAG_ENERGY":   {"depends": ["acc_mag"], "formula": "sum(acc_mag^2)"},
+        "ACC_MAG_P2P":      {"depends": ["acc_mag"], "formula": "max(acc_mag) - min(acc_mag)"},
+
+        # == ACC orientation (Tier 2) ==
+        "ACC_TILT_ANGLE":   {"depends": ["acc"], "formula": "grav=mean(acc,axis=0); deg(acos(|grav[2]|/norm(grav)))"},
+        "ACC_DOM_AXIS":     {"depends": ["acc"], "formula": "argmax(|mean(acc,axis=0)|)"},
+        "ACC_GRAVITY_RATIO":{"depends": ["acc_mag"], "formula": "norm(mean(acc,axis=0)) / (mean(acc_mag) + 1e-8)"},
+
+        # == ACC tremor (Tier 2) ==
+        "ACC_TREMOR_PEAK_FREQ":  {"depends": ["acc_mag"], "formula": "argmax(rfft(acc_mag*hamming) over 3-12Hz)"},
+        "ACC_TREMOR_PEAK_POWER": {"depends": ["acc_mag"], "formula": "max(rfft(acc_mag*hamming)^2 over 3-12Hz)"},
+        "ACC_TREMOR_POWER_RATIO":{"depends": ["acc_mag"], "formula": "sum(rfft^2 over 3-12Hz) / sum(rfft^2)"},
+        "ACC_LOW_MOTION_RATIO":  {"depends": ["acc_mag"], "formula": "sum(rfft^2 over 0.5-3Hz) / sum(rfft^2)"},
     }
 
     # ---- 为每个入选特征组装完整配方 ----
@@ -1100,8 +1150,8 @@ def main():
                    help="运行到此步骤后停止；默认 s06_cb，即导出部署配方后停止")
 
     # ── s03 参数 ──
-    p.add_argument("--window_sec", type=int, default=3, help="特征提取窗口秒数")
-    p.add_argument("--stride_sec", type=int, default=1, help="训练/评估特征提取步长秒数")
+    p.add_argument("--window_sec", type=int, default=3, help="Stage2 窗口秒数")
+    p.add_argument("--stride_sec", type=int, default=1, help="Stage2 滑窗步长（秒）")
     p.add_argument("--skip_initial_windows", type=int, default=3,
                    help="drop this many leading Stage2 windows per sample")
     p.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction, default=False,
@@ -1134,7 +1184,7 @@ def main():
     p.add_argument("--model_search_strategy", default="staged_group_cv",
                    choices=["staged_group_cv", "single_split"],
                    help="s05 model search strategy")
-    p.add_argument("--max_model_nodes", type=int, default=400,
+    p.add_argument("--max_model_nodes", type=int, default=500,
                    help="s05 max total XGBoost nodes for --model_search")
     p.add_argument("--model_search_fp_cost", type=float, default=2.0,
                    help="s05 FP penalty in model-search score")
@@ -1146,8 +1196,12 @@ def main():
                    help="fraction of valid calibration pool used for model search")
     p.add_argument("--model_search_max_candidates", type=int, default=600,
                    help="maximum sampled s05 model-search candidates")
+    p.add_argument("--model_search_stage1_top_k", type=int, default=4,
+                   help="number of stage-1 structure candidates advanced to stage-2 refine")
     p.add_argument("--model_search_stage2_top_k", type=int, default=80,
                    help="number of stage-A candidates kept for s05 staged_group_cv")
+    p.add_argument("--model_search_feature_counts", type=str, default="",
+                   help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15)。留空则使用 --max_features 固定值")
     p.add_argument("--model_search_cv_folds", type=int, default=3,
                    help="s05 staged_group_cv folds")
     p.add_argument("--model_search_cv_repeats", type=int, default=2,
@@ -1340,6 +1394,7 @@ def main():
         commands["s05"] = (
             f'"{PYTHON}" "{_script_path("s05_train_final_model")}" '
             f'--artifact_dir "{args.artifact_dir}" '
+            f'--max_features {args.max_features} '
             f'--threshold_objective {args.threshold_objective} '
             f'--threshold_beta {args.threshold_beta} '
             f'--calibration_method {args.calibration_method} '
@@ -1356,7 +1411,9 @@ def main():
             f'--model_search_accuracy_tolerance {args.model_search_accuracy_tolerance} '
             f'--model_search_valid_fraction {args.model_search_valid_fraction} '
             f'--model_search_max_candidates {args.model_search_max_candidates} '
+            f'--model_search_stage1_top_k {args.model_search_stage1_top_k} '
             f'--model_search_stage2_top_k {args.model_search_stage2_top_k} '
+            f'--model_search_feature_counts "{args.model_search_feature_counts}" '
             f'--model_search_cv_folds {args.model_search_cv_folds} '
             f'--model_search_cv_repeats {args.model_search_cv_repeats} '
             f'--model_search_random_state {args.model_search_random_state} '

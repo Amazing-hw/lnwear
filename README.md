@@ -219,7 +219,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 12 \
-  --max_model_nodes 260 \
+  --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
   --model_search_max_candidates 600 \
   --model_search_stage2_top_k 80 \
@@ -659,6 +659,8 @@ artifacts/
   feature_pool_valid.csv
   feature_pool_test.csv
   selected_features.json
+  ranked_features.json
+  feature_diagnostics.csv
 
   final_model.json
   final_model_config.json
@@ -680,6 +682,7 @@ artifacts/
   hard_negatives_{split}_{method}.json
   window_error_analysis_{split}_{method}.csv
   window_error_analysis_{split}_{method}.json
+  per_sample_summary.csv
 
   generalization_audit/
     summary.json
@@ -692,9 +695,18 @@ artifacts/
   deploy_cookbook.json
   deploy_xgboost.json
   deploy_feature_extractor.py
+  deploy_selected_feature_formulas.json
+
+  feature_subset_search/
+    subset_candidates.csv
+    subset_eval_valid.csv
+    subset_eval_summary.json
+    best_subset_features.json
 
   commercial_compare/
   report_plots/
+    s04_feature_selection_report.png
+    s05_training_report.png
 ```
 
 ## 特征工程
