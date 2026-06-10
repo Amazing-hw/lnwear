@@ -429,6 +429,20 @@ def export_feature_extractor_script(artifact_dir):
 
     bundle = joblib.load(bp)
     selected = list(bundle["feature_names"])
+    use_stage2_ir = bool(bundle.get("meta", {}).get("use_stage2_ir", False))
+
+    # 若 use_stage2_ir=false，剔除 IR 相关特征（训练时 IR 已置零，部署不应计算）
+    if not use_stage2_ir:
+        _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
+                        "corr_IR_", "log_IR_")
+        _before = len(selected)
+        selected = [f for f in selected
+                    if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)]
+        _dropped = _before - len(selected)
+        if _dropped > 0:
+            print(f"[IR strip] use_stage2_ir=false, 从部署脚本中移除 {_dropped} 个 IR 特征 "
+                  f"(保留 {len(selected)} 个非 IR 特征)")
+
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
     formulas = build_selected_feature_formulas(selected)

@@ -116,6 +116,10 @@ _REDUNDANT_FEATURES = {
     "G1_AC_RMS", "G2_AC_RMS", "G3_AC_RMS",
     # -- AUTO_CORR_LAG_SEC ≈ 1/DOM_FREQ --
     "G1_AUTO_CORR_LAG_SEC", "G2_AUTO_CORR_LAG_SEC", "G3_AUTO_CORR_LAG_SEC",
+    # -- DOM_FREQ 跨通道不变（同一心跳），consensus range/cv 始终为 0 --
+    "G_consensus_DOM_FREQ_min", "G_consensus_DOM_FREQ_max",
+    "G_consensus_DOM_FREQ_range", "G_consensus_DOM_FREQ_cv",
+    "G_consensus_DOM_FREQ_top2_mean",
     # -- Hjorth_Activity = var(bp) ≈ (AC_RMS)²，仅 IRX/AMBX 砍 --
     "IRX_Hjorth_Activity", "AMBX_Hjorth_Activity",
     # -- Hjorth_Complexity 二阶导出，极不稳定 --
@@ -1972,7 +1976,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     _consensus_base = [
         "DC_MEDIAN", "AC_RMS", "AC_MAD", "AC_DC_RATIO",
-        "DERIV_MAD", "FFT_PEAK_MEDIAN_RATIO", "DOM_FREQ",
+        "DERIV_MAD", "FFT_PEAK_MEDIAN_RATIO",
         "AUTO_CORR_PEAK",
     ]
     for _base in _consensus_base:

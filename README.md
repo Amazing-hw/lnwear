@@ -140,6 +140,16 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、test 端到端评估、部署产物和部署配方导出。
 
+**完整搜参 + 后处理 + 部署导出**（一条命令，包含特征数搜索 + 状态机后处理搜参）：
+
+```bash
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts \
+    --model_search_feature_counts "8,10,12,15" \
+    --export_window_cache --optimize_postprocess
+```
+
+此命令依次完成：特征提取 → 特征筛选 → 对每个 k 值独立搜参选最优 → 导出 NPZ 缓存 → 后处理状态机搜参 → test 评估 → 部署产物导出。最终交付物可直接交给嵌入式同事。
+
 legacy s06 状态机优化、逐窗 NPZ 缓存导出和 s07 后处理状态机搜参很耗时，默认不跑。需要时再显式打开：
 
 ```bash
@@ -839,6 +849,8 @@ postprocess state machine params
 ```
 
 如果 `use_stage2_ir=false`，部署侧进入 Stage2 特征提取前也要把 IR 信号置零；Stage1 仍继续使用真实 IR。
+
+此外，当 `use_stage2_ir=false` 时，`s08_run_pipeline.py` 生成 `deploy_feature_extractor.py` 时会自动剔除所有 IR 相关特征（前缀 `IR_`/`IRX_`/`GREEN_IR_`/`IR_AMB_`/`IR_over_`/`corr_IR_`/`log_IR_`），缩减 `FEATURE_ORDER`、`FILL_VALUES` 和 `CLIP_BOUNDS`，避免嵌入端浪费算力计算零信号特征。
 
 窗口级工程化识别只需要两类核心产物：
 
