@@ -225,6 +225,27 @@ def split_calibration_for_model_search(df_calib_pool, search_fraction=0.5, rando
 # 异常值Clipping
 # =========================================================
 
+def prepare_valid_calibration_threshold_data(df_valid, selected_features, fill_values,
+                                             threshold_fraction=0.5, random_state=42):
+    """Prepare disjoint valid splits for probability calibration and threshold locking."""
+    df_calib, df_threshold, split_meta = split_valid_for_calibration_threshold(
+        df_valid,
+        threshold_fraction=threshold_fraction,
+        random_state=random_state,
+    )
+    X_calib, y_calib, _ = prepare_xy(df_calib, selected_features, fill_values=fill_values)
+    X_threshold, y_threshold, _ = prepare_xy(df_threshold, selected_features, fill_values=fill_values)
+    return {
+        "df_calib": df_calib,
+        "df_threshold": df_threshold,
+        "X_calib": X_calib,
+        "y_calib": y_calib,
+        "X_threshold": X_threshold,
+        "y_threshold": y_threshold,
+        "split": split_meta,
+    }
+
+
 def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False):
     """
     基于 IQR 的异常值裁剪（向量化版）。
@@ -849,6 +870,8 @@ def build_model_search_result_rows(model_search_records):
             "is_default_params": bool(r.get("is_default_params", False)),
             "beats_default_params": bool(r.get("beats_default_params", False)),
             "chosen_reason": str(r.get("chosen_reason", "")),
+            "feature_count": int(r.get("feature_count", r.get("n_features", 0))),
+            "n_features": int(r.get("n_features", r.get("feature_count", 0))),
         }
         for name, value in (r.get("metrics") or {}).items():
             if name == "confusion_matrix":
@@ -868,6 +891,67 @@ def build_model_search_result_rows(model_search_records):
             row[f"param_{name}"] = value
         rows.append(row)
     return rows
+
+
+def summarize_model_search_stability(results_df, accuracy_close_margin=0.002):
+    """Summarize whether top model-search candidates are clearly separated."""
+    if results_df is None or len(results_df) == 0:
+        return {"available": False, "reason": "empty_results"}
+    df = results_df.copy()
+    if "eligible" in df.columns:
+        df = df[df["eligible"].astype(bool)]
+    if df.empty or "mean_cv_accuracy" not in df.columns:
+        return {"available": False, "reason": "missing_cv_accuracy"}
+    df["mean_cv_accuracy"] = pd.to_numeric(df["mean_cv_accuracy"], errors="coerce")
+    df = df[df["mean_cv_accuracy"].notna()].copy()
+    if df.empty:
+        return {"available": False, "reason": "no_finite_cv_accuracy"}
+
+    sort_cols = ["mean_cv_accuracy"]
+    ascending = [False]
+    if "std_cv_accuracy" in df.columns:
+        sort_cols.append("std_cv_accuracy")
+        ascending.append(True)
+    if "mean_cv_fp_rate" in df.columns:
+        sort_cols.append("mean_cv_fp_rate")
+        ascending.append(True)
+    if "final_total_nodes" in df.columns:
+        sort_cols.append("final_total_nodes")
+        ascending.append(True)
+    df = df.sort_values(by=sort_cols, ascending=ascending).reset_index(drop=True)
+
+    best_acc = float(df.loc[0, "mean_cv_accuracy"])
+    second_acc = float(df.loc[1, "mean_cv_accuracy"]) if len(df) > 1 else None
+    top_margin = None if second_acc is None else float(best_acc - second_acc)
+    close_mask = (best_acc - df["mean_cv_accuracy"].astype(float)) <= float(accuracy_close_margin)
+    close_df = df[close_mask]
+
+    default_rank = None
+    if "is_default_params" in df.columns:
+        default_hits = df.index[df["is_default_params"].astype(bool)].tolist()
+        if default_hits:
+            default_rank = int(default_hits[0] + 1)
+
+    feature_counts = []
+    if "feature_count" in close_df.columns:
+        feature_counts = sorted({int(v) for v in pd.to_numeric(close_df["feature_count"], errors="coerce").dropna()})
+
+    is_unstable = bool(
+        len(close_df) > 1
+        or (top_margin is not None and top_margin <= float(accuracy_close_margin))
+        or (default_rank is not None and default_rank <= 3)
+    )
+    return {
+        "available": True,
+        "best_mean_cv_accuracy": best_acc,
+        "second_mean_cv_accuracy": second_acc,
+        "top_accuracy_margin": top_margin,
+        "accuracy_close_margin": float(accuracy_close_margin),
+        "close_top_candidate_count": int(len(close_df)),
+        "close_top_feature_counts": feature_counts,
+        "default_params_rank": default_rank,
+        "is_unstable": is_unstable,
+    }
 
 
 def _json_safe_float(value):
@@ -1487,6 +1571,11 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
             X_train, y_train,
         )
         model_search_summary["split"] = model_select_split
+    model_search_summary["feature_count"] = int(k)
+    model_search_summary["selected_features"] = list(features)
+    for _record in model_search_records:
+        _record.setdefault("feature_count", int(k))
+        _record.setdefault("n_features", len(features))
 
     total_nodes = count_xgb_nodes(raw_model)
     best_score = float(model_search_summary.get("best", {}).get("score", float("-inf")))
@@ -1700,14 +1789,37 @@ def main(args=None):
             "selection_metric": "search_score" if args.model_search else "valid_accuracy",
             "best_score": float(_best_score),
         }
-        # 单 k 分支下后续需要的变量
+        # 多 k 搜参只消耗 train 内部 group-CV；valid 仍重新拆成 calibration/threshold。
         scale_pos_weight = _sw
         scale_pos_weight_strategy = _sw_strategy
-        calibration_threshold_split = None  # 多 k 分支下不需要 threshold split（用 valid 全量）
+        calibration_threshold_split = None
         X_threshold = X_valid
         y_threshold = y_valid
         X_calib = X_valid
         y_calib = y_valid
+        _df_valid_final = clip_outliers(
+            df_valid_raw,
+            selected_features,
+            k=1.5,
+            bounds=clip_bounds,
+        )
+        _valid_splits = prepare_valid_calibration_threshold_data(
+            _df_valid_final,
+            selected_features,
+            fill_values,
+            threshold_fraction=args.threshold_valid_fraction,
+            random_state=args.calibration_random_state,
+        )
+        calibration_threshold_split = _valid_splits["split"]
+        df_calib = _valid_splits["df_calib"]
+        X_threshold = _valid_splits["X_threshold"]
+        y_threshold = _valid_splits["y_threshold"]
+        X_calib = _valid_splits["X_calib"]
+        y_calib = _valid_splits["y_calib"]
+        model_search_summary["calibration_threshold_split"] = calibration_threshold_split
+        if isinstance(model_search_summary.get("split"), dict):
+            model_search_summary["split"]["calibration_groups"] = calibration_threshold_split.get("calibration_groups")
+            model_search_summary["split"]["threshold_groups"] = calibration_threshold_split.get("threshold_groups")
         train_groups = _train_groups
         neg_count, pos_count = _neg_count, _pos_count
         p_train_pos = _p_train_pos
@@ -1964,6 +2076,9 @@ def main(args=None):
     model_search_results_path = None
     if model_search_records:
         model_search_results_path = os.path.join(args.artifact_dir, "model_search_results.csv")
+        for _record in model_search_records:
+            _record.setdefault("feature_count", len(selected_features))
+            _record.setdefault("n_features", len(selected_features))
         rows = build_model_search_result_rows(model_search_records)
         results_df = pd.DataFrame(rows)
         if "cv_folds_completed" in results_df.columns and int(results_df["cv_folds_completed"].max()) > 0:
@@ -1982,6 +2097,7 @@ def main(args=None):
                 by=["eligible", "selection_accuracy", "total_nodes", "selection_fp_rate"],
                 ascending=[False, False, True, True],
             )
+        model_search_summary["stability"] = summarize_model_search_stability(results_df)
         results_df.to_csv(model_search_results_path, index=False)
         model_search_summary["results_path"] = model_search_results_path
 
@@ -2020,6 +2136,7 @@ def main(args=None):
 
     config = {
         "selected_features": selected_features,
+        "selected_feature_count": len(selected_features),
         "fill_values": fill_values,
 
         "model_path": model_path,

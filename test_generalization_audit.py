@@ -225,3 +225,65 @@ def test_s08_dry_run_can_insert_generalization_audit_after_eval():
     assert eval_pos < audit_pos
     assert "--split test" in output
     assert "--method state_machine" in output
+
+
+def test_audit_action_items_include_quality_aware_threshold_and_search_stability():
+    from s10_generalization_audit import build_action_items
+
+    window_strata = pd.DataFrame([
+        {
+            "level": "window",
+            "dimension": "quality_bin",
+            "stratum": "low_quality",
+            "n_windows": 20,
+            "n_samples": 4,
+            "accuracy": 0.70,
+            "precision": 0.5,
+            "recall": 0.8,
+            "fp_rate": 0.4,
+            "fn_rate": 0.0,
+            "fp": 4,
+            "fn": 0,
+            "tp": 8,
+            "tn": 6,
+            "low_support": False,
+        },
+        {
+            "level": "window",
+            "dimension": "mode",
+            "stratum": "2",
+            "n_windows": 30,
+            "n_samples": 6,
+            "accuracy": 0.75,
+            "precision": 0.7,
+            "recall": 0.8,
+            "fp_rate": 0.2,
+            "fn_rate": 0.1,
+            "fp": 3,
+            "fn": 2,
+            "tp": 12,
+            "tn": 13,
+            "low_support": False,
+        },
+    ])
+    model_search_df = pd.DataFrame([
+        {"eligible": True, "mean_cv_accuracy": 0.9820, "feature_count": 10, "is_default_params": False},
+        {"eligible": True, "mean_cv_accuracy": 0.9815, "feature_count": 15, "is_default_params": True},
+    ])
+
+    actions = build_action_items(
+        window_strata,
+        pd.DataFrame(),
+        {},
+        model_search_df,
+        {"accuracy": 0.82, "n": 30},
+        min_support=3,
+    )
+
+    issue_types = set(actions["issue_type"])
+    assert "fp_low_quality_or_ood" in issue_types
+    assert "mode_specific_drop" in issue_types
+    assert "model_search_unstable_top_candidates" in issue_types
+    text = "\n".join(actions["suggested_action"].astype(str))
+    assert "quality-aware threshold" in text
+    assert "mode-specific threshold" in text

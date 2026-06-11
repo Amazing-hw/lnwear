@@ -1,15 +1,28 @@
 from pathlib import Path
 import importlib.util
+import json
 import py_compile
 import subprocess
 import sys
 
 import joblib
 import numpy as np
+import pytest
 from xgboost import XGBClassifier
 
 import s06_deploy_eval as s06
 import s08_run_pipeline as s08
+
+
+def test_ambx_bp_shape_features_have_deploy_formulas():
+    selected = ["AMBX_bp_skewness", "AMBX_bp_kurtosis"]
+
+    formulas = s08.build_selected_feature_formulas(selected)
+
+    assert "amb_bp" in formulas["AMBX_bp_skewness"].get("intermediate_signals", {})
+    assert "amb_bp" in formulas["AMBX_bp_kurtosis"].get("intermediate_signals", {})
+    assert "std" in formulas["AMBX_bp_skewness"]["formula"]
+    assert "std" in formulas["AMBX_bp_kurtosis"]["formula"]
 
 
 def test_rendered_deploy_feature_extractor_is_project_source_independent():
@@ -122,6 +135,68 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     assert "sys.path" not in script
 
 
+def test_export_feature_extractor_preserves_ir_feature_order_when_stage2_ir_disabled(tmp_path):
+    selected = [
+        "GREEN_CORR",
+        "IRX_bp_skewness",
+        "AMBX_bp_skewness",
+    ]
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "threshold": 0.37,
+            "meta": {"use_stage2_ir": False},
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+
+    out_path = s08.export_feature_extractor_script(str(tmp_path))
+    script = Path(out_path).read_text(encoding="utf-8")
+
+    assert '"GREEN_CORR"' in script
+    assert '"IRX_bp_skewness"' in script
+    assert '"AMBX_bp_skewness"' in script
+
+
+def test_deploy_feature_extractor_applies_stage2_ir_policy_when_disabled(tmp_path):
+    selected = ["IR_mean"]
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "threshold": 0.37,
+            "meta": {
+                "fs_ppg": 25.0,
+                "win_sec": 5.0,
+                "step_sec": 1.0,
+                "use_stage2_ir": False,
+            },
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+
+    out_path = s08.export_feature_extractor_script(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("deploy_feature_extractor", out_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    n = 125
+    t = np.arange(n, dtype=float) / 25.0
+    ir_a = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ir_b = 1.0e6 + 5.0e5 * np.sin(2 * np.pi * 0.7 * t)
+    ambient = 1.0e5 + np.zeros(n)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t)
+
+    assert module.USE_STAGE2_IR is False
+    assert module.DEFAULT_WINDOW_SEC == 5.0
+    assert module.extract_features(ir_a, ambient, g1, g2, g3, fs=25.0) == module.extract_features(
+        ir_b, ambient, g1, g2, g3, fs=25.0
+    )
+
+
 def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_path):
     selected = [
         "GREEN_CORR",
@@ -231,3 +306,118 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
     assert '"names": [\n      "GREEN_CORR",\n      "GREEN_AC"\n    ]' in deploy_config
     assert "AMB_AC" not in model_params
     assert "AMB_AC" not in deploy_config
+
+
+def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(tmp_path):
+    selected = ["GREEN_CORR", "GREEN_AC"]
+    model = XGBClassifier(
+        n_estimators=1,
+        max_depth=1,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=0,
+    )
+    model.fit(np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float), np.asarray([0, 1]))
+
+    (tmp_path / "stage1_threshold.json").write_text(
+        '{"deploy_stage1_threshold":{"dc_threshold":3600000,"ac_dc_threshold":0.35}}',
+        encoding="utf-8",
+    )
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: float(i) for i, name in enumerate(selected)},
+            "clip_bounds": {"GREEN_AC": [-1.0, 1.0]},
+            "model": model,
+            "raw_model": model,
+            "threshold": 0.37,
+            "quality_thresholds": {},
+            "feature_quantiles": {},
+            "meta": {
+                "fs_ppg": 25.0,
+                "win_sec": 3.0,
+                "step_sec": 1.0,
+                "use_stage2_ir": False,
+            },
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+    s08.export_feature_extractor_script(str(tmp_path))
+    s08.export_deploy_cookbook(str(tmp_path))
+    s06.export_deploy_artifacts(str(tmp_path), skip_initial_windows=3)
+
+    report = s08.validate_deploy_artifact_consistency(str(tmp_path))
+    assert report["feature_names"] == selected
+    assert report["threshold"] == 0.37
+
+    xgb_path = tmp_path / "deploy_xgboost.json"
+    deploy_xgb = json.loads(xgb_path.read_text(encoding="utf-8"))
+    deploy_xgb["feature_order"] = list(reversed(selected))
+    xgb_path.write_text(json.dumps(deploy_xgb), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="deploy_xgboost.json feature_order"):
+        s08.validate_deploy_artifact_consistency(str(tmp_path))
+
+
+def test_export_golden_vectors_and_validate_feature_order(tmp_path):
+    selected = [
+        "GREEN_CORR",
+        "GREEN_AC",
+        "AMB_AC",
+        "ACC_YSUM",
+        "GREEN_DC",
+        "AMB_DC",
+        "GREEN_XCORR",
+        "FFT_PEAK_MEDIAN_RATIO",
+    ]
+    model = XGBClassifier(
+        n_estimators=1,
+        max_depth=1,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=0,
+    )
+    model.fit(
+        np.asarray([[0.0] * len(selected), [1.0] * len(selected)], dtype=float),
+        np.asarray([0, 1]),
+    )
+    (tmp_path / "stage1_threshold.json").write_text(
+        '{"deploy_stage1_threshold":{"dc_threshold":3600000,"ac_dc_threshold":0.35}}',
+        encoding="utf-8",
+    )
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "clip_bounds": {},
+            "model": model,
+            "raw_model": model,
+            "threshold": 0.37,
+            "quality_thresholds": {},
+            "feature_quantiles": {},
+            "meta": {
+                "fs_ppg": 25.0,
+                "win_sec": 3.0,
+                "step_sec": 1.0,
+                "use_stage2_ir": False,
+            },
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+    s08.export_feature_extractor_script(str(tmp_path))
+    s08.export_deploy_cookbook(str(tmp_path))
+    s06.export_deploy_artifacts(str(tmp_path), skip_initial_windows=3)
+
+    golden_path = s08.export_golden_vectors(str(tmp_path))
+    golden = json.loads(Path(golden_path).read_text(encoding="utf-8"))
+
+    assert golden["feature_order"] == selected
+    assert golden["vectors"]
+    assert golden["vectors"][0]["feature_vector_length"] == len(selected)
+    assert 0.0 <= golden["vectors"][0]["probability"] <= 1.0
+    s08.validate_deploy_artifact_consistency(str(tmp_path))
+
+    golden["feature_order"] = list(reversed(selected))
+    Path(golden_path).write_text(json.dumps(golden), encoding="utf-8")
+    with pytest.raises(ValueError, match="golden_vectors.json feature_order"):
+        s08.validate_deploy_artifact_consistency(str(tmp_path))

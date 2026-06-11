@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 import s05_train_final_model as s05
 
@@ -70,6 +71,58 @@ def test_group_split_accepts_arrow_string_sample_names():
     assert search_meta["fallback"] is False
     assert set(df_calib["sample_name"]).isdisjoint(set(df_threshold["sample_name"]))
     assert set(df_model_select["sample_name"]).isdisjoint(set(df_search_calib["sample_name"]))
+
+
+def test_prepare_valid_calibration_threshold_data_keeps_disjoint_groups_for_multi_k():
+    df_valid = _grouped_valid_frame()
+
+    prepared = s05.prepare_valid_calibration_threshold_data(
+        df_valid,
+        ["feature"],
+        {"feature": 0.0},
+        threshold_fraction=0.5,
+        random_state=7,
+    )
+
+    split = prepared["split"]
+    assert split["fallback"] is False
+    assert set(split["calibration_groups"]).isdisjoint(set(split["threshold_groups"]))
+    assert len(prepared["X_calib"]) == len(prepared["y_calib"]) == len(prepared["df_calib"])
+    assert len(prepared["X_threshold"]) == len(prepared["y_threshold"]) == len(prepared["df_threshold"])
+    assert set(prepared["df_calib"]["sample_name"]).isdisjoint(
+        set(prepared["df_threshold"]["sample_name"])
+    )
+
+
+def test_model_search_stability_summary_flags_close_top_candidates_and_default_strength():
+    df = pd.DataFrame([
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.9820,
+            "std_cv_accuracy": 0.004,
+            "mean_cv_fp_rate": 0.02,
+            "feature_count": 10,
+            "final_total_nodes": 180,
+            "is_default_params": False,
+        },
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.9815,
+            "std_cv_accuracy": 0.003,
+            "mean_cv_fp_rate": 0.015,
+            "feature_count": 15,
+            "final_total_nodes": 240,
+            "is_default_params": True,
+        },
+    ])
+
+    summary = s05.summarize_model_search_stability(df)
+
+    assert summary["available"] is True
+    assert summary["top_accuracy_margin"] == pytest.approx(0.0005)
+    assert summary["close_top_candidate_count"] == 2
+    assert summary["default_params_rank"] == 2
+    assert summary["is_unstable"] is True
 
 
 def test_parse_model_search_grid_exposes_adjustable_values():

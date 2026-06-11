@@ -126,7 +126,6 @@ postprocess latency:     first_worn_output_p95 <= 6s
 Stage2 窗长选择：
 - `--window_sec 3`（默认）：75 点@25Hz，响应快，适合实时佩戴检测
 - `--window_sec 5`：125 点@25Hz，频域分辨率更高（0.2Hz），适合需要精确心率频段的场景
-```
 
 `use_stage2_ir=false` 只影响 Stage2：特征提取前把 IR 信号置零。Stage1 始终使用真实 IR 做 DC/ACDC 门控。
 
@@ -138,7 +137,7 @@ Stage2 窗长选择：
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
-这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 3s/1s 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、test 端到端评估、部署产物和部署配方导出。
+这条命令会一次性完成：数据切分、Stage1 固定阈值配置、Stage2 特征提取（预切窗直接使用，连续时序按 `window_sec/stride_sec` 滑窗）、特征筛选、候选特征子集搜索、XGBoost 复杂度受限搜参、test 端到端评估、部署产物和部署配方导出。
 
 **完整搜参 + 后处理 + 部署导出**（一条命令，包含特征数搜索 + 状态机后处理搜参）：
 
@@ -291,9 +290,10 @@ python s08_run_pipeline.py \
 4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
 5. 在 max_model_nodes 预算内，选最优 (k × params) 组合。
 6. 最优特征集 + 最优模型 → model_bundle.pkl → 自动传递到所有部署产物。
+7. 多 k 搜参只用 train 内部 group-CV 做模型/特征数选择；valid 仍按 sample group 拆成 calibration split 和 threshold split，用于概率校准和单窗阈值固化。
 ```
 
-完整候选结果写入 `artifacts/model_search_results.csv`。最佳参数和特征数写入 `artifacts/final_model_config.json` 和 `artifacts/model_bundle.pkl`。
+完整候选结果写入 `artifacts/model_search_results.csv`。最佳参数、特征数、valid calibration/threshold split 和搜索稳定性摘要写入 `artifacts/final_model_config.json` 和 `artifacts/model_bundle.pkl`。
 
 ## 分步运行
 
@@ -729,6 +729,7 @@ artifacts/
   deploy_xgboost.json
   deploy_feature_extractor.py
   deploy_selected_feature_formulas.json
+  golden_vectors.json
 
   feature_subset_search/
     subset_candidates.csv
@@ -848,18 +849,23 @@ window_model_threshold
 postprocess state machine params
 ```
 
-如果 `use_stage2_ir=false`，部署侧进入 Stage2 特征提取前也要把 IR 信号置零；Stage1 仍继续使用真实 IR。
+如果 `use_stage2_ir=false`，部署侧进入 Stage2 特征提取前也要把 IR 信号置零；Stage1 仍继续使用真实 IR。`s08` 导出的 `deploy_feature_extractor.py` 会把 `model_bundle.pkl["meta"]` 中的 `USE_STAGE2_IR`、`DEFAULT_FS` 和 `DEFAULT_WINDOW_SEC` 固化到脚本常量里，工程侧不需要另外猜测窗长或 IR 使用策略。
 
-此外，当 `use_stage2_ir=false` 时，`s08_run_pipeline.py` 生成 `deploy_feature_extractor.py` 时会自动剔除所有 IR 相关特征（前缀 `IR_`/`IRX_`/`GREEN_IR_`/`IR_AMB_`/`IR_over_`/`corr_IR_`/`log_IR_`），缩减 `FEATURE_ORDER`、`FILL_VALUES` 和 `CLIP_BOUNDS`，避免嵌入端浪费算力计算零信号特征。
+部署端不会在导出时再裁剪 IR 相关特征。`deploy_feature_extractor.py` 的 `FEATURE_ORDER` 必须严格等于 `model_bundle.pkl["feature_names"]`，`FILL_VALUES`、`CLIP_BOUNDS` 和 `WINDOW_MODEL_THRESHOLD` 也都以 `model_bundle.pkl` 为准。若希望减少端侧特征数量，必须通过 `--model_search_feature_counts` 在训练/搜参阶段选出更小的特征集并重新训练模型，不能在部署导出阶段删除特征。
 
-窗口级工程化识别只需要两类核心产物：
+`s08_run_pipeline.py` 在默认部署导出流程中会校验 `model_bundle.pkl`、`deploy_feature_extractor.py`、`deploy_xgboost.json`、`deploy_cookbook.json` 和 `deploy_package/model_params.json` 的特征顺序、阈值、fill/clip 配置是否一致；若发现旧产物或部署文件漂移，会直接报错中断。
+
+默认部署导出还会生成 `artifacts/golden_vectors.json`。它包含固定合成窗口的 `FEATURE_ORDER`、fill/clip 后特征向量、XGBoost 概率和窗口级阈值标签，用于工程侧 C/Rust/端侧实现做 golden-vector 对齐。上线前应要求端侧对同一批 golden vectors 输出完全一致或在约定浮点误差内一致。
+
+窗口级工程化识别的核心推理产物是前两个文件；`golden_vectors.json` 是上线前做端侧一致性验收的校验产物：
 
 ```text
 deploy_feature_extractor.py
 final_model.json
+golden_vectors.json
 ```
 
-`deploy_feature_extractor.py` 是自包含脚本：它内联了所需的 Stage2 窗口级预处理和特征计算逻辑，不依赖 `s03_extract_feature_pool.py`、`s08_run_pipeline.py` 或其他训练/评估脚本。工程侧用它按 `FEATURE_ORDER` 生成特征向量，用 `final_model.json` 计算窗口佩戴概率，再用脚本内置的 `WINDOW_MODEL_THRESHOLD` 或 `classify_probability(probability)` 得到窗口级 0/1 识别结果。
+`deploy_feature_extractor.py` 是自包含脚本：它内联了所需的 Stage2 窗口级预处理、`use_stage2_ir` 策略和特征计算逻辑，不依赖 `s03_extract_feature_pool.py`、`s08_run_pipeline.py` 或其他训练/评估脚本。工程侧用它按 `FEATURE_ORDER` 生成特征向量，用 `final_model.json` 计算窗口佩戴概率，再用脚本内置的 `WINDOW_MODEL_THRESHOLD` 或 `classify_probability(probability)` 得到窗口级 0/1 识别结果。
 
 ### 训练与推理的预处理管道
 
@@ -884,10 +890,12 @@ final_model.json
     → ④ XGBoost 推理
 
 推理侧 (deploy_feature_extractor.py, 独立部署脚本):
-  raw features (standalone extraction via _clean_value)
-    → ① inf/None → fill_values (FILL_VALUES dict)
-    → ② clip(clip_bounds) (CLIP_BOUNDS dict)
-    → ③ 返回特征向量
+  raw window signals
+    → ① 按 USE_STAGE2_IR 对 Stage2 IR 输入保留或置零
+    → ② standalone feature extraction
+    → ③ inf/None → fill_values (FILL_VALUES dict)
+    → ④ clip(clip_bounds) (CLIP_BOUNDS dict)
+    → ⑤ 返回特征向量
 ```
 
 关键差异说明：

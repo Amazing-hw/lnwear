@@ -366,6 +366,43 @@ def _top_rows(df, condition, limit=5):
     return sub.head(limit).to_dict("records")
 
 
+def _model_search_stability_summary(model_search_df, close_margin=0.002):
+    if model_search_df is None or model_search_df.empty or "mean_cv_accuracy" not in model_search_df.columns:
+        return {"available": False}
+    df = model_search_df.copy()
+    if "eligible" in df.columns:
+        df = df[df["eligible"].astype(bool)]
+    df["mean_cv_accuracy"] = pd.to_numeric(df["mean_cv_accuracy"], errors="coerce")
+    df = df[df["mean_cv_accuracy"].notna()].copy()
+    if df.empty:
+        return {"available": False}
+    sort_cols = ["mean_cv_accuracy"]
+    ascending = [False]
+    for col in ["std_cv_accuracy", "mean_cv_fp_rate", "final_total_nodes"]:
+        if col in df.columns:
+            sort_cols.append(col)
+            ascending.append(True)
+    df = df.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    best_acc = float(df.loc[0, "mean_cv_accuracy"])
+    second_acc = float(df.loc[1, "mean_cv_accuracy"]) if len(df) > 1 else None
+    margin = None if second_acc is None else float(best_acc - second_acc)
+    close_df = df[(best_acc - df["mean_cv_accuracy"].astype(float)) <= float(close_margin)]
+    default_rank = None
+    if "is_default_params" in df.columns:
+        hits = df.index[df["is_default_params"].astype(bool)].tolist()
+        if hits:
+            default_rank = int(hits[0] + 1)
+    return {
+        "available": True,
+        "best_mean_cv_accuracy": best_acc,
+        "second_mean_cv_accuracy": second_acc,
+        "top_accuracy_margin": margin,
+        "close_top_candidate_count": int(len(close_df)),
+        "default_params_rank": default_rank,
+        "is_unstable": bool(len(close_df) > 1 or (default_rank is not None and default_rank <= 3)),
+    }
+
+
 def build_action_items(window_strata, sample_strata, hard_payload, model_search_df,
                        window_metrics, min_support):
     """Translate recurring deployment-risk patterns into concrete next actions."""
@@ -398,6 +435,21 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
                 row["n_samples"],
                 "Check Stage1/quality gating and add matching positive low-quality/OOD data.",
             )
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"].isin(["quality_bin", "ood_bin"]))
+            & (df["fp"] > 0)
+            & (df["n_windows"] >= 1),
+        ):
+            _add_action(
+                items,
+                "P1",
+                "fp_low_quality_or_ood",
+                f"{row['dimension']}={row['stratum']}",
+                f"fp={row['fp']}, fp_rate={row['fp_rate']:.4f}",
+                row["n_samples"],
+                "Try quality-aware threshold or quality gating before changing the state machine.",
+            )
         overall_acc = float(window_metrics.get("accuracy", 0.0))
         for row in _top_rows(
             window_strata,
@@ -412,7 +464,7 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
                 f"mode={row['stratum']}",
                 f"accuracy={row['accuracy']:.4f}, overall={overall_acc:.4f}",
                 row["n_samples"],
-                "Inspect mode-specific feature selection or consider mode-specific thresholds.",
+                "Inspect mode-specific feature selection or try a mode-specific threshold on valid only.",
             )
         for row in _top_rows(
             window_strata,
@@ -441,6 +493,21 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
                 f"best_cv_accuracy={cv_best:.4f}, test_window_accuracy={window_metrics.get('accuracy', 0.0):.4f}",
                 int(window_metrics.get("n", 0)),
                 "Audit split leakage and record/person/device distribution shift.",
+            )
+        stability = _model_search_stability_summary(model_search_df)
+        if stability.get("available") and stability.get("is_unstable"):
+            _add_action(
+                items,
+                "P2",
+                "model_search_unstable_top_candidates",
+                "model_search_results",
+                (
+                    f"top_margin={stability.get('top_accuracy_margin')}, "
+                    f"close_top={stability.get('close_top_candidate_count')}, "
+                    f"default_rank={stability.get('default_params_rank')}"
+                ),
+                int(window_metrics.get("n", 0)),
+                "Do not trust a single top candidate blindly; inspect top-k stability or increase group-CV repeats.",
             )
 
     if not items:

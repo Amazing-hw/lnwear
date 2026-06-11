@@ -9,11 +9,13 @@
 这条命令会默认跑到 s06_cb：
     s01 数据切分
     s02 Stage1 固定阈值
-    s03 3s/1s Stage2 特征窗口
+    s03 Stage2 特征窗口（默认 3s/1s，也支持 5s/1s）
     s04 特征筛选 + s04_search 候选子集搜索
     s05 XGBoost 训练；默认执行节点预算约束下的 staged group-CV 搜参
     s06_eval 用当前已固化/默认状态机做 test 端到端评估
     s06_xpt/s06_feat/s06_plot/s06_cb 导出部署产物、特征脚本、错误图和部署配方
+    s06_cb 后自动校验部署特征顺序、阈值、fill/clip 与 model_bundle.pkl 完全一致
+    s06_cb 后同时导出 golden_vectors.json，供端侧实现做特征向量和概率对齐
 
 legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，默认不跑；需要时显式运行：
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --optimize
@@ -46,7 +48,7 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
 流程:
     s01: 数据扫描 & train/valid/test 切分
     s02: Stage1 IR DC/ACDC 固定阈值配置
-    s03: Stage2 特征池提取（预切窗直接使用；连续时序按 3s/1s 滑窗）
+    s03: Stage2 特征池提取（预切窗直接使用；连续时序按 window_sec/stride_sec 滑窗）
     s04: 稳定性特征筛选
     s05: XGBoost 最终模型训练
     s06_opt:  legacy 状态机参数网格搜索（默认不跑；需 --optimize）
@@ -64,6 +66,8 @@ import os
 import json
 import subprocess
 import joblib
+import ast
+import importlib.util
 
 
 THREAD_ENV_DEFAULTS = {
@@ -274,12 +278,18 @@ def _standalone_feature_engine_source(scripts_dir):
 
 
 def _render_selected_feature_extractor(selected_features, fill_values, clip_bounds, formulas, scripts_dir,
-                                       window_model_threshold=0.5):
+                                       window_model_threshold=0.5,
+                                       use_stage2_ir=False,
+                                       default_fs=25.0,
+                                       window_sec=3.0):
     order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
     fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
     clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
     formulas_json = json.dumps(formulas, ensure_ascii=False, indent=2)
     threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
+    use_stage2_ir_py = "True" if bool(use_stage2_ir) else "False"
+    default_fs_py = repr(float(default_fs))
+    window_sec_py = repr(float(window_sec))
     feature_engine_source = _standalone_feature_engine_source(scripts_dir)
 
     return f'''# -*- coding: utf-8 -*-
@@ -302,6 +312,17 @@ FILL_VALUES = {fill_json}
 CLIP_BOUNDS = {clip_json}
 FEATURE_FORMULAS = {formulas_json}
 WINDOW_MODEL_THRESHOLD = {threshold_json}
+USE_STAGE2_IR = {use_stage2_ir_py}
+DEFAULT_FS = {default_fs_py}
+DEFAULT_WINDOW_SEC = {window_sec_py}
+
+
+def apply_stage2_ir_policy(ir, use_stage2_ir=USE_STAGE2_IR):
+    """Return the IR signal used by Stage2 features according to the trained model switch."""
+    ir = np.asarray(ir, dtype=np.float64)
+    if use_stage2_ir:
+        return ir
+    return np.zeros_like(ir, dtype=np.float64)
 
 
 {feature_engine_source}
@@ -351,8 +372,9 @@ def _add_acc_ppg_coherence(features, acc, g_mean_bp, fs):
 
 def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     """Return selected features as a plain dict in model order."""
+    ir_stage2 = apply_stage2_ir_policy(ir, use_stage2_ir=USE_STAGE2_IR)
     features, preprocessed = extract_feature_pool_from_window(
-        ir=ir,
+        ir=ir_stage2,
         ambient=ambient,
         g1=g1,
         g2=g2,
@@ -377,7 +399,7 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     _acc_energy = float(features.get("ACC_MAG_ENERGY", 0.0))
     features["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
     # Ambient Stage1 soft features (环境光软特征)
-    _ir_dc = float(np.median(ir)) if ir is not None and len(ir) > 0 else 0.0
+    _ir_dc = float(np.median(ir_stage2)) if ir_stage2 is not None and len(ir_stage2) > 0 else 0.0
     _amb_dc = float(np.median(ambient)) if ambient is not None and len(ambient) > 0 else 0.0
     _amb_ratio = float(_amb_dc / max(_ir_dc, EPS))
     features["AMB_STAGE1_RATIO"] = _amb_ratio
@@ -405,15 +427,15 @@ def classify_probability(probability):
 
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
-    n = 125
-    t = np.linspace(0, 5, n, endpoint=False)
+    n = max(32, int(round(DEFAULT_FS * DEFAULT_WINDOW_SEC)))
+    t = np.arange(n, dtype=float) / DEFAULT_FS
     ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
     ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
     g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
     g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
     g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
     acc = rng.normal(0, 0.01, (n, 3))
-    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=25)
+    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=DEFAULT_FS)
     print(f"Feature vector: {{len(vec)}} values")
     for i, (name, value) in enumerate(zip(FEATURE_ORDER, vec)):
         print(f"{{i:02d}} {{name}} = {{value:.8g}}")
@@ -429,19 +451,7 @@ def export_feature_extractor_script(artifact_dir):
 
     bundle = joblib.load(bp)
     selected = list(bundle["feature_names"])
-    use_stage2_ir = bool(bundle.get("meta", {}).get("use_stage2_ir", False))
-
-    # 若 use_stage2_ir=false，剔除 IR 相关特征（训练时 IR 已置零，部署不应计算）
-    if not use_stage2_ir:
-        _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
-                        "corr_IR_", "log_IR_")
-        _before = len(selected)
-        selected = [f for f in selected
-                    if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)]
-        _dropped = _before - len(selected)
-        if _dropped > 0:
-            print(f"[IR strip] use_stage2_ir=false, 从部署脚本中移除 {_dropped} 个 IR 特征 "
-                  f"(保留 {len(selected)} 个非 IR 特征)")
+    meta = bundle.get("meta", {}) or {}
 
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
@@ -453,6 +463,9 @@ def export_feature_extractor_script(artifact_dir):
         formulas,
         scripts_dir=SCRIPTS_DIR,
         window_model_threshold=float(bundle.get("threshold", 0.5)),
+        use_stage2_ir=bool(meta.get("use_stage2_ir", False)),
+        default_fs=float(meta.get("fs_ppg", 25.0)),
+        window_sec=float(meta.get("win_sec", 3.0)),
     )
 
     out_path = os.path.join(artifact_dir, "deploy_feature_extractor.py")
@@ -466,6 +479,259 @@ def export_feature_extractor_script(artifact_dir):
     print(f"[OK] selected deploy feature extractor -> {out_path}")
     print(f"[OK] selected deploy formulas -> {formula_path}")
     return out_path
+
+
+def _load_json_if_exists(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _parse_deploy_script_constants(path):
+    if not os.path.exists(path):
+        raise ValueError(f"deploy_feature_extractor.py missing: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    wanted = {
+        "FEATURE_ORDER",
+        "FILL_VALUES",
+        "CLIP_BOUNDS",
+        "WINDOW_MODEL_THRESHOLD",
+        "USE_STAGE2_IR",
+        "DEFAULT_FS",
+        "DEFAULT_WINDOW_SEC",
+    }
+    values = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in wanted:
+                    values[target.id] = ast.literal_eval(node.value)
+    missing = sorted(wanted - set(values))
+    if missing:
+        raise ValueError("deploy_feature_extractor.py missing constants: " + ", ".join(missing))
+    return values
+
+
+def _normalize_clip_bounds(bounds):
+    out = {}
+    for name, bound in (bounds or {}).items():
+        if bound is None or not isinstance(bound, (list, tuple)) or len(bound) != 2:
+            continue
+        out[name] = [float(bound[0]), float(bound[1])]
+    return out
+
+
+def _assert_same(label, actual, expected):
+    if actual != expected:
+        raise ValueError(f"{label} mismatch: expected {expected!r}, got {actual!r}")
+
+
+def _assert_float_same(label, actual, expected, tol=1e-12):
+    if abs(float(actual) - float(expected)) > tol:
+        raise ValueError(f"{label} mismatch: expected {float(expected)!r}, got {float(actual)!r}")
+
+
+def _json_safe_number(value):
+    value = float(value)
+    if not (value == value) or value in (float("inf"), float("-inf")):
+        return 0.0
+    return value
+
+
+def export_golden_vectors(artifact_dir, n_vectors=1):
+    """Export deterministic deployment golden vectors for endpoint parity checks."""
+    bundle_path = os.path.join(artifact_dir, "model_bundle.pkl")
+    script_path = os.path.join(artifact_dir, "deploy_feature_extractor.py")
+    if not os.path.exists(bundle_path):
+        print("[WARN] model_bundle.pkl not found, skip golden vectors")
+        return None
+    if not os.path.exists(script_path):
+        print("[WARN] deploy_feature_extractor.py not found, skip golden vectors")
+        return None
+
+    bundle = joblib.load(bundle_path)
+    selected = list(bundle["feature_names"])
+    threshold = float(bundle.get("threshold", 0.5))
+    spec = importlib.util.spec_from_file_location("_lnwear_deploy_feature_extractor", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if list(module.FEATURE_ORDER) != selected:
+        raise ValueError("deploy_feature_extractor.py FEATURE_ORDER mismatch before golden export")
+
+    fs = float(bundle.get("meta", {}).get("fs_ppg", 25.0))
+    win_sec = float(bundle.get("meta", {}).get("win_sec", 3.0))
+    n = max(32, int(round(fs * win_sec)))
+    rng = __import__("numpy").random.default_rng(12345)
+    np = __import__("numpy")
+    vectors = []
+    for idx in range(int(max(1, n_vectors))):
+        t = np.arange(n, dtype=float) / fs
+        phase = 0.15 * idx
+        ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t + phase)
+        ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t + phase)
+        g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01 + phase)
+        g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03 + phase)
+        g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02 + phase)
+        acc = rng.normal(0, 0.01, (n, 3))
+        feature_dict = module.extract_feature_dict(ir, ambient, g1, g2, g3, acc=acc, fs=fs, mode=0)
+        feature_vector = [float(feature_dict[name]) for name in selected]
+        X = np.asarray([feature_vector], dtype=float)
+        model = bundle.get("model") or bundle.get("raw_model")
+        probability = float(model.predict_proba(X)[:, 1][0])
+        label = int(probability >= threshold)
+        vectors.append({
+            "id": f"synthetic_{idx}",
+            "fs": fs,
+            "window_sec": win_sec,
+            "n_samples": int(n),
+            "mode": 0,
+            "feature_vector_length": int(len(feature_vector)),
+            "features_after_fill_clip": {
+                name: _json_safe_number(feature_dict[name])
+                for name in selected
+            },
+            "feature_vector": [_json_safe_number(v) for v in feature_vector],
+            "probability": _json_safe_number(probability),
+            "threshold": threshold,
+            "window_label": label,
+        })
+
+    payload = {
+        "version": 1,
+        "source": "s08_run_pipeline.export_golden_vectors",
+        "feature_order": selected,
+        "threshold": threshold,
+        "n_vectors": int(len(vectors)),
+        "vectors": vectors,
+    }
+    out_path = os.path.join(artifact_dir, "golden_vectors.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[OK] golden vectors -> {out_path}")
+    return out_path
+
+
+def validate_deploy_artifact_consistency(artifact_dir):
+    """Fail fast when deployment files drift from model_bundle.pkl."""
+    bundle_path = os.path.join(artifact_dir, "model_bundle.pkl")
+    if not os.path.exists(bundle_path):
+        raise ValueError(f"model_bundle.pkl missing: {bundle_path}")
+
+    bundle = joblib.load(bundle_path)
+    selected = list(bundle["feature_names"])
+    threshold = float(bundle.get("threshold", 0.5))
+    expected_fill = _json_float_map(bundle.get("fill_values", {}), selected)
+    expected_clip = _json_clip_map(bundle.get("clip_bounds", {}), selected)
+    expected_meta = {
+        key: bundle.get("meta", {}).get(key)
+        for key in ("fs_ppg", "win_sec", "step_sec", "use_stage2_ir")
+        if key in bundle.get("meta", {})
+    }
+
+    script_constants = _parse_deploy_script_constants(
+        os.path.join(artifact_dir, "deploy_feature_extractor.py")
+    )
+    _assert_same("deploy_feature_extractor.py FEATURE_ORDER", list(script_constants["FEATURE_ORDER"]), selected)
+    _assert_same("deploy_feature_extractor.py FILL_VALUES", script_constants["FILL_VALUES"], expected_fill)
+    _assert_same("deploy_feature_extractor.py CLIP_BOUNDS", script_constants["CLIP_BOUNDS"], expected_clip)
+    _assert_float_same("deploy_feature_extractor.py WINDOW_MODEL_THRESHOLD",
+                       script_constants["WINDOW_MODEL_THRESHOLD"], threshold)
+    if "use_stage2_ir" in expected_meta:
+        _assert_same("deploy_feature_extractor.py USE_STAGE2_IR",
+                     bool(script_constants["USE_STAGE2_IR"]), bool(expected_meta["use_stage2_ir"]))
+    if "fs_ppg" in expected_meta:
+        _assert_float_same("deploy_feature_extractor.py DEFAULT_FS",
+                           script_constants["DEFAULT_FS"], expected_meta["fs_ppg"])
+    if "win_sec" in expected_meta:
+        _assert_float_same("deploy_feature_extractor.py DEFAULT_WINDOW_SEC",
+                           script_constants["DEFAULT_WINDOW_SEC"], expected_meta["win_sec"])
+
+    formulas = _load_json_if_exists(os.path.join(artifact_dir, "deploy_selected_feature_formulas.json"))
+    if formulas is not None:
+        missing_formulas = [name for name in selected if name not in formulas]
+        if missing_formulas:
+            raise ValueError("deploy_selected_feature_formulas.json missing formulas: "
+                             + ", ".join(missing_formulas))
+
+    deploy_xgb = _load_json_if_exists(os.path.join(artifact_dir, "deploy_xgboost.json"))
+    if deploy_xgb is not None:
+        _assert_same("deploy_xgboost.json feature_order", list(deploy_xgb.get("feature_order", [])), selected)
+        _assert_same("deploy_xgboost.json feature_names", list(deploy_xgb.get("feature_names", [])), selected)
+        _assert_same("deploy_xgboost.json fill_values",
+                     {name: float(deploy_xgb.get("fill_values", {}).get(name, 0.0)) for name in selected},
+                     expected_fill)
+        _assert_same("deploy_xgboost.json clip_bounds",
+                     _normalize_clip_bounds(deploy_xgb.get("clip_bounds", {})),
+                     _normalize_clip_bounds(expected_clip))
+        _assert_float_same("deploy_xgboost.json threshold", deploy_xgb.get("threshold", 0.5), threshold)
+
+    cookbook = _load_json_if_exists(os.path.join(artifact_dir, "deploy_cookbook.json"))
+    if cookbook is not None:
+        cb_features = cookbook.get("B_selected_features", {}).get("feature_order", [])
+        _assert_same("deploy_cookbook.json B_selected_features.feature_order", list(cb_features), selected)
+        cb_inf = cookbook.get("C_xgboost_inference", {})
+        _assert_same("deploy_cookbook.json C_xgboost_inference.fill_values",
+                     {name: float(cb_inf.get("fill_values", {}).get(name, 0.0)) for name in selected},
+                     expected_fill)
+        _assert_same("deploy_cookbook.json C_xgboost_inference.clip_bounds",
+                     _normalize_clip_bounds(cb_inf.get("clip_bounds", {})),
+                     _normalize_clip_bounds(expected_clip))
+        _assert_float_same("deploy_cookbook.json C_xgboost_inference.model_threshold",
+                           cb_inf.get("model_threshold", 0.5), threshold)
+
+    model_params = _load_json_if_exists(os.path.join(artifact_dir, "deploy_package", "model_params.json"))
+    if model_params is not None:
+        _assert_same("deploy_package/model_params.json selected_features",
+                     list(model_params.get("selected_features", [])), selected)
+        _assert_same("deploy_package/model_params.json fill_values",
+                     {name: float(model_params.get("fill_values", {}).get(name, 0.0)) for name in selected},
+                     expected_fill)
+        _assert_same("deploy_package/model_params.json clip_bounds",
+                     _normalize_clip_bounds(model_params.get("clip_bounds", {})),
+                     _normalize_clip_bounds(expected_clip))
+        _assert_float_same("deploy_package/model_params.json window_threshold",
+                           model_params.get("window_threshold", 0.5), threshold)
+        for key, expected in expected_meta.items():
+            if key in model_params.get("meta", {}):
+                _assert_same(f"deploy_package/model_params.json meta.{key}",
+                             model_params["meta"][key], expected)
+
+    golden = _load_json_if_exists(os.path.join(artifact_dir, "golden_vectors.json"))
+    if golden is not None:
+        _assert_same("golden_vectors.json feature_order", list(golden.get("feature_order", [])), selected)
+        _assert_float_same("golden_vectors.json threshold", golden.get("threshold", 0.5), threshold)
+        for idx, vec in enumerate(golden.get("vectors", [])):
+            _assert_same(
+                f"golden_vectors.json vectors[{idx}].feature_vector_length",
+                int(vec.get("feature_vector_length", -1)),
+                len(selected),
+            )
+            _assert_same(
+                f"golden_vectors.json vectors[{idx}].feature_vector length",
+                len(vec.get("feature_vector", [])),
+                len(selected),
+            )
+
+    report = {
+        "feature_names": selected,
+        "n_features": len(selected),
+        "threshold": threshold,
+        "meta": expected_meta,
+        "checked_files": [
+            name for name, exists in [
+                ("deploy_feature_extractor.py", True),
+                ("deploy_selected_feature_formulas.json", formulas is not None),
+                ("deploy_xgboost.json", deploy_xgb is not None),
+                ("deploy_cookbook.json", cookbook is not None),
+                ("deploy_package/model_params.json", model_params is not None),
+                ("golden_vectors.json", golden is not None),
+            ] if exists
+        ],
+    }
+    print("[OK] deploy artifacts are consistent with model_bundle.pkl")
+    return report
 import sys
 import time
 from datetime import timedelta
@@ -800,8 +1066,10 @@ def _build_full_feature_recipe(selected_features):
         # == Waveform shape ==
         "GREEN_bp_skewness": {"depends": ["g_mean_bp"], "formula": "mean((bp-mean(bp))^3) / std(bp)^3"},
         "IRX_bp_skewness":   {"depends": ["ir_bp"], "formula": "mean((bp-mean(bp))^3) / std(bp)^3"},
+        "AMBX_bp_skewness":  {"depends": ["amb_bp"], "formula": "mean((bp-mean(bp))^3) / std(bp)^3"},
         "GREEN_bp_kurtosis": {"depends": ["g_mean_bp"], "formula": "mean((bp-mean(bp))^4) / std(bp)^4"},
         "IRX_bp_kurtosis":   {"depends": ["ir_bp"], "formula": "mean((bp-mean(bp))^4) / std(bp)^4"},
+        "AMBX_bp_kurtosis":  {"depends": ["amb_bp"], "formula": "mean((bp-mean(bp))^4) / std(bp)^4"},
 
         # == ACC ==
         "ACC_MAG_MEAN":     {"depends": ["acc_mag"], "formula": "mean(acc_mag)"},
@@ -1665,6 +1933,9 @@ def main():
         if cmd == "__cookbook__":
             t0 = time.time()
             export_deploy_cookbook(args.artifact_dir)
+            if "s06_feat" in completed_keys:
+                export_golden_vectors(args.artifact_dir)
+                validate_deploy_artifact_consistency(args.artifact_dir)
             dt = time.time() - t0
             completed_keys.add(key)
             print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
