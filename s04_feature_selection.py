@@ -233,11 +233,13 @@ FEATURE_GROUPS = {
         "G_spatial_vmag_iqr", "G_spatial_vmag_std",
         "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
         "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
+        "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
     ],
     # -- 绿光三通道一致性(3) - limit 1 --
     "green_3ch_consistency": [
         "G_bp_corr_mean", "G_bp_corr_min", "G_bp_corr_std",
         "G_bp_lag_std",
+        "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
     ],
     # -- Ambient 交叉泄露(5) - limit 1 --
     "amb_cross": [

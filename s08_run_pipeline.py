@@ -1220,6 +1220,26 @@ def _build_full_feature_recipe(selected_features):
                 "depends": ["g1_bp", "g2_bp", "g3_bp"],
                 "formula": "degrees(atan2((sqrt(3)/2)*(ac2-ac3), ac1-0.5*ac2-0.5*ac3))",
             },
+            "G_2OF3_AC_SUPPORT": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "count(raw_centered_ac_rms >= 0.5 * max(raw_centered_ac_rms)) / 3",
+            },
+            "G_TOP2_TO_ALL_AC_RATIO": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "sum(largest_two(raw_centered_ac_rms)) / (sum(raw_centered_ac_rms) + 1e-12)",
+            },
+            "G_TOP2_CORR_MIN": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw", "g1_bp", "g2_bp", "g3_bp"],
+                "formula": "corrcoef(bandpass signals for two channels with highest raw centered AC RMS)",
+            },
+            "G_WEAK_CHANNEL_GAP": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "(mean(largest_two(raw_centered_ac_rms)) - min(raw_centered_ac_rms)) / (mean(largest_two(raw_centered_ac_rms)) + 1e-12)",
+            },
+            "G_SPATIAL_STABILITY_SCORE": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw", "g1_bp", "g2_bp", "g3_bp"],
+                "formula": "G_2OF3_AC_SUPPORT * max(0, G_TOP2_CORR_MIN) / (1 + mean(spatial_vmag))",
+            },
             "GREEN_SAT_FRAC": {
                 "depends": ["g_mean_raw"],
                 "formula": "mean(g_mean_raw >= 0.98 * max(g_mean_raw))",

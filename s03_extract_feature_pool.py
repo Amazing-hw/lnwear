@@ -1110,7 +1110,8 @@ def extract_single_channel_features(raw, bp, dc, fs, prefix, fft_cache=None):
 # 三通道绿光空间特征
 # =========================================================
 
-def extract_green_spatial_features(g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp):
+def extract_green_spatial_features(g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp,
+                                   g1_input=None, g2_input=None, g3_input=None):
     feat = OrderedDict()
     eps = 1e-8
 
@@ -1169,6 +1170,45 @@ def extract_green_spatial_features(g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp):
     feat["G_bp_corr_mean"] = float(np.mean([c12, c23, c31]))
     feat["G_bp_corr_min"] = float(np.min([c12, c23, c31]))
     feat["G_bp_corr_std"] = float(np.std([c12, c23, c31]))
+
+    # ---------- 三绿光可靠性 ----------
+    # These scalar features keep the 120-degree green-channel geometry deployable:
+    # no voting state, just compact reliability cues for XGBoost.
+    ch_bp = [g1_bp, g2_bp, g3_bp]
+    ch_raw = [
+        g1_raw if g1_input is None else np.asarray(g1_input, dtype=np.float64),
+        g2_raw if g2_input is None else np.asarray(g2_input, dtype=np.float64),
+        g3_raw if g3_input is None else np.asarray(g3_input, dtype=np.float64),
+    ]
+    ch_ac = np.array([
+        float(np.sqrt(np.mean((x - np.median(x)) ** 2))) for x in ch_raw
+    ], dtype=np.float64)
+    max_ac = float(np.max(ch_ac)) if len(ch_ac) else 0.0
+    total_ac = float(np.sum(ch_ac))
+    if max_ac <= eps:
+        feat["G_2OF3_AC_SUPPORT"] = 0.0
+        feat["G_TOP2_TO_ALL_AC_RATIO"] = 0.0
+        feat["G_TOP2_CORR_MIN"] = 0.0
+        feat["G_WEAK_CHANNEL_GAP"] = 0.0
+        feat["G_SPATIAL_STABILITY_SCORE"] = 0.0
+    else:
+        support_count = int(np.sum(ch_ac >= 0.5 * max_ac))
+        top2_idx = np.argsort(ch_ac)[-2:]
+        top2_ac = ch_ac[top2_idx]
+        top2_corr = safe_corr(ch_bp[int(top2_idx[0])], ch_bp[int(top2_idx[1])])
+        top2_mean_ac = float(np.mean(top2_ac))
+        weak_ac = float(np.min(ch_ac))
+        weak_gap = safe_div(top2_mean_ac - weak_ac, top2_mean_ac + eps)
+        corr_quality = max(0.0, float(top2_corr))
+        spatial_penalty = 1.0 / (1.0 + float(np.mean(vmag)))
+
+        feat["G_2OF3_AC_SUPPORT"] = float(support_count / 3.0)
+        feat["G_TOP2_TO_ALL_AC_RATIO"] = safe_div(float(np.sum(top2_ac)), total_ac + eps)
+        feat["G_TOP2_CORR_MIN"] = float(top2_corr)
+        feat["G_WEAK_CHANNEL_GAP"] = float(max(0.0, weak_gap))
+        feat["G_SPATIAL_STABILITY_SCORE"] = float(
+            feat["G_2OF3_AC_SUPPORT"] * corr_quality * spatial_penalty
+        )
 
     return feat, g_imbalance, vmag
 
@@ -1812,6 +1852,9 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     g1 = g1[:n]
     g2 = g2[:n]
     g3 = g3[:n]
+    g1_input = g1.copy()
+    g2_input = g2.copy()
+    g3_input = g3.copy()
     g_mean_input = (g1 + g2 + g3) / 3.0
 
     # Short-window SQI is computed on the raw window before artifact removal.
@@ -1901,7 +1944,10 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     spatial_feat, g_imbalance, g_vmag = extract_green_spatial_features(
         g1_raw, g2_raw, g3_raw,
-        g1_bp, g2_bp, g3_bp
+        g1_bp, g2_bp, g3_bp,
+        g1_input=g1_input,
+        g2_input=g2_input,
+        g3_input=g3_input,
     )
 
     feat.update(spatial_feat)

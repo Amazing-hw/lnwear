@@ -28,6 +28,20 @@ import pandas as pd
 
 
 OPTIONAL_DIMENSIONS = ["subject_id", "device_id", "session_id"]
+GREEN_RELIABILITY_FEATURES = [
+    "G_2OF3_AC_SUPPORT",
+    "G_TOP2_TO_ALL_AC_RATIO",
+    "G_TOP2_CORR_MIN",
+    "G_WEAK_CHANNEL_GAP",
+    "G_SPATIAL_STABILITY_SCORE",
+]
+GREEN_RELIABILITY_DIMENSIONS = [
+    "green_support_bin",
+    "green_top2_ratio_bin",
+    "green_top2_corr_bin",
+    "green_weak_gap_bin",
+    "green_stability_bin",
+]
 WINDOW_DIMENSIONS = [
     "mode",
     "h5_file",
@@ -37,7 +51,7 @@ WINDOW_DIMENSIONS = [
     "time_bin",
     "quality_bin",
     "ood_bin",
-] + OPTIONAL_DIMENSIONS
+] + GREEN_RELIABILITY_DIMENSIONS + OPTIONAL_DIMENSIONS
 SAMPLE_DIMENSIONS = [
     "mode",
     "h5_file",
@@ -144,6 +158,70 @@ def _finite_float(value):
     except Exception:
         return None
     return out if np.isfinite(out) else None
+
+
+def _green_support_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v < 2.0 / 3.0:
+        return "<2of3"
+    if v < 1.0:
+        return "2of3"
+    return "3of3"
+
+
+def _green_corr_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v < 0.50:
+        return "low_corr"
+    if v < 0.85:
+        return "mid_corr"
+    return "high_corr"
+
+
+def _green_gap_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v > 0.60:
+        return "large_gap"
+    if v > 0.25:
+        return "mid_gap"
+    return "low_gap"
+
+
+def _green_stability_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v < 0.35:
+        return "low_stability"
+    if v < 0.75:
+        return "mid_stability"
+    return "high_stability"
+
+
+def add_green_reliability_bins(window_df):
+    """Add deployment-readable bins for optional three-green reliability features."""
+    if window_df.empty:
+        return window_df
+    df = window_df.copy()
+    if "G_2OF3_AC_SUPPORT" in df.columns:
+        df["green_support_bin"] = df["G_2OF3_AC_SUPPORT"].map(_green_support_bin)
+    if "G_TOP2_TO_ALL_AC_RATIO" in df.columns:
+        df["green_top2_ratio_bin"] = df["G_TOP2_TO_ALL_AC_RATIO"].map(
+            lambda v: "single_dominant" if (_finite_float(v) or 0.0) > 0.90 else "balanced_top2"
+        )
+    if "G_TOP2_CORR_MIN" in df.columns:
+        df["green_top2_corr_bin"] = df["G_TOP2_CORR_MIN"].map(_green_corr_bin)
+    if "G_WEAK_CHANNEL_GAP" in df.columns:
+        df["green_weak_gap_bin"] = df["G_WEAK_CHANNEL_GAP"].map(_green_gap_bin)
+    if "G_SPATIAL_STABILITY_SCORE" in df.columns:
+        df["green_stability_bin"] = df["G_SPATIAL_STABILITY_SCORE"].map(_green_stability_bin)
+    return df
 
 
 def _first_worn_latencies(sample_df):
@@ -285,6 +363,7 @@ def _strata_rows(df, dimensions, min_support, level):
 
 
 def build_strata(window_df, sample_df, min_support):
+    window_df = add_green_reliability_bins(window_df)
     window_strata = pd.DataFrame(
         _strata_rows(window_df, WINDOW_DIMENSIONS, min_support, "window"),
         columns=STRATA_COLUMNS,
@@ -403,6 +482,37 @@ def _model_search_stability_summary(model_search_df, close_margin=0.002):
     }
 
 
+def _collect_feature_names(value):
+    if isinstance(value, dict):
+        out = []
+        for key, nested in value.items():
+            if key in {"selected_features", "feature_names", "features"}:
+                out.extend(_collect_feature_names(nested))
+            elif isinstance(nested, (dict, list, tuple)):
+                out.extend(_collect_feature_names(nested))
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, (dict, list, tuple)):
+                out.extend(_collect_feature_names(item))
+        return out
+    return []
+
+
+def green_reliability_feature_usage(final_config):
+    features = list(dict.fromkeys(_collect_feature_names(final_config)))
+    selected = [f for f in features if f in GREEN_RELIABILITY_FEATURES]
+    return {
+        "known_features": list(GREEN_RELIABILITY_FEATURES),
+        "selected_features": selected,
+        "selected_count": int(len(selected)),
+        "selected_fraction": _safe_div(len(selected), len(features)) if features else 0.0,
+    }
+
+
 def build_action_items(window_strata, sample_strata, hard_payload, model_search_df,
                        window_metrics, min_support):
     """Translate recurring deployment-risk patterns into concrete next actions."""
@@ -480,6 +590,35 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
                 f"errors={int(row['fp'] + row['fn'])}",
                 row["n_samples"],
                 "Review skip_initial_windows, warmup behavior, and window ordering.",
+            )
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"].isin([
+                "green_support_bin",
+                "green_top2_ratio_bin",
+                "green_top2_corr_bin",
+                "green_weak_gap_bin",
+                "green_stability_bin",
+            ]))
+            & (df["fp"] > 0)
+            & (
+                df["stratum"].astype(str).isin([
+                    "<2of3",
+                    "single_dominant",
+                    "low_corr",
+                    "large_gap",
+                    "low_stability",
+                ])
+            ),
+        ):
+            _add_action(
+                items,
+                "P1",
+                "green_reliability_fp_cluster",
+                f"{row['dimension']}={row['stratum']}",
+                f"fp={row['fp']}, fp_rate={row['fp_rate']:.4f}",
+                row["n_samples"],
+                "Inspect hard negatives with poor three-green reliability; consider keeping these features if they reduce FP on valid/test.",
             )
 
     if not model_search_df.empty and "mean_cv_accuracy" in model_search_df.columns:
@@ -616,6 +755,7 @@ def run_audit(artifact_dir, split="test", method="state_machine", min_support=10
         "sample_metrics": sample_metrics,
         "group_level_variance": group_level_variance,
         "model_search": final_config.get("model_search", {}),
+        "green_reliability_feature_usage": green_reliability_feature_usage(final_config),
         "n_window_strata": int(len(window_strata)),
         "n_sample_strata": int(len(sample_strata)),
         "n_action_items": int(len(action_items)),

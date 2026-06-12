@@ -214,7 +214,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 20 \
-  --model_search_feature_counts "8,10,12,15,18,22,26,30" \
+  --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --split test
 ```
@@ -226,7 +226,7 @@ python s08_run_pipeline.py \
   --artifact_dir artifacts \
   --window_sec 3 \
   --max_features 20 \
-  --model_search_feature_counts "8,10,12,15,18,22,26,30"
+  --model_search_feature_counts "8,10,12,15,18"
 ```
 
 ## 复杂度受限模型搜参
@@ -237,7 +237,7 @@ python s08_run_pipeline.py \
 
 | 参数 | 候选值 | 候选数 |
 |---|---|---|
-| 特征数量 k | 8, 10, 12, 15, 18, 22, 26, 30 | 8 |
+| 特征数量 k | 8, 10, 12, 15, 18 | 5 |
 | n_estimators | 20, 25, 30, 35, 40, 45, 50, 55, 60 | 9 |
 | max_depth | 2, 3, 4, 5 | 4 |
 | learning_rate | 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10 | 7 |
@@ -257,7 +257,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 20 \
-  --model_search_feature_counts "8,10,12,15,18,22,26,30" \
+  --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
   --model_search_max_candidates 600 \
@@ -278,7 +278,7 @@ python s08_run_pipeline.py \
 搜参选择策略：
 
 ```text
-1. 对每个 k ∈ {8,10,12,15,18,22,26,30}，从 ranked_features.json 取 top-k 特征。
+1. 对每个 k ∈ {8,10,12,15,18}，从 ranked_features.json 取 top-k 特征。
 2. 每个 k 内，从参数空间按固定 random_state 抽样最多 600 个 XGBoost 候选。
 3. Stage A 在 train 内部 group split 上预筛，保留 top 80。
 4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
@@ -590,6 +590,8 @@ artifacts/generalization_audit/action_items.csv
 
 审计会汇总窗口级 accuracy/precision/recall/FP rate/FN rate、样本级 false-worn event rate、positive sample first-worn latency P50/P95，并按 `mode/h5_file/sample_name/record/window_index/time_bin/quality_bin/ood_bin` 分层；如果存在 `subject_id/device_id/session_id`，也会自动纳入分层。小样本分层会标记 `low_support`，避免被少量样本误导。
 
+如果窗口错误报告中包含三绿光可靠性特征，审计会额外生成 `green_support_bin`、`green_top2_corr_bin`、`green_weak_gap_bin`、`green_stability_bin` 等分层；当 FP 集中在 `<2of3`、`low_corr`、`large_gap` 或 `low_stability` 时，`action_items.csv` 会提示优先检查 hard negatives 和三绿光可靠性特征。`summary.json` 也会记录最终模型选中了多少个三绿光可靠性特征。
+
 ### 10. 商业 baseline 对比
 
 ```bash
@@ -742,12 +744,15 @@ artifacts/
 | PPG Green | G_mean, G1, G2, G3 | 单通道 (DC/AC/FFT/autocorr) | 每通道 10 个基础特征 |
 | PPG Green | G1/G2/G3 空间 | 不均衡/空间向量/相关性 | 120° 对称 LED 空间特征（16 个） |
 | PPG Green | G1/G2/G3 per-ch | 通道间共识 (min/max/range/cv) | 倾斜方向检测（32 个） |
-| PPG IR | IR | 单通道 + FFT harmonic + SNR | 红外脉搏通道（15 个） |
+| PPG Green | G1/G2/G3 reliability | 2-of-3 support/top2 corr/weak gap | 三绿光可靠性候选特征 |
+
+三绿光通道只通过特征表达，不增加端侧硬投票或多模型结构。新增可靠性候选包括 `G_2OF3_AC_SUPPORT`、`G_TOP2_TO_ALL_AC_RATIO`、`G_TOP2_CORR_MIN`、`G_WEAK_CHANNEL_GAP` 和 `G_SPATIAL_STABILITY_SCORE`。它们会和其他普通 float 特征一起参与 `8,10,12,15,18` 特征数量搜参；只有被最终模型选中时才会进入 `FEATURE_ORDER`、`deploy_feature_extractor.py` 和 golden vectors。
+| PPG IR | IR | Stage1 DC/ACDC gate only | 不进入 Stage2 特征池 |
 | PPG Ambient | Ambient | 单通道 + spectral + 波形 | 环境光抑制（8 个） |
 | ACC | X/Y/Z 三轴 | 基础 (per-axis) + 幅值 + 震颤 | 加速度检测（19 个） |
 | ACC-PPG | cross | 相干性 + BP 相关 | 运动-脉搏交叉（4 个） |
-| 跨通道 | GREEN-IR-AMB | 相关性/比值/泄漏 | 光学串扰建模（14 个） |
-| 信号质量 | GREEN/IR | 饱和度/削顶率 | 传感器接触质量（4 个） |
+| 跨通道 | GREEN-AMB / ACC-GREEN | 相关性/比值/泄漏 | Stage2 不使用 IR 派生特征 |
+| 信号质量 | GREEN/AMB | 饱和度/削顶率 | 传感器接触质量 |
 | 通用 | — | Hjorth/Entropy/Deriv/Temporal | 波形形态学（24 个） |
 | 元数据 | — | SIG_LEN/SIG_SEC/mode 等 | 窗口元信息（4 个） |
 

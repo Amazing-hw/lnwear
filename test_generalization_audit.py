@@ -115,7 +115,14 @@ def _write_minimal_audit_artifacts(artifact_dir):
         }
     ]).to_csv(artifact_dir / "model_search_results.csv", index=False)
     (artifact_dir / "final_model_config.json").write_text(
-        json.dumps({"model_search": {"strategy": "staged_group_cv"}}),
+        json.dumps({
+            "model_search": {"strategy": "staged_group_cv"},
+            "selected_features": [
+                "GREEN_AC",
+                "G_2OF3_AC_SUPPORT",
+                "G_TOP2_CORR_MIN",
+            ],
+        }),
         encoding="utf-8",
     )
 
@@ -158,6 +165,11 @@ def test_generalization_audit_exports_strata_and_action_items(tmp_path):
     assert summary["window_metrics"]["fp_rate"] > 0
     assert summary["sample_metrics"]["false_worn_event_rate"] > 0
     assert summary["sample_metrics"]["first_worn_latency_p95_sec"] == 5.0
+    assert summary["green_reliability_feature_usage"]["selected_count"] == 2
+    assert summary["green_reliability_feature_usage"]["selected_features"] == [
+        "G_2OF3_AC_SUPPORT",
+        "G_TOP2_CORR_MIN",
+    ]
 
     window_strata = pd.read_csv(out_dir / "window_strata.csv")
     assert "low_support" in window_strata.columns
@@ -287,3 +299,53 @@ def test_audit_action_items_include_quality_aware_threshold_and_search_stability
     text = "\n".join(actions["suggested_action"].astype(str))
     assert "quality-aware threshold" in text
     assert "mode-specific threshold" in text
+
+
+def test_audit_bins_green_reliability_features_and_flags_fp_clusters():
+    from s10_generalization_audit import build_action_items, build_strata
+
+    window_df = pd.DataFrame([
+        {
+            "sample_name": "neg/single-channel",
+            "target": 0,
+            "pred_raw": 1,
+            "G_2OF3_AC_SUPPORT": 1.0 / 3.0,
+            "G_TOP2_CORR_MIN": 0.15,
+            "G_WEAK_CHANNEL_GAP": 0.90,
+            "G_SPATIAL_STABILITY_SCORE": 0.05,
+        },
+        {
+            "sample_name": "neg/ok",
+            "target": 0,
+            "pred_raw": 0,
+            "G_2OF3_AC_SUPPORT": 1.0,
+            "G_TOP2_CORR_MIN": 0.98,
+            "G_WEAK_CHANNEL_GAP": 0.02,
+            "G_SPATIAL_STABILITY_SCORE": 0.95,
+        },
+        {
+            "sample_name": "pos/ok",
+            "target": 1,
+            "pred_raw": 1,
+            "G_2OF3_AC_SUPPORT": 1.0,
+            "G_TOP2_CORR_MIN": 0.97,
+            "G_WEAK_CHANNEL_GAP": 0.03,
+            "G_SPATIAL_STABILITY_SCORE": 0.94,
+        },
+    ])
+
+    window_strata, sample_strata = build_strata(window_df, pd.DataFrame(), min_support=1)
+    actions = build_action_items(
+        window_strata,
+        sample_strata,
+        {},
+        pd.DataFrame(),
+        {"accuracy": 2 / 3, "n": 3},
+        min_support=1,
+    )
+
+    assert "green_support_bin" in set(window_strata["dimension"])
+    assert "green_top2_corr_bin" in set(window_strata["dimension"])
+    assert "green_reliability_fp_cluster" in set(actions["issue_type"])
+    text = "\n".join(actions["suggested_action"].astype(str))
+    assert "three-green reliability" in text

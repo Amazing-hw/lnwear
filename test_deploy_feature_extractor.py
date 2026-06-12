@@ -53,6 +53,83 @@ def test_all_s03_window_features_have_deploy_formulas():
         assert "IR_" not in formula and "ir_" not in formula, name
 
 
+def test_green_reliability_features_capture_three_channel_failure_modes():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ambient = 1.0e5 + 200.0 * np.sin(2 * np.pi * 0.3 * t)
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    base = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
+    aligned = s03.extract_feature_pool_from_window(
+        ir, ambient,
+        base,
+        2.0e6 + 7.8e3 * np.sin(2 * np.pi * 1.2 * t + 0.03),
+        2.0e6 + 8.2e3 * np.sin(2 * np.pi * 1.2 * t - 0.02),
+        fs=fs,
+    )
+    single_channel_fake = s03.extract_feature_pool_from_window(
+        ir, ambient,
+        base,
+        np.full_like(base, 2.0e6),
+        np.full_like(base, 2.0e6),
+        fs=fs,
+    )
+    tilted = s03.extract_feature_pool_from_window(
+        ir, ambient,
+        base,
+        2.0e6 + 7.8e3 * np.sin(2 * np.pi * 1.2 * t + 0.02),
+        2.0e6 + 1.0e3 * np.sin(2 * np.pi * 1.2 * t - 0.04),
+        fs=fs,
+    )
+    all_weak = s03.extract_feature_pool_from_window(
+        ir, ambient,
+        np.full_like(base, 2.0e6),
+        np.full_like(base, 2.0e6),
+        np.full_like(base, 2.0e6),
+        fs=fs,
+    )
+
+    expected = [
+        "G_2OF3_AC_SUPPORT",
+        "G_TOP2_TO_ALL_AC_RATIO",
+        "G_TOP2_CORR_MIN",
+        "G_WEAK_CHANNEL_GAP",
+        "G_SPATIAL_STABILITY_SCORE",
+    ]
+    for name in expected:
+        assert name in aligned
+        assert np.isfinite(aligned[name])
+
+    assert aligned["G_2OF3_AC_SUPPORT"] == 1.0
+    assert aligned["G_TOP2_CORR_MIN"] > 0.95
+    assert aligned["G_WEAK_CHANNEL_GAP"] < 0.15
+    assert aligned["G_SPATIAL_STABILITY_SCORE"] > single_channel_fake["G_SPATIAL_STABILITY_SCORE"]
+
+    assert single_channel_fake["G_2OF3_AC_SUPPORT"] < 1.0
+    assert single_channel_fake["G_TOP2_CORR_MIN"] < aligned["G_TOP2_CORR_MIN"]
+    assert tilted["G_2OF3_AC_SUPPORT"] >= 2.0 / 3.0
+    assert tilted["G_TOP2_CORR_MIN"] > 0.90
+    assert all_weak["G_SPATIAL_STABILITY_SCORE"] == 0.0
+
+
+def test_green_reliability_features_have_deploy_formulas():
+    selected = [
+        "G_2OF3_AC_SUPPORT",
+        "G_TOP2_TO_ALL_AC_RATIO",
+        "G_TOP2_CORR_MIN",
+        "G_WEAK_CHANNEL_GAP",
+        "G_SPATIAL_STABILITY_SCORE",
+    ]
+
+    formulas = s08.build_selected_feature_formulas(selected)
+
+    assert set(formulas) == set(selected)
+    for info in formulas.values():
+        text = json.dumps(info, ensure_ascii=False)
+        assert "ir_" not in text
+        assert "IR_" not in text
+
+
 def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
     fs = 25
     n = 125
