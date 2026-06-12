@@ -143,7 +143,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts \
-    --model_search_feature_counts "8,10,12,15" \
+    --model_search_feature_counts "8,10,12,15,18" \
     --export_window_cache --optimize_postprocess
 ```
 
@@ -220,7 +220,7 @@ python s08_run_pipeline.py \
   --no-use_stage2_ir \
   --max_features 20 \
   --model_search \
-  --model_search_feature_counts "10,12,15,18,20" \
+  --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --split test
 ```
@@ -232,20 +232,20 @@ python s08_run_pipeline.py \
   --artifact_dir artifacts \
   --window_sec 5 \
   --max_features 20 \
-  --model_search_feature_counts "10,12,15,18,20"
+  --model_search_feature_counts "8,10,12,15,18"
 ```
 
 ## 复杂度受限模型搜参
 
-模型搜参默认开启，同时默认启用**特征数量搜参**（测试 k ∈ {10,12,15,18,20} 选出最优特征数）。如果只想快速跑固定默认 XGBoost 参数和固定特征数，可以在 `s08_run_pipeline.py` 上显式加 `--no-model_search`。默认策略是 `staged_group_cv`：只把 `total_nodes <= max_model_nodes` 作为硬约束，在预算内用 train 内部 group CV 选择窗口级泛化性能最稳的模型和特征数。
+模型搜参默认开启，同时默认启用**特征数量搜参**。s08 先用默认参数快速评估每个 k（无 model_search），选出最优 k 后再对该 k 做完整模型搜参。这比每个 k 都跑完整搜参减少约 80% 耗时。
 
 ### 搜索空间
 
 | 参数 | 候选值 | 候选数 |
 |---|---|---|
-| 特征数量 k | 10, 12, 15, 18, 20 | 5 |
+| 特征数量 k | 8, 10, 12, 15, 18 | 5 |
 | n_estimators | 20, 25, 30, 35, 40, 45, 50, 55, 60 | 9 |
-| max_depth | 2, 3, 4 | 3 |
+| max_depth | 2, 3, 4, 5 | 4 |
 | learning_rate | 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10 | 7 |
 | min_child_weight | 10, 15, 20, 25, 30, 40, 50 | 7 |
 | reg_lambda | 5, 8, 10, 12, 16, 20, 30 | 7 |
@@ -254,7 +254,7 @@ python s08_run_pipeline.py \
 | colsample_bytree | 0.70, 0.75, 0.80, 0.85, 0.90 | 5 |
 | **总计** | | **~8.9M × 5k** |
 
-不要用空字符串来禁用特征数搜参；PowerShell 下空字符串参数可能会被解析成缺少参数。若希望固定特征数量，请显式传单个 k，并让它与 `--max_features` 一致，例如 `--max_features 15 --model_search_feature_counts 15`。
+若要固定特征数量，传单个 k 与 `--max_features` 一致即可：`--max_features 15 --model_search_feature_counts 15`。
 
 一键流水线开启示例：
 
@@ -263,7 +263,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 20 \
-  --model_search_feature_counts "10,12,15,18,20" \
+  --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
   --model_search_max_candidates 600 \
@@ -284,7 +284,7 @@ python s08_run_pipeline.py \
 搜参选择策略：
 
 ```text
-1. 对每个 k ∈ {10,12,15,18,20}，从 ranked_features.json 取 top-k 特征。
+1. 对每个 k ∈ {8,10,12,15,18}，从 ranked_features.json 取 top-k 特征。
 2. 每个 k 内，从参数空间按固定 random_state 抽样最多 600 个 XGBoost 候选。
 3. Stage A 在 train 内部 group split 上预筛，保留 top 80。
 4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
@@ -775,7 +775,7 @@ artifacts/
 
 ### 特征筛选
 
-`s04_feature_selection.py` 负责从 ~170 候选特征中选出 `max_features` 个（默认 15）。流程：
+`s04_feature_selection.py` 负责从 ~170 候选特征（IR 已剔除）中选出 `max_features` 个（默认 15）。流程：
 
 ```text
 clean_features_by_train（缺失/低方差/高相关/VIF）
@@ -783,6 +783,23 @@ clean_features_by_train（缺失/低方差/高相关/VIF）
   → cross_validate_importance（5-fold Permutation + SHAP）
   → 按 deployment_score 排序选取 max_features
 ```
+
+各组特征的入选上限（GROUP_LIMITS_DEFAULT）：
+
+| 特征组 | Limit | 特征组 | Limit |
+|---|---|---|---|
+| commercial_baseline | 8 | green_stats | 2 |
+| green_spatial | 2 | green_3ch_consistency | 2 |
+| frequency | 2 | waveform_morphology | 3 |
+| signal_complexity | 2 | signal_quality | 2 |
+| acc_features | 1 | acc_per_axis | 1 |
+| acc_tremor | 1 | acc_orientation | 1 |
+| ambient_stats | 1 | amb_cross | 1 |
+| ir_g_amplitude | 1 | ir_g_correlation | 1 |
+| spatial_coupling | 1 | mode | 1 |
+| other | 2 | meta | 0 |
+
+绿光相关 ~13 槽位，ACC 相关 ~4 槽位。IR 相关组（ir_stats/ir_g_*/ambient_stage1）在 `use_stage2_ir=false` 时无候选特征。
 
 ## 测试与验收
 
@@ -864,9 +881,11 @@ window_model_threshold
 postprocess state machine params
 ```
 
-如果 `use_stage2_ir=false`，部署侧进入 Stage2 特征提取前也要把 IR 信号置零；Stage1 仍继续使用真实 IR。`s08` 导出的 `deploy_feature_extractor.py` 会把 `model_bundle.pkl["meta"]` 中的 `USE_STAGE2_IR`、`DEFAULT_FS` 和 `DEFAULT_WINDOW_SEC` 固化到脚本常量里，工程侧不需要另外猜测窗长或 IR 使用策略。
+如果 `use_stage2_ir=false`（默认），两处自动剔除 IR 特征：
+1. **训练阶段**：`s04` 从候选池中移除所有 IR 前缀特征（`IR_`/`IRX_`/`GREEN_IR_`/`IR_AMB_`/`IR_over_`/`corr_IR_`/`log_IR_`/`ACC_IR_`），确保 IR 特征不会进入特征筛选和模型训练。
+2. **部署导出**：`s08` 生成 `deploy_feature_extractor.py` 时同步剔除 IR 特征，`FEATURE_ORDER`/`FILL_VALUES`/`CLIP_BOUNDS` 均不包含 IR 特征。
 
-部署端不会在导出时再裁剪 IR 相关特征。`deploy_feature_extractor.py` 的 `FEATURE_ORDER` 必须严格等于 `model_bundle.pkl["feature_names"]`，`FILL_VALUES`、`CLIP_BOUNDS` 和 `WINDOW_MODEL_THRESHOLD` 也都以 `model_bundle.pkl` 为准。若希望减少端侧特征数量，必须通过 `--model_search_feature_counts` 在训练/搜参阶段选出更小的特征集并重新训练模型，不能在部署导出阶段删除特征。
+`deploy_feature_extractor.py` 的 `FEATURE_ORDER` 直接来自 `model_bundle.pkl["feature_names"]`（已剔除 IR），嵌入端只需按顺序计算特征向量即可，无需额外处理 IR 信号。
 
 `s08_run_pipeline.py` 在默认部署导出流程中会校验 `model_bundle.pkl`、`deploy_feature_extractor.py`、`deploy_xgboost.json`、`deploy_cookbook.json` 和 `deploy_package/model_params.json` 的特征顺序、阈值、fill/clip 配置是否一致；若发现旧产物或部署文件漂移，会直接报错中断。
 
