@@ -529,6 +529,39 @@ def validate_h5_file(h5_file, sample_name):
 def safe_div(a, b, eps=EPS):
     return float(a) / (float(b) + eps)
 
+
+STAGE2_IR_FEATURE_PREFIXES = (
+    "IR_",
+    "IRX_",
+    "GREEN_IR_",
+    "IR_AMB_",
+    "IR_over_",
+    "log_IR_",
+    "corr_IR_",
+    "ACC_IR_",
+)
+
+STAGE2_IR_FEATURE_NAMES = {
+    "corr_Ambient_IR",
+    "AMB_STAGE1_RATIO",
+    "AMB_STAGE1_PASS",
+    "IR_DC_LEVEL",
+}
+
+
+def is_stage2_ir_feature(name):
+    """Return True for features that use the IR channel and must not enter Stage2."""
+    n = str(name)
+    return n in STAGE2_IR_FEATURE_NAMES or any(n.startswith(p) for p in STAGE2_IR_FEATURE_PREFIXES)
+
+
+def filter_stage2_ir_features(features):
+    """Remove all IR-derived Stage2 features while preserving input order."""
+    if hasattr(features, "items"):
+        return OrderedDict((k, v) for k, v in features.items() if not is_stage2_ir_feature(k))
+    return [f for f in features if not is_stage2_ir_feature(f)]
+
+
 def robust_mad(x):
     x = np.asarray(x, dtype=np.float64)
     if len(x) == 0:
@@ -1011,9 +1044,12 @@ def _diff_spike_ratio(x, k=6.0):
 
 
 def short_window_sqi_features(ir_raw_in, amb_raw_in, g_raw_in):
-    """Fast SQI features computed before artifact removal."""
+    """Fast Stage2 SQI features from ambient and green only.
+
+    IR is intentionally ignored here: Stage1 owns IR gating, and Stage2 must not
+    carry hidden IR information through generic SQI feature names.
+    """
     channels = [
-        finite_signal(ir_raw_in),
         finite_signal(amb_raw_in),
         finite_signal(g_raw_in),
     ]
@@ -1156,15 +1192,7 @@ def extract_cross_channel_features(g_raw, g_bp, g_dc,
     feat = OrderedDict()
 
     g_env = smooth_envelope(g_bp, fs)
-    ir_env = smooth_envelope(ir_bp, fs)
     amb_env = smooth_envelope(amb_bp, fs)
-
-    feat["GREEN_IR_RAW_CORR"] = safe_corr(g_raw, ir_raw)
-    feat["GREEN_IR_BP_CORR"] = safe_corr(g_bp, ir_bp)
-    feat["GREEN_IR_ENV_CORR"] = safe_corr(g_env, ir_env)
-
-    max_lag = int(round(0.3 * fs))
-    feat["GREEN_IR_MAX_XCORR"] = max_norm_xcorr(g_bp, ir_bp, max_lag)
 
     # 使用缓存的FFT结果，避免重复计算
     if fft_cache_green is not None:
@@ -1172,32 +1200,13 @@ def extract_cross_channel_features(g_raw, g_bp, g_dc,
     else:
         _, g_dom = fft_peak_features(g_bp, fs, fmin=0.5, fmax=5.0)
     
-    if fft_cache_ir is not None:
-        ir_dom = fft_cache_ir.get('dom_freq', 0.0)
-    else:
-        _, ir_dom = fft_peak_features(ir_bp, fs, fmin=0.5, fmax=5.0)
-
-    feat["GREEN_IR_DOM_FREQ_DIFF"] = abs(g_dom - ir_dom)
-
     feat["GREEN_AMB_BP_CORR"] = safe_corr(g_bp, amb_bp)
-    feat["IR_AMB_BP_CORR"] = safe_corr(ir_bp, amb_bp)
     feat["GREEN_AMB_ENV_CORR"] = safe_corr(g_env, amb_env)
-    feat["IR_AMB_ENV_CORR"] = safe_corr(ir_env, amb_env)
 
     g_rms = np.sqrt(np.mean(g_bp ** 2)) + EPS
-    ir_rms = np.sqrt(np.mean(ir_bp ** 2)) + EPS
     amb_rms = np.sqrt(np.mean(amb_bp ** 2)) + EPS
 
     feat["GREEN_AMB_LEAK"] = abs(feat["GREEN_AMB_BP_CORR"]) * safe_div(amb_rms, g_rms)
-    feat["IR_AMB_LEAK"] = abs(feat["IR_AMB_BP_CORR"]) * safe_div(amb_rms, ir_rms)
-
-    feat["GREEN_IR_AC_RATIO"] = safe_div(g_rms, ir_rms)
-    feat["GREEN_IR_DC_RATIO"] = safe_div(abs(g_dc), abs(ir_dc))
-
-    g_acdc = safe_div(g_rms, abs(g_dc) + EPS)
-    ir_acdc = safe_div(ir_rms, abs(ir_dc) + EPS)
-
-    feat["GREEN_IR_ACDC_RATIO_RATIO"] = safe_div(g_acdc, ir_acdc)
 
     return feat
 
@@ -1365,12 +1374,11 @@ def extract_acc_tremor_features(acc_window, fs=100.0, prefix="ACC"):
     return feats
 
 
-def extract_acc_ppg_cross_features(acc_window, green_bp, ir_bp, fs=100.0):
+def extract_acc_ppg_cross_features(acc_window, green_bp, ir_bp=None, fs=100.0):
     feats = OrderedDict()
 
     if acc_window is None or len(acc_window) < 4:
         feats["ACC_GREEN_BP_CORR"] = 0.0
-        feats["ACC_IR_BP_CORR"] = 0.0
         return feats
 
     mag = _acc_magnitude(acc_window)
@@ -1381,14 +1389,12 @@ def extract_acc_ppg_cross_features(acc_window, green_bp, ir_bp, fs=100.0):
     except Exception:
         mag_bp = mag_centered
 
-    n = min(len(mag_bp), len(green_bp), len(ir_bp))
+    n = min(len(mag_bp), len(green_bp))
     if n < 8:
         feats["ACC_GREEN_BP_CORR"] = 0.0
-        feats["ACC_IR_BP_CORR"] = 0.0
         return feats
 
     feats["ACC_GREEN_BP_CORR"] = abs(safe_corr(mag_bp[:n], green_bp[:n]))
-    feats["ACC_IR_BP_CORR"] = abs(safe_corr(mag_bp[:n], ir_bp[:n]))
 
     return feats
 
@@ -1705,7 +1711,8 @@ def extract_temporal_dynamic_features(x, fs=100.0, prefix=""):
 # 统一窗口级特征提取函数（供训练和部署共用）
 # =========================================================
 
-def extract_window_features(ppg_window, fs=25.0, acc_window=None):
+def extract_window_features(ppg_window, fs=25.0, acc_window=None,
+                            use_stage2_ir=DEFAULT_USE_STAGE2_IR):
     """
     统一的窗口级特征提取函数。
     训练（s03）和部署（s06）都调用此函数，保证一致性。
@@ -1726,7 +1733,7 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None):
     if ppg.shape[1] < 6:
         raise ValueError(f"ppg_window 需要至少6通道，当前只有{ppg.shape[1]}通道")
 
-    ir = ppg[:, 0]
+    ir = apply_stage2_ir_policy(ppg[:, 0], use_stage2_ir=use_stage2_ir)
     ambient = ppg[:, 1] if ppg.shape[1] > 1 else np.zeros_like(ir)
     g1 = ppg[:, 2] if ppg.shape[1] > 2 else np.zeros_like(ir)
     g2 = ppg[:, 3] if ppg.shape[1] > 3 else g1
@@ -1741,11 +1748,10 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None):
     feat.update(extract_acc_tremor_features(acc_window, fs=fs, prefix="ACC"))
 
     green_bp = preprocessed.get("g_top2_bp") if ppg.shape[1] > 2 else None
-    ir_bp = preprocessed.get("ir_bp")
-    if green_bp is not None and ir_bp is not None:
-        feat.update(extract_acc_ppg_cross_features(acc_window, green_bp, ir_bp, fs=fs))
+    if green_bp is not None:
+        feat.update(extract_acc_ppg_cross_features(acc_window, green_bp, fs=fs))
 
-    return feat
+    return filter_stage2_ir_features(feat)
 
 
 def align_acc_window(acc, ppg_len, start_ppg, win_ppg, fs_ppg=100.0, fs_acc=None):
@@ -1828,7 +1834,6 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     fft_cache = {
         'green': compute_fft_cache(g_mean_bp, fs, fmin=0.5, fmax=5.0),
-        'ir': compute_fft_cache(ir_bp, fs, fmin=0.5, fmax=5.0),
         'amb': compute_fft_cache(amb_bp, fs, fmin=0.5, fmax=5.0),
         'g1': compute_fft_cache(g1_bp, fs, fmin=0.5, fmax=5.0),
         'g2': compute_fft_cache(g2_bp, fs, fmin=0.5, fmax=5.0),
@@ -1836,14 +1841,11 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     }
 
     # 3s/75-point robust deployment features: low-cost, stable on short windows.
-    feat["IR_ROBUST_RANGE_RATIO"] = robust_range_ratio(ir_raw)
     feat["GREEN_ROBUST_RANGE_RATIO"] = robust_range_ratio(g_mean_raw)
     feat["AMB_ROBUST_RANGE_RATIO"] = robust_range_ratio(amb_raw)
-    feat["IR_SEG_ACDC_CV"] = segment_acdc_cv(ir_raw)
     feat["GREEN_SEG_ACDC_CV"] = segment_acdc_cv(g_mean_raw)
     feat["AMB_SEG_ACDC_CV"] = segment_acdc_cv(amb_raw)
     feat["GREEN_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(fft_cache['green'])
-    feat["IR_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(fft_cache['ir'])
     feat["AMB_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(fft_cache['amb'])
 
     # =====================================================
@@ -1857,12 +1859,6 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
 
     # IR 类
-    feat["IR_mean"] = float(np.mean(ir_raw))
-    feat["IR_std"] = float(np.std(ir_raw))
-    feat["IR_p95"] = float(np.percentile(ir_raw, 95))
-    feat["IR_diff_std"] = float(np.std(np.diff(ir_raw)))
-    feat["IR_acdc"] = safe_div(np.sqrt(np.mean(ir_bp ** 2)), abs(ir_dc) + EPS)
-
     # G_mean 类
     feat["G_mean_mean"] = float(np.mean(g_mean_raw))
     feat["G_mean_std"] = float(np.std(g_mean_raw))
@@ -1870,36 +1866,18 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     feat["G_mean_acdc"] = safe_div(np.sqrt(np.mean(g_mean_bp ** 2)), abs(g_mean_dc) + EPS)
 
     # IR-G 关系
-    feat["log_IR_Gmean_mean"] = float(
-        np.mean(np.log(np.abs(ir_raw) + EPS) - np.log(np.abs(g_mean_raw) + EPS))
-    )
-
-    ratio = ir_raw / (g_mean_raw + EPS)
-    feat["IR_over_Gmean_mean"] = float(np.mean(ratio))
-    feat["IR_over_Gmean_std"] = float(np.std(ratio))
-    feat["corr_IR_Gmean"] = safe_corr(ir_raw, g_mean_raw)
-
     # Ambient
     feat["Ambient_mean"] = float(np.mean(amb_raw))
     feat["Ambient_std"] = float(np.std(amb_raw))
     feat["Ambient_p95"] = float(np.percentile(amb_raw, 95))
-    feat["corr_Ambient_IR"] = safe_corr(amb_raw, ir_raw)
     feat["corr_Ambient_Gmean"] = safe_corr(amb_raw, g_mean_raw)
 
     # IR / Ambient 比值 — 皮肤接触指示器（佩戴时皮肤遮挡Ambient，比值变化显著）
-    ratio_ia = ir_raw / (amb_raw + EPS)
-    feat["IR_over_Ambient_mean"] = float(np.mean(ratio_ia))
-    feat["IR_over_Ambient_std"] = float(np.std(ratio_ia))
-
     # =====================================================
     # 3. 单通道增强特征（使用FFT缓存）
     # =====================================================
     feat.update(extract_single_channel_features(
         g_mean_raw, g_mean_bp, g_mean_dc, fs, "GREEN", fft_cache=fft_cache['green']
-    ))
-
-    feat.update(extract_single_channel_features(
-        ir_raw, ir_bp, ir_dc, fs, "IRX", fft_cache=fft_cache['ir']
     ))
 
     feat.update(extract_single_channel_features(
@@ -1909,7 +1887,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     # 3b. 波形形态: 偏度/峰度 — 真实 PPG 有特征性不对称（收缩峰尖锐、舒张缓慢）
     # =====================================================
-    for _pf, _bp in [("GREEN", g_mean_bp), ("IRX", ir_bp)]:
+    for _pf, _bp in [("GREEN", g_mean_bp)]:
         _m = float(np.mean(_bp))
         _s = float(np.std(_bp))
         if _s > EPS:
@@ -2020,7 +1998,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         amb_raw, amb_bp,
         fs,
         fft_cache_green=fft_cache['green'],
-        fft_cache_ir=fft_cache['ir']
+        fft_cache_ir=None
     ))
 
 
@@ -2095,8 +2073,6 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     feat["corr_Gmean_G_imbalance"] = safe_corr(g_mean_raw, g_imbalance)
     feat["corr_Gmean_vmag"] = safe_corr(g_mean_raw, g_vmag)
-    feat["corr_IR_G_imbalance"] = safe_corr(ir_raw, g_imbalance)
-    feat["corr_IR_vmag"] = safe_corr(ir_raw, g_vmag)
     feat["corr_Ambient_vmag"] = safe_corr(amb_raw, g_vmag)
 
     # =====================================================
@@ -2114,40 +2090,6 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     feat["AMB_DC_TO_GREEN_DC"] = safe_div(_amb_dc, abs(_g_dc))
     feat["GCH_DC_RANGE_RATIO"] = safe_div(float(np.max(_ch_dc_vals) - np.min(_ch_dc_vals)), abs(float(np.mean(_ch_dc_vals))))
     feat["GCH_AC_RANGE_RATIO"] = safe_div(float(np.max(_ch_ac_vals) - np.min(_ch_ac_vals)), abs(float(np.mean(_ch_ac_vals))))
-
-    # =====================================================
-    # 7b. IR FFT harmonic + SNR features (Tier 2)
-    #     IR is the primary pulse-sensing channel; FFT harmonic structure
-    #     is a strong indicator of real PPG vs noise/static.
-    # =====================================================
-    for _ch_label, _ch_cache in [("IR", fft_cache['ir'])]:
-        _fc = _ch_cache
-        if _fc.get('band_spec') is not None and len(_fc['band_spec']) > 0:
-            _bs = _fc['band_spec']
-            _bf = _fc['band_freqs']
-            # SNR
-            _in_band = float(np.sum(_bs ** 2))
-            _out_band = float(np.sum(_fc['spec'] ** 2)) - _in_band
-            feat[f"{_ch_label}_FFT_SNR"] = float(_in_band / (_out_band + EPS))
-            # Harmonic ratio
-            _f0_idx = int(np.argmax(_bs))
-            _f0 = _bf[_f0_idx]
-            _f0_power = float(_bs[_f0_idx] ** 2)
-            _h2_mask = (_bf >= _f0 * 2 - 0.3) & (_bf <= _f0 * 2 + 0.3)
-            if np.any(_h2_mask):
-                _h2_power = float(np.max(_bs[_h2_mask] ** 2))
-                feat[f"{_ch_label}_FFT_harmonic_ratio"] = float(_h2_power / (_f0_power + EPS))
-                feat[f"{_ch_label}_FFT_harmonic_present"] = 1.0 if _h2_power > _f0_power * 0.1 else 0.0
-            else:
-                feat[f"{_ch_label}_FFT_harmonic_ratio"] = 0.0
-                feat[f"{_ch_label}_FFT_harmonic_present"] = 0.0
-            # Peak width
-            _peak_val = np.max(_bs)
-            _above_half = _bs > _peak_val * 0.5
-            feat[f"{_ch_label}_FFT_peak_width_Hz"] = float(_bf[_above_half][-1] - _bf[_above_half][0]) if np.any(_above_half) else 0.0
-        else:
-            for _suffix in ["FFT_SNR", "FFT_harmonic_ratio", "FFT_harmonic_present", "FFT_peak_width_Hz"]:
-                feat[f"{_ch_label}_{_suffix}"] = 0.0
 
     # =====================================================
     # 7c. AMB spectral features (Tier 2)
@@ -2182,7 +2124,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # 7e. Signal quality indicators (Tier 2)
     #     Detect sensor saturation, clipping, and poor contact.
     # =====================================================
-    for _ch_label, _ch_raw in [("GREEN", g_mean_raw), ("IR", ir_raw)]:
+    for _ch_label, _ch_raw in [("GREEN", g_mean_raw)]:
         _sat_thr = 0.98 * np.max(_ch_raw)
         feat[f"{_ch_label}_SAT_FRAC"] = float(np.mean(_ch_raw >= _sat_thr))
         _d = np.diff(_ch_raw)
@@ -2193,7 +2135,6 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # 8. 新增特征: Hjorth参数
     # =====================================================
     feat.update(extract_hjorth_parameters(g_mean_bp, prefix="GREEN"))
-    feat.update(extract_hjorth_parameters(ir_bp, prefix="IRX"))
     feat.update(extract_hjorth_parameters(amb_bp, prefix="AMBX"))
 
     # =====================================================
@@ -2208,14 +2149,12 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # 10. 新增特征: 导数特征
     # =====================================================
     feat.update(extract_derivative_features(g_mean_bp, fs, prefix="GREEN"))
-    feat.update(extract_derivative_features(ir_bp, fs, prefix="IRX"))
     feat.update(extract_derivative_features(amb_bp, fs, prefix="AMBX"))
 
     # =====================================================
     # 11. 新增特征: 时序动态特征
     # =====================================================
     feat.update(extract_temporal_dynamic_features(g_mean_bp, fs, prefix="GREEN"))
-    feat.update(extract_temporal_dynamic_features(ir_bp, fs, prefix="IRX"))
     feat.update(extract_temporal_dynamic_features(amb_bp, fs, prefix="AMBX"))
 
     # =====================================================
@@ -2239,6 +2178,15 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # 训练与推理使用相同的 s03 代码，因此这一行为在两端一致，不构成训练-部署 gap。
 
     # ---- Invalid feature count (before NaN→0.0 fill) ----
+    # Stage2 starts after Stage1 IR gating. IR-derived keys must not be created
+    # in the model-facing pool; failing here catches new leaks at the source.
+    _stage2_ir_leaks = [k for k in feat.keys() if is_stage2_ir_feature(k)]
+    if _stage2_ir_leaks:
+        raise ValueError(
+            "IR-derived Stage2 features generated in s03; remove them at source: "
+            + ", ".join(_stage2_ir_leaks[:10])
+        )
+
     # Count features that could not be computed. This lets XGBoost
     # distinguish "genuinely low value" from "computation failed".
     # Computed BEFORE the 0.0 fill below so we capture the true invalid count.
@@ -2248,7 +2196,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     for k, v in feat.items():
         if v is None or not np.isfinite(v):
             _invalid_total += 1
-            if any(k.startswith(p) for p in ["GREEN", "G_", "G1", "G2", "G3", "GTOP2", "IRX", "AMBX", "IR_", "AMB_", "IR_over", "Ambient", "log_IR", "corr_"]):
+            if any(k.startswith(p) for p in ["GREEN", "G_", "G1", "G2", "G3", "GTOP2", "AMBX", "AMB_", "Ambient", "corr_"]):
                 if any(k.startswith(p) for p in ["GREEN", "G_", "G1", "G2", "G3", "GTOP2"]):
                     _invalid_green += 1
                 _invalid_ppg += 1
@@ -2271,7 +2219,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         preprocessed = {
             'g1_bp': g1_bp, 'g2_bp': g2_bp, 'g3_bp': g3_bp,
             'g_top2_bp': g_top2_bp, 'g_top2_raw': g_top2_raw,
-            'ir_bp': ir_bp, 'amb_bp': amb_bp,
+            'amb_bp': amb_bp,
             'g_mean_bp': g_mean_bp
         }
         return feat, preprocessed
@@ -2382,6 +2330,7 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                     else:
                         feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
                 feat.update(compute_ambient_stage1_features(raw_window))
+                feat = filter_stage2_ir_features(feat)
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
                 feat["target"] = int(window_target)
@@ -2488,6 +2437,7 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                     feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
 
             feat.update(compute_ambient_stage1_features(window))
+            feat = filter_stage2_ir_features(feat)
             feat["sample_name"] = sample["sample_name"]
             feat["h5_file"] = sample["h5_file"]
             feat["target"] = int(sample["target"])
@@ -2635,7 +2585,7 @@ def main(args=None):
                         help="drop this many leading Stage2 windows per sample")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction,
                         default=DEFAULT_USE_STAGE2_IR,
-                        help="whether Stage2 feature extraction uses IR channel values")
+                        help="legacy compatibility flag; Stage2 model features are always ambient/green/ACC only")
     
     # target 感知 stride 参数
     # 注意：默认 False。train/deploy 都用统一 1s stride 才能保证窗口分布一致。

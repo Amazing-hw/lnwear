@@ -29,6 +29,14 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
 
 如果 --stop_after 直接指向 s07_post/s09_cmp/s10_audit，脚本会视为显式请求并自动打开对应可选步骤。
 
+Full optimization shortcut:
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --full_optimize
+
+Stage2 no-IR policy:
+    IR is reserved for Stage1 DC/ACDC gating only. Stage2 feature selection,
+    XGBoost training, s06/s07 evaluation, deploy_feature_extractor.py, and
+    golden_vectors.json use only ambient, green, and ACC features.
+
 Preflight gates before a real-data run:
     python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py s10_generalization_audit.py
     python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp .pytest_tmp_deploy_guard
@@ -78,6 +86,8 @@ import subprocess
 import sys
 import time
 import joblib
+
+from s03_extract_feature_pool import is_stage2_ir_feature
 import ast
 import importlib.util
 from datetime import timedelta
@@ -174,17 +184,15 @@ EXTRA_FEATURE_FORMULAS = {
         "intermediate_signals": {},
     },
     "SQI_FLAT_RATIO": {
-        "formula": "mean(diff-flat-ratio over IR, Ambient, GreenMean before artifact removal)",
+        "formula": "mean(diff-flat-ratio over Ambient and GreenMean before artifact removal)",
         "intermediate_signals": {
-            "ir": "raw input IR window",
             "ambient": "raw input ambient window",
             "g_mean": "(g1 + g2 + g3) / 3 before preprocessing",
         },
     },
     "SQI_SPIKE_RATIO": {
-        "formula": "mean(diff > 6*MAD(diff) ratio over IR, Ambient, GreenMean before artifact removal)",
+        "formula": "mean(diff > 6*MAD(diff) ratio over Ambient and GreenMean before artifact removal)",
         "intermediate_signals": {
-            "ir": "raw input IR window",
             "ambient": "raw input ambient window",
             "g_mean": "(g1 + g2 + g3) / 3 before preprocessing",
         },
@@ -246,7 +254,18 @@ def _json_clip_map(clip_bounds, feature_names):
     return out
 
 
+def _stage2_ir_selected_features(feature_names):
+    return [name for name in feature_names if is_stage2_ir_feature(name)]
+
+
 def build_selected_feature_formulas(selected_features):
+    ir_features = _stage2_ir_selected_features(selected_features)
+    if ir_features:
+        raise ValueError(
+            "Stage2 deployment features must not include IR-derived features. "
+            "Please rerun s03-s05 after the no-IR Stage2 policy update. Offending features: "
+            + ", ".join(ir_features)
+        )
     recipe, *_ = _build_full_feature_recipe(selected_features)
     for name in selected_features:
         if str(recipe.get(name, {}).get("formula", "")).startswith("[") and name in EXTRA_FEATURE_FORMULAS:
@@ -278,6 +297,10 @@ def _standalone_feature_engine_source(scripts_dir):
     engine_start = source.index("def safe_div")
     engine_end = source.index("def _downsample_ppg", engine_start)
     engine_source = source[engine_start:engine_end].strip()
+    drop_start = engine_source.find("\ndef extract_window_features")
+    drop_end = engine_source.find("\ndef align_acc_window", drop_start)
+    if drop_start >= 0 and drop_end > drop_start:
+        engine_source = engine_source[:drop_start] + engine_source[drop_end:]
     engine_source = engine_source.replace(
         "训练（s03）和部署（s06）都调用此函数，保证一致性。",
         "Training and deployment use the same exported feature logic.",
@@ -300,7 +323,6 @@ def _render_selected_feature_extractor(selected_features, fill_values, clip_boun
     clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
     formulas_json = json.dumps(formulas, ensure_ascii=False, indent=2)
     threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
-    use_stage2_ir_py = "True" if bool(use_stage2_ir) else "False"
     default_fs_py = repr(float(default_fs))
     window_sec_py = repr(float(window_sec))
     feature_engine_source = _standalone_feature_engine_source(scripts_dir)
@@ -325,17 +347,8 @@ FILL_VALUES = {fill_json}
 CLIP_BOUNDS = {clip_json}
 FEATURE_FORMULAS = {formulas_json}
 WINDOW_MODEL_THRESHOLD = {threshold_json}
-USE_STAGE2_IR = {use_stage2_ir_py}
 DEFAULT_FS = {default_fs_py}
 DEFAULT_WINDOW_SEC = {window_sec_py}
-
-
-def apply_stage2_ir_policy(ir, use_stage2_ir=USE_STAGE2_IR):
-    """Return the IR signal used by Stage2 features according to the trained model switch."""
-    ir = np.asarray(ir, dtype=np.float64)
-    if use_stage2_ir:
-        return ir
-    return np.zeros_like(ir, dtype=np.float64)
 
 
 {feature_engine_source}
@@ -385,7 +398,9 @@ def _add_acc_ppg_coherence(features, acc, g_mean_bp, fs):
 
 def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     """Return selected features as a plain dict in model order."""
-    ir_stage2 = apply_stage2_ir_policy(ir, use_stage2_ir=USE_STAGE2_IR)
+    # Stage2 never consumes IR-derived features. IR remains available only to
+    # upstream Stage1 gating; the deployment feature vector is ambient/green/ACC.
+    ir_stage2 = np.zeros_like(np.asarray(ir, dtype=np.float64))
     features, preprocessed = extract_feature_pool_from_window(
         ir=ir_stage2,
         ambient=ambient,
@@ -401,7 +416,6 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
         extract_acc_ppg_cross_features(
             acc,
             preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"]),
-            preprocessed["ir_bp"],
             fs=fs,
         )
     )
@@ -418,6 +432,7 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     features["AMB_STAGE1_RATIO"] = _amb_ratio
     features["AMB_STAGE1_PASS"] = 1.0 if (_ir_dc >= 1e2 and _amb_ratio < 2.0) else 0.0
     features["IR_DC_LEVEL"] = _ir_dc
+    features = filter_stage2_ir_features(features)
     features["mode"] = float(mode)
 
     missing = [name for name in FEATURE_ORDER if name not in features]
@@ -465,19 +480,14 @@ def export_feature_extractor_script(artifact_dir):
     bundle = joblib.load(bp)
     selected = list(bundle["feature_names"])
     meta = bundle.get("meta", {}) or {}
-    use_stage2_ir = bool(meta.get("use_stage2_ir", False))
-
-    # 若 use_stage2_ir=false，剔除 IR 相关特征（训练时 IR 已置零，部署不应计算）
-    if not use_stage2_ir:
-        _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
-                        "corr_IR_", "log_IR_", "ACC_IR_")
-        _before = len(selected)
-        selected = [f for f in selected
-                    if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)]
-        _dropped = _before - len(selected)
-        if _dropped > 0:
-            print(f"[IR strip] use_stage2_ir=false, 从部署脚本中移除 {_dropped} 个 IR 特征 "
-                  f"(保留 {len(selected)} 个非 IR 特征)")
+    ir_features = _stage2_ir_selected_features(selected)
+    if ir_features:
+        raise ValueError(
+            "model_bundle.pkl contains IR-derived Stage2 features. "
+            "Deployment export will not silently crop model inputs; rerun s03-s05 "
+            "so the model is trained with ambient/green/ACC features only. Offending features: "
+            + ", ".join(ir_features)
+        )
 
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
@@ -524,7 +534,6 @@ def _parse_deploy_script_constants(path):
         "FILL_VALUES",
         "CLIP_BOUNDS",
         "WINDOW_MODEL_THRESHOLD",
-        "USE_STAGE2_IR",
         "DEFAULT_FS",
         "DEFAULT_WINDOW_SEC",
     }
@@ -652,7 +661,7 @@ def validate_deploy_artifact_consistency(artifact_dir):
     expected_clip = _json_clip_map(bundle.get("clip_bounds", {}), selected)
     expected_meta = {
         key: bundle.get("meta", {}).get(key)
-        for key in ("fs_ppg", "win_sec", "step_sec", "use_stage2_ir")
+        for key in ("fs_ppg", "win_sec", "step_sec")
         if key in bundle.get("meta", {})
     }
 
@@ -664,9 +673,6 @@ def validate_deploy_artifact_consistency(artifact_dir):
     _assert_same("deploy_feature_extractor.py CLIP_BOUNDS", script_constants["CLIP_BOUNDS"], expected_clip)
     _assert_float_same("deploy_feature_extractor.py WINDOW_MODEL_THRESHOLD",
                        script_constants["WINDOW_MODEL_THRESHOLD"], threshold)
-    if "use_stage2_ir" in expected_meta:
-        _assert_same("deploy_feature_extractor.py USE_STAGE2_IR",
-                     bool(script_constants["USE_STAGE2_IR"]), bool(expected_meta["use_stage2_ir"]))
     if "fs_ppg" in expected_meta:
         _assert_float_same("deploy_feature_extractor.py DEFAULT_FS",
                            script_constants["DEFAULT_FS"], expected_meta["fs_ppg"])
@@ -1113,6 +1119,8 @@ def _build_full_feature_recipe(selected_features):
         "ACC_GREEN_BP_CORR":{"depends": ["acc_mag_bp", "g_mean_bp"], "formula": "|safe_corr(acc_mag_bp, g_mean_bp)|"},
         "ACC_IR_BP_CORR":   {"depends": ["acc_mag_bp", "ir_bp"], "formula": "|safe_corr(acc_mag_bp, ir_bp)|"},
         "ACC_ENERGY_TO_GREEN_AC":{"depends": ["acc_mag", "g_mean_bp"], "formula": "safe_div(sum(acc_mag^2), sqrt(mean(g_mean_bp^2)))"},
+        "ACC_SAT_FRAC":      {"depends": ["acc"], "formula": "mean(|acc| >= 0.98*max(|acc|))"},
+        "ACC_CLIP_RATE":     {"depends": ["acc"], "formula": "mean(|diff(acc)| < 1e-10)"},
 
         # == ACC per-axis (Tier 1) ==
         "ACC_X_MEAN":       {"depends": ["acc_x"], "formula": "mean(acc_x)"},
@@ -1427,7 +1435,7 @@ def export_deploy_cookbook(artifact_dir):
                 "score[t] = alpha * quality[t] * proba[t] + (1-alpha*quality[t]) * score[t-1]",
                 "IF state==0 and count(score>T_on) >= K_on and cooldown_expired: state=1, reset counter",
                 "IF state==1 and count(score<T_off) >= K_off and cooldown_expired: state=0, reset counter",
-                "quality[t] from Ambient_std / G_mean_mean / IR_mean thresholds (from bundle)",
+                "quality[t] from Ambient_std / G_mean_mean thresholds (from bundle)",
             ],
             "quality_thresholds": bundle.get("quality_thresholds", {}),
         },
@@ -1621,7 +1629,7 @@ def main():
     p.add_argument("--skip_initial_windows", type=int, default=3,
                    help="drop this many leading Stage2 windows per sample")
     p.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction, default=False,
-                   help="whether Stage2 feature extraction uses IR channel values")
+                   help="legacy compatibility flag; Stage2 model features are always ambient/green/ACC only")
 
     # ── s04 参数 ──
     p.add_argument("--max_features", type=int, default=15, help="最终选择的特征数")
@@ -1706,6 +1714,8 @@ def main():
                    help="export window-level NPZ cache for s07 postprocess optimization")
     p.add_argument("--optimize_postprocess", action=argparse.BooleanOptionalAction, default=False,
                    help="run s07 FP-sensitive postprocess optimization on cached windows")
+    p.add_argument("--full_optimize", action="store_true",
+                   help="enable full search loop: model/feature-count search, window cache export, and s07 postprocess optimization")
     p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
                    help="split used by s07 postprocess optimization")
     p.add_argument("--postprocess_fp_cost", type=float, default=4.0,
@@ -1732,6 +1742,10 @@ def main():
                    help="导出部署配方给嵌入式同事 (--no-export_deploy_cookbook 跳过)")
 
     args = p.parse_args()
+    if args.full_optimize:
+        args.model_search = True
+        args.export_window_cache = True
+        args.optimize_postprocess = True
     thread_env = configure_thread_env()
     print("[parallel] thread caps inherited by child steps: " +
           ", ".join(f"{k}={v}" for k, v in thread_env.items()))

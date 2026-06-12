@@ -32,6 +32,8 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import (roc_auc_score, accuracy_score, precision_score,
                               recall_score, f1_score, confusion_matrix)
 
+from s03_extract_feature_pool import filter_stage2_ir_features
+
 logger = logging.getLogger(__name__)
 
 
@@ -1786,12 +1788,10 @@ def main(args=None):
 
     feature_cols = get_feature_cols(df_train)
 
-    # 默认 IR 不参与 Stage2（use_stage2_ir=false），剔除 IR 相关特征避免噪声
-    _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
-                    "corr_IR_", "log_IR_", "ACC_IR_")
+    # Stage2 candidates are ambient/green/ACC only; remove stale IR-derived
+    # columns from old feature_pool CSVs before selection.
     _before = len(feature_cols)
-    feature_cols = [f for f in feature_cols
-                    if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)]
+    feature_cols = filter_stage2_ir_features(feature_cols)
     _dropped = _before - len(feature_cols)
     if _dropped > 0:
         print(f"[s04 IR strip] 从候选池移除 {_dropped} 个 IR 特征 (保留 {len(feature_cols)} 个)")

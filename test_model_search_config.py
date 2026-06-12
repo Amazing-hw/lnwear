@@ -512,6 +512,29 @@ def test_s08_model_search_can_explicitly_run_npz_and_postprocess_search():
     assert "s09_commercial_compare.py" not in output
 
 
+def test_s08_full_optimize_enables_cache_and_postprocess_search():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--full_optimize",
+        ],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert "--model_search_strategy staged_group_cv" in output
+    assert '--model_search_feature_counts "8"' in output
+    assert '--model_search_feature_counts "30"' in output
+    assert "--export_window_cache" in output
+    assert "s07_postprocess_optimize.py" in output
+    assert "s09_commercial_compare.py" not in output
+
+
 def test_s08_model_search_can_be_disabled_for_fast_dry_runs():
     result = subprocess.run(
         [

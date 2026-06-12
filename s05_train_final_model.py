@@ -30,9 +30,27 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import KFold, StratifiedKFold, StratifiedGroupKFold, train_test_split
 
+from s03_extract_feature_pool import filter_stage2_ir_features, is_stage2_ir_feature
+
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def enforce_no_stage2_ir_features(feature_names, context):
+    """Filter stale IR-derived features before Stage2 model training/export."""
+    original = list(feature_names)
+    filtered = filter_stage2_ir_features(original)
+    dropped = [f for f in original if is_stage2_ir_feature(f)]
+    if dropped:
+        suffix = "..." if len(dropped) > 20 else ""
+        logger.warning(
+            "%s: removed %d IR-derived Stage2 features: %s",
+            context, len(dropped), ", ".join(dropped[:20]) + suffix,
+        )
+    if not filtered:
+        raise ValueError(f"{context}: no non-IR Stage2 features remain after filtering")
+    return filtered
 
 
 DEFAULT_XGB_PARAMS = {
@@ -1380,7 +1398,7 @@ def export_training_report_plot(plot_data, artifact_dir):
 # 质量阈值 / OOD 分位数 / fingerprint
 # =========================================================
 
-QUALITY_FEATURES_DEFAULT = ["Ambient_std", "G_mean_mean", "IR_mean"]
+QUALITY_FEATURES_DEFAULT = ["Ambient_std", "G_mean_mean"]
 
 
 def learn_quality_thresholds(df_train, features=None, q_high=0.99, q_low=0.01):
@@ -1623,7 +1641,7 @@ def main(args=None):
     parser.add_argument("--step_sec", type=float, default=1.0,
                         help="Feature/evaluation stride seconds recorded into model metadata.")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction, default=False,
-                        help="whether Stage2 feature pools used IR channel values")
+                        help="legacy compatibility flag; Stage2 model features are always ambient/green/ACC only")
     parser.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=False,
                         help="search XGBoost params under a node-count budget before final calibration")
     parser.add_argument("--model_search_strategy", type=str, default="staged_group_cv",
@@ -1709,6 +1727,8 @@ def main(args=None):
             fs = json.load(f)
         selected_features = fs["selected_features"]
 
+    selected_features = enforce_no_stage2_ir_features(selected_features, "initial selected_features")
+
     feature_pool_train_path = os.path.join(args.artifact_dir, "feature_pool_train.csv")
     feature_pool_valid_path = os.path.join(args.artifact_dir, "feature_pool_valid.csv")
     splits_path = os.path.join(args.artifact_dir, "splits.json")
@@ -1726,8 +1746,9 @@ def main(args=None):
                 _feature_counts.append(int(_part))
         _feature_counts = sorted(set(_feature_counts))
 
-    # ── 多 k 分支 / 单 k 分支 ──
-    if _feature_counts and os.path.exists(ranked_features_path):
+    # ── 多 k/显式 k 特征数搜索分支 / 普通单 k 分支 ──
+    _using_feature_count_search = bool(_feature_counts and os.path.exists(ranked_features_path))
+    if _using_feature_count_search:
         # ============ 多 k 搜参 ============
         if not args.model_search:
             logger.warning("model_search_feature_counts 已指定但 model_search 未启用，"
@@ -1735,6 +1756,16 @@ def main(args=None):
 
         with open(ranked_features_path, "r", encoding="utf-8") as _f:
             _ranked = json.load(_f)
+        _ranked_before = len(_ranked)
+        _ranked = [r for r in _ranked if not is_stage2_ir_feature(r.get("feature", ""))]
+        _ranked_dropped = _ranked_before - len(_ranked)
+        if _ranked_dropped > 0:
+            logger.warning(
+                "ranked_features.json: removed %d IR-derived Stage2 candidates before feature-count search",
+                _ranked_dropped,
+            )
+        if not _ranked:
+            raise ValueError("ranked_features.json has no non-IR Stage2 candidates after filtering")
 
         _max_k = min(max(_feature_counts), len(_ranked))
         _ks = [k for k in _feature_counts if k <= _max_k]
@@ -1902,8 +1933,8 @@ def main(args=None):
     #   按部署时 Stage2 输入的期望 P(target=1 | Stage1 pass) 重加权，
     #   使训练 effective 分布 ≈ 部署条件分布。
     #   公式: scale_pos_weight = r * (1 - p_train) / ((1 - r) * p_train)
-    # 单 k 或空：走正常训练流程；多 k：由下方循环处理
-    if len(_feature_counts) <= 1:
+    # 普通单 k 或空：走正常训练流程；显式 feature_counts 分支上方已经训练完成
+    if not _using_feature_count_search:
         neg_count = int(np.sum(y_train == 0))
         pos_count = int(np.sum(y_train == 1))
         n_total = max(neg_count + pos_count, 1)

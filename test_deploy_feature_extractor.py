@@ -12,6 +12,7 @@ from xgboost import XGBClassifier
 
 import s06_deploy_eval as s06
 import s03_extract_feature_pool as s03
+import s05_train_final_model as s05
 import s08_run_pipeline as s08
 
 
@@ -40,8 +41,16 @@ def test_all_s03_window_features_have_deploy_formulas():
 
     formulas = s08.build_selected_feature_formulas(features)
 
+    assert not [name for name in features if s03.is_stage2_ir_feature(name)]
     assert "G_consensus_AC_MAD_range" in formulas
     assert len(formulas) == len(features)
+    forbidden_dep_tokens = ("ir_raw", "ir_bp", "ir_dc")
+    for name, info in formulas.items():
+        deps = info.get("depends", []) + list(info.get("intermediate_signals", {}).keys())
+        formula = str(info.get("formula", ""))
+        assert not s03.is_stage2_ir_feature(name), name
+        assert not any(token in deps for token in forbidden_dep_tokens), name
+        assert "IR_" not in formula and "ir_" not in formula, name
 
 
 def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
@@ -85,14 +94,10 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
 
     vector = module.extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=float(fs))
 
+    assert not [name for name in selected if s03.is_stage2_ir_feature(name)]
+    assert list(module.FEATURE_ORDER) == selected
     assert "G_consensus_AC_MAD_range" in module.FEATURE_ORDER
-    # IR features are stripped when use_stage2_ir=false (bundle meta default)
-    _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
-                    "corr_IR_", "log_IR_", "ACC_IR_")
-    _ir_stripped_count = len([f for f in selected
-                              if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)])
-    assert len(module.FEATURE_ORDER) == _ir_stripped_count
-    assert len(vector) == _ir_stripped_count
+    assert len(vector) == len(selected)
 
 
 def test_rendered_deploy_feature_extractor_is_project_source_independent():
@@ -205,7 +210,101 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     assert "sys.path" not in script
 
 
-def test_export_feature_extractor_strips_ir_features_when_stage2_ir_disabled(tmp_path):
+def test_s03_stage2_ir_disabled_omits_ir_features_before_selection():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    acc = np.column_stack([
+        0.01 * np.sin(2 * np.pi * 1.0 * t),
+        0.02 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
+    ])
+
+    features = s03.extract_window_features(ppg, fs=fs, acc_window=acc, use_stage2_ir=False)
+    ppg_with_different_ir = ppg.copy()
+    ppg_with_different_ir[:, 0] = 1.0e6 + 5.0e5 * np.sin(2 * np.pi * 0.7 * t)
+    features_with_different_ir = s03.extract_window_features(
+        ppg_with_different_ir, fs=fs, acc_window=acc, use_stage2_ir=False
+    )
+
+    forbidden = [
+        "IR_mean",
+        "IRX_bp_skewness",
+        "GREEN_IR_BP_CORR",
+        "ACC_IR_BP_CORR",
+        "AMB_STAGE1_RATIO",
+        "IR_DC_LEVEL",
+        "corr_Ambient_IR",
+    ]
+    for name in forbidden:
+        assert name not in features
+    assert features.keys() == features_with_different_ir.keys()
+    for name in features:
+        assert np.isclose(features[name], features_with_different_ir[name], equal_nan=True), name
+    assert "GREEN_CORR" in features
+    assert "AMB_DC" in features
+
+
+def test_s03_feature_pool_source_keys_are_stage2_ir_free_even_with_acc():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    acc = np.column_stack([
+        0.01 * np.sin(2 * np.pi * 1.0 * t),
+        0.02 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
+    ])
+
+    pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
+    window_features = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
+
+    assert not [name for name in pool if s03.is_stage2_ir_feature(name)]
+    assert not [name for name in window_features if s03.is_stage2_ir_feature(name)]
+    assert not any("IR" in name for name in window_features)
+    assert "GREEN_SEG_ACDC_CV" in pool
+    assert "GREEN_FFT_harmonic_ratio" in pool
+    assert "ACC_GREEN_BP_CORR" in window_features
+
+
+def test_s05_filters_stale_ir_features_before_training():
+    features = [
+        "IRX_bp_skewness",
+        "GREEN_CORR",
+        "corr_Ambient_IR",
+        "AMBX_bp_skewness",
+    ]
+
+    assert s05.enforce_no_stage2_ir_features(features, "unit-test") == [
+        "GREEN_CORR",
+        "AMBX_bp_skewness",
+    ]
+
+
+def test_s06_rejects_stage2_ir_features_in_loaded_bundle():
+    with pytest.raises(ValueError, match="IR-derived Stage2 features"):
+        s06.assert_no_stage2_ir_features(
+            ["GREEN_CORR", "IR_mean"],
+            "unit-test",
+        )
+
+
+def test_s06_quality_fallback_does_not_use_ir_mean():
+    assert s06.compute_quality({"Ambient_std": 0.0, "G_mean_mean": 1.0, "IR_mean": 0.0}) == 1.0
+
+
+def test_export_feature_extractor_rejects_ir_features_in_stage2_bundle(tmp_path):
     selected = [
         "GREEN_CORR",
         "IRX_bp_skewness",
@@ -221,15 +320,11 @@ def test_export_feature_extractor_strips_ir_features_when_stage2_ir_disabled(tmp
         tmp_path / "model_bundle.pkl",
     )
 
-    out_path = s08.export_feature_extractor_script(str(tmp_path))
-    script = Path(out_path).read_text(encoding="utf-8")
-
-    assert '"GREEN_CORR"' in script
-    assert '"IRX_bp_skewness"' not in script  # IR stripped when use_stage2_ir=false
-    assert '"AMBX_bp_skewness"' in script
+    with pytest.raises(ValueError, match="IR-derived Stage2 features"):
+        s08.export_feature_extractor_script(str(tmp_path))
 
 
-def test_deploy_feature_extractor_applies_stage2_ir_policy_when_disabled(tmp_path):
+def test_deploy_feature_extractor_ignores_ir_for_stage2_features(tmp_path):
     selected = ["GREEN_AC", "AMB_AC"]
     joblib.dump(
         {
@@ -260,7 +355,7 @@ def test_deploy_feature_extractor_applies_stage2_ir_policy_when_disabled(tmp_pat
     g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t)
     g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t)
 
-    assert module.USE_STAGE2_IR is False
+    assert not hasattr(module, "USE_STAGE2_IR")
     assert module.DEFAULT_WINDOW_SEC == 5.0
     assert module.extract_features(ir_a, ambient, g1, g2, g3, fs=25.0) == module.extract_features(
         ir_b, ambient, g1, g2, g3, fs=25.0

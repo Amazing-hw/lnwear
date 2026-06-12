@@ -29,7 +29,7 @@ new_codex/
   s03_extract_feature_pool.py
     提取 Stage2 特征池；3D 预切窗直接逐个使用已有 3s 窗口，连续时序才按 3s/1s 滑窗。
     默认跳过每条样本前 3 个 Stage2 窗口。
-    默认 Stage2 不使用 IR，开启 --use_stage2_ir 后才保留真实 IR。
+    Stage2 特征池固定不包含 IR 派生特征；IR 只用于 Stage1 DC/ACDC 门控。
 
   s04_feature_selection.py
     做特征清洗、稳定性筛选、相关性/VIF、Permutation、SHAP、FP proxy 和候选子集搜索。
@@ -127,7 +127,7 @@ Stage2 窗长选择：
 - `--window_sec 5`（默认）：125 点@25Hz，频域分辨率更高（0.2Hz），适合需要精确心率频段的场景
 - `--window_sec 3`：75 点@25Hz，响应快，适合实时佩戴检测
 
-`use_stage2_ir=false` 只影响 Stage2：特征提取前把 IR 信号置零。Stage1 始终使用真实 IR 做 DC/ACDC 门控。
+Stage1 始终使用真实 IR 做 DC/ACDC 门控；Stage2 从特征池源头只保留环境光、绿光和 ACC 特征。`--use_stage2_ir` 仅保留为旧命令兼容项，不会让 IR 派生特征进入特征筛选、模型训练或部署导出。
 
 ## 快速开始
 
@@ -143,8 +143,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts \
-    --model_search_feature_counts "8,10,12,15,18" \
-    --export_window_cache --optimize_postprocess
+    --full_optimize
 ```
 
 此命令依次完成：特征提取 → 特征筛选 → 对每个 k 值独立搜参选最优 → 导出 NPZ 缓存 → 后处理状态机搜参 → test 评估 → 部署产物导出。最终交付物可直接交给嵌入式同事。
@@ -215,7 +214,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 20 \
-  --model_search_feature_counts "8,10,12,15,18" \
+  --model_search_feature_counts "8,10,12,15,18,22,26,30" \
   --max_model_nodes 500 \
   --split test
 ```
@@ -227,7 +226,7 @@ python s08_run_pipeline.py \
   --artifact_dir artifacts \
   --window_sec 3 \
   --max_features 20 \
-  --model_search_feature_counts "8,10,12,15,18"
+  --model_search_feature_counts "8,10,12,15,18,22,26,30"
 ```
 
 ## 复杂度受限模型搜参
@@ -238,7 +237,7 @@ python s08_run_pipeline.py \
 
 | 参数 | 候选值 | 候选数 |
 |---|---|---|
-| 特征数量 k | 8, 10, 12, 15, 18 | 5 |
+| 特征数量 k | 8, 10, 12, 15, 18, 22, 26, 30 | 8 |
 | n_estimators | 20, 25, 30, 35, 40, 45, 50, 55, 60 | 9 |
 | max_depth | 2, 3, 4, 5 | 4 |
 | learning_rate | 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10 | 7 |
@@ -258,7 +257,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --max_features 20 \
-  --model_search_feature_counts "8,10,12,15,18" \
+  --model_search_feature_counts "8,10,12,15,18,22,26,30" \
   --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
   --model_search_max_candidates 600 \
@@ -279,7 +278,7 @@ python s08_run_pipeline.py \
 搜参选择策略：
 
 ```text
-1. 对每个 k ∈ {8,10,12,15,18}，从 ranked_features.json 取 top-k 特征。
+1. 对每个 k ∈ {8,10,12,15,18,22,26,30}，从 ranked_features.json 取 top-k 特征。
 2. 每个 k 内，从参数空间按固定 random_state 抽样最多 600 个 XGBoost 候选。
 3. Stage A 在 train 内部 group split 上预筛，保留 top 80。
 4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
@@ -351,13 +350,7 @@ artifacts/feature_pool_valid.csv
 artifacts/feature_pool_test.csv
 ```
 
-如果要让 Stage2 使用 IR：
-
-```bash
-python s03_extract_feature_pool.py --artifact_dir artifacts --use_stage2_ir
-```
-
-注意：`s03/s05/s06/s09` 必须使用同一个 Stage2 IR 策略。
+不要再为 Stage2 打开 IR。`--use_stage2_ir` 仅为旧命令兼容保留；Stage2 特征池始终只包含环境光、绿光和 ACC。
 
 ### 4. 特征筛选
 
@@ -507,7 +500,7 @@ artifacts/postprocess_opt/postprocess_search_results.csv
 artifacts/postprocess_opt/postprocess_replay_valid_to_test.json
 ```
 
-注意：如果训练主流程使用过非默认参数，例如 `--use_stage2_ir`、不同的 `--window_sec`、`--stride_sec` 或 `--skip_initial_windows`，这里必须保持一致。当前默认是 `--no-use_stage2_ir`、`window_sec=3`、`stride_sec=1`、`skip_initial_windows=3`。
+注意：如果训练主流程使用过非默认窗参数，例如不同的 `--window_sec`、`--stride_sec` 或 `--skip_initial_windows`，这里必须保持一致。Stage2 不再使用 IR 派生特征，`--use_stage2_ir` 不作为后处理一致性参数。
 
 先导出 valid 和 test 两个 split 的窗口缓存：
 
@@ -794,7 +787,7 @@ clean_features_by_train（缺失/低方差/高相关/VIF）
 | spatial_coupling | 1 | mode | 1 |
 | other | 2 | meta | 0 |
 
-绿光相关 ~13 槽位，ACC 相关 ~4 槽位。IR 相关组（ir_stats/ir_g_*/ambient_stage1）在 `use_stage2_ir=false` 时无候选特征。
+绿光、环境光和 ACC 相关槽位参与 Stage2 特征筛选。IR 相关组（ir_stats/ir_g_*/ambient_stage1/ACC_IR 等）不再作为 Stage2 候选特征；如旧产物中仍含 IR 特征，需要重新运行 s03-s05。
 
 ## 测试与验收
 
@@ -847,7 +840,7 @@ python s06_deploy_eval.py --artifact_dir artifacts --split valid --export_window
 
 ### Stage2 IR 策略不一致
 
-默认推荐 `--no-use_stage2_ir`。如果开启 IR，`s03/s05/s06/s09` 全链路都要使用 `--use_stage2_ir`。
+Stage2 现在固定不使用 IR 派生特征。`--use_stage2_ir` 仅为兼容旧命令保留，不建议使用，也不会把 IR 特征带入最终模型；如 `model_bundle.pkl` 中仍有 IR 特征，部署导出会报错并要求重新生成。
 
 ### 终端中文显示乱码
 
@@ -876,11 +869,12 @@ window_model_threshold
 postprocess state machine params
 ```
 
-如果 `use_stage2_ir=false`（默认），两处自动剔除 IR 特征：
-1. **训练阶段**：`s04` 从候选池中移除所有 IR 前缀特征（`IR_`/`IRX_`/`GREEN_IR_`/`IR_AMB_`/`IR_over_`/`corr_IR_`/`log_IR_`/`ACC_IR_`），确保 IR 特征不会进入特征筛选和模型训练。
-2. **部署导出**：`s08` 生成 `deploy_feature_extractor.py` 时同步剔除 IR 特征，`FEATURE_ORDER`/`FILL_VALUES`/`CLIP_BOUNDS` 均不包含 IR 特征。
+Stage2 的部署策略是“训练前过滤，不在导出阶段裁剪”：
+1. **s03 源头**：Stage2 特征池输出只包含环境光、绿光和 ACC；`SQI_*` 这类泛化名字也不会再隐式使用 IR。
+2. **s04/s05 防线**：如果读取到旧 CSV、旧 `ranked_features.json` 或旧 `selected_features.json`，会再次移除 IR 派生候选，防止旧产物污染训练。
+3. **s08 部署导出**：`deploy_feature_extractor.py` 的 `FEATURE_ORDER` 严格等于 `model_bundle.pkl["feature_names"]`，不会静默裁剪。若旧 bundle 仍含 IR 特征，导出会直接报错，要求重新运行 s03-s05。
 
-`deploy_feature_extractor.py` 的 `FEATURE_ORDER` 直接来自 `model_bundle.pkl["feature_names"]`（已剔除 IR），嵌入端只需按顺序计算特征向量即可，无需额外处理 IR 信号。
+嵌入端只需按 `FEATURE_ORDER` 计算环境光、绿光和 ACC 特征向量；IR 通道只属于 Stage1 门控，不属于 Stage2 窗口级 XGBoost 输入。
 
 `s08_run_pipeline.py` 在默认部署导出流程中会校验 `model_bundle.pkl`、`deploy_feature_extractor.py`、`deploy_xgboost.json`、`deploy_cookbook.json` 和 `deploy_package/model_params.json` 的特征顺序、阈值、fill/clip 配置是否一致；若发现旧产物或部署文件漂移，会直接报错中断。
 
@@ -894,7 +888,7 @@ final_model.json
 golden_vectors.json
 ```
 
-`deploy_feature_extractor.py` 是自包含脚本：它内联了所需的 Stage2 窗口级预处理、`use_stage2_ir` 策略和特征计算逻辑，不依赖 `s03_extract_feature_pool.py`、`s08_run_pipeline.py` 或其他训练/评估脚本。工程侧用它按 `FEATURE_ORDER` 生成特征向量，用 `final_model.json` 计算窗口佩戴概率，再用脚本内置的 `WINDOW_MODEL_THRESHOLD` 或 `classify_probability(probability)` 得到窗口级 0/1 识别结果。
+`deploy_feature_extractor.py` 是自包含脚本：它内联了所需的 Stage2 窗口级预处理和特征计算逻辑，不依赖 `s03_extract_feature_pool.py`、`s08_run_pipeline.py` 或其他训练/评估脚本。工程侧用它按 `FEATURE_ORDER` 生成环境光、绿光和 ACC 特征向量，用 `final_model.json` 计算窗口佩戴概率，再用脚本内置的 `WINDOW_MODEL_THRESHOLD` 或 `classify_probability(probability)` 得到窗口级 0/1 识别结果。
 
 ### 训练与推理的预处理管道
 
@@ -920,7 +914,7 @@ golden_vectors.json
 
 推理侧 (deploy_feature_extractor.py, 独立部署脚本):
   raw window signals
-    → ① 按 USE_STAGE2_IR 对 Stage2 IR 输入保留或置零
+    → ① Stage2 忽略 IR，只计算环境光、绿光和 ACC 特征
     → ② standalone feature extraction
     → ③ inf/None → fill_values (FILL_VALUES dict)
     → ④ clip(clip_bounds) (CLIP_BOUNDS dict)

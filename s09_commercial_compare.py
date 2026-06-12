@@ -37,7 +37,6 @@ from s03_extract_feature_pool import (
     fft_peak_features,
     get_channels_from_window,
     is_prewindowed_signal,
-    apply_stage2_ir_policy,
     load_acc,
     load_ppg,
     moving_average_filter,
@@ -549,7 +548,6 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
                     continue
                 try:
                     ir, ambient, g1, g2, g3 = get_channels_from_window(window_25, mode)
-                    ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
                     acc_seg = None
                     if acc is not None and is_prewindowed_signal(acc) and idx < acc.shape[0]:
                         acc_seg, _ = _prewindow_to_25hz(sample, acc[idx], window_sec)
@@ -617,7 +615,6 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
         try:
             window = ppg_25[s2_start:s2_start + s2_win, :]
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-            ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
             acc_seg = _slice_acc(acc_25, s2_start, s2_win)
             feature_vec = extractor.extract_features(
                 ir, ambient, g1, g2, g3, acc=acc_seg, fs=FEATURE_FS, mode=mode

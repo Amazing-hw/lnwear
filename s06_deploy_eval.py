@@ -49,7 +49,7 @@ from s03_extract_feature_pool import (
     stage1_ambient_check,
     detect_green_mode,
     get_channels_from_window,
-    apply_stage2_ir_policy,
+    is_stage2_ir_feature,
     extract_feature_pool_from_window,
     align_acc_window,
     extract_acc_features,
@@ -84,11 +84,19 @@ DEFAULT_USE_STAGE2_IR = False
 
 
 def resolve_use_stage2_ir(bundle, requested=None):
-    if requested is not None:
-        return bool(requested)
-    if isinstance(bundle, dict):
-        return bool(bundle.get("meta", {}).get("use_stage2_ir", DEFAULT_USE_STAGE2_IR))
+    # Legacy CLI compatibility only. Stage2 model features are always
+    # ambient/green/ACC; IR is reserved for Stage1 gating.
     return DEFAULT_USE_STAGE2_IR
+
+
+def assert_no_stage2_ir_features(feature_names, context):
+    leaks = [str(name) for name in feature_names if is_stage2_ir_feature(str(name))]
+    if leaks:
+        raise ValueError(
+            f"IR-derived Stage2 features found in {context}: {leaks[:10]}. "
+            "Regenerate artifacts from s03; Stage2 uses only ambient/green/ACC."
+        )
+    return list(feature_names)
 
 
 def _env_flag(name):
@@ -134,6 +142,7 @@ def assert_bundle_ok(bundle):
 
     miss = [c for c in bundle["feature_names"] if c not in bundle["fill_values"]]
     assert not miss, f"fill_values missing for: {miss[:5]} ..."
+    assert_no_stage2_ir_features(bundle["feature_names"], "model_bundle.pkl feature_names")
 
     for k in ["fs_ppg", "win_sec", "step_sec"]:
         assert k in bundle["meta"], f"meta missing: {k}"
@@ -291,9 +300,6 @@ def compute_quality(feat_or_meta, thresholds=None):
         q *= 0.5
     gmm = feat_or_meta.get("G_mean_mean", None)
     if gmm is not None and np.abs(gmm) < 1e-6:
-        q *= 0.5
-    irm = feat_or_meta.get("IR_mean", None)
-    if irm is not None and np.abs(irm) < 1e-6:
         q *= 0.5
     return float(q)
 
@@ -474,7 +480,6 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
                 raw_window, src_fs=100, tgt_fs=FEATURE_FS
             )
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-            ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
             feat, preprocessed = extract_feature_pool_from_window(
                 ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
                 fs=FEATURE_FS, return_preprocessed=True
@@ -493,15 +498,13 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
                 feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
                 feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
                 green_bp = preprocessed.get("g_top2_bp")
-                ir_bp = preprocessed.get("ir_bp")
-                if green_bp is not None and ir_bp is not None:
-                    feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
+                if green_bp is not None:
+                    feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, fs=FEATURE_FS))
 
             feats_list.append(feat)
             quality_metas.append({
                 "Ambient_std": feat.get("Ambient_std"),
                 "G_mean_mean": feat.get("G_mean_mean"),
-                "IR_mean": feat.get("IR_mean"),
             })
         except Exception:
             feats_list.append(None)
@@ -568,7 +571,7 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
         "window_layout": sample.get("window_layout"),
         "window_indices": list(sample.get("window_indices", [])),
         "window_labels": list(sample.get("window_labels", [])),
-        "use_stage2_ir": bool(use_stage2_ir),
+        "use_stage2_ir": False,
         "fallback": False, "fallback_reason": None,
     }
 
@@ -664,7 +667,6 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
             window = ppg_25[s2_start:s2_start + win_25, :]
             try:
                 ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-                ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
                 feat, preprocessed = extract_feature_pool_from_window(
                     ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
                     fs=FEATURE_FS, return_preprocessed=True
@@ -675,10 +677,9 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
                     feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
                     feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
                     green_bp = preprocessed.get("g_top2_bp")
-                    ir_bp = preprocessed.get("ir_bp")
-                    if green_bp is not None and ir_bp is not None:
+                    if green_bp is not None:
                         feat.update(extract_acc_ppg_cross_features(
-                            acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
+                            acc_seg, green_bp, fs=FEATURE_FS))
                         # ACC-PPG coherence
                         if acc_seg is not None and len(acc_seg) >= 16:
                             try:
@@ -697,7 +698,6 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
                 quality_metas.append({
                     "Ambient_std": feat.get("Ambient_std"),
                     "G_mean_mean": feat.get("G_mean_mean"),
-                    "IR_mean": feat.get("IR_mean"),
                 })
             except Exception:
                 feats_list.append(None)
@@ -1923,7 +1923,6 @@ def predict_sample(sample, model, scaler, selected_features,
         window = ppg[start:start + win, :]
         try:
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-            ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
             feat = extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
             x = []
             for f in selected_features:
@@ -1979,6 +1978,10 @@ def build_feature_formula_map(selected_features):
     返回: OrderedDict[feature_name -> formula_info]
     """
     from collections import OrderedDict
+    selected_features = assert_no_stage2_ir_features(
+        list(selected_features),
+        "deploy feature formula selected_features",
+    )
     # ---- 公式片段模板 ----
     # 按通道替换
     CHANNEL_NAMES = {
@@ -2231,7 +2234,7 @@ def build_feature_formula_map(selected_features):
         # 确定信号依赖
         sigs = set()
         if info["category"] in ("core", "cross_channel", "short_window"):
-            sigs.update(["ir", "g_mean", "ambient"])
+            sigs.update(["g_mean", "ambient"])
         elif info["category"] == "green_spatial":
             sigs.update(["g1", "g2", "g3"])
         elif info["category"] == "single_channel":
@@ -2247,7 +2250,7 @@ def build_feature_formula_map(selected_features):
         elif info["category"] == "acc":
             sigs.add("acc")
         elif info["category"] in ("spatial_coupling",):
-            sigs.update(["ir", "g_mean", "ambient"])
+            sigs.update(["g_mean", "ambient"])
         info["signals"] = sorted(sigs)
 
         # 查找公式：先直接匹配，再尝试去掉通道前缀匹配
@@ -2311,7 +2314,10 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
         if "postprocess" in fcfg:
             postprocess_cfg.update(fcfg["postprocess"])
 
-    selected_features = list(bundle["feature_names"])
+    selected_features = assert_no_stage2_ir_features(
+        list(bundle["feature_names"]),
+        "model_bundle.pkl feature_names",
+    )
     if _os.path.exists(features_path):
         try:
             with open(features_path, "r", encoding="utf-8") as f:
@@ -2388,7 +2394,7 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
             "duration_sec": float(bundle["meta"]["win_sec"]),
             "stride_sec": float(bundle["meta"]["step_sec"]),
             "skip_initial_windows": int(skip_initial_windows),
-            "use_stage2_ir": bool(bundle.get("meta", {}).get("use_stage2_ir", DEFAULT_USE_STAGE2_IR)),
+            "use_stage2_ir": False,
             "fs_ppg": float(bundle["meta"]["fs_ppg"]),
         }),
         ("preprocessing_per_channel", [
@@ -2534,9 +2540,9 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
         ("quality_scoring", OrderedDict([
             ("description", "基于特征质量调整 EMA 平滑速度"),
             ("thresholds_source", "train — learned from bundle['quality_thresholds']"),
-            ("features_used", ["Ambient_std", "G_mean_mean", "IR_mean"]),
-            ("thresholds", bundle.get("quality_thresholds", {})),
-            ("fallback", "if thresholds missing: Ambient_std>1e7→×0.5, |G_mean_mean|<1e-6→×0.5, |IR_mean|<1e-6→×0.5"),
+        ("features_used", ["Ambient_std", "G_mean_mean"]),
+        ("thresholds", bundle.get("quality_thresholds", {})),
+        ("fallback", "if thresholds missing: Ambient_std>1e7→×0.5, |G_mean_mean|<1e-6→×0.5"),
         ])),
         ("ood_monitoring", OrderedDict([
             ("description", "OOD 窗比例监控 — 窗特征超出 train 分位 [q_low, q_high] 的比例"),
@@ -2566,7 +2572,7 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
                 ("duration_sec", float(bundle["meta"]["win_sec"])),
                 ("stride_sec", float(bundle["meta"]["step_sec"])),
                 ("skip_initial_windows", int(skip_initial_windows)),
-                ("use_stage2_ir", bool(bundle.get("meta", {}).get("use_stage2_ir", DEFAULT_USE_STAGE2_IR))),
+                ("use_stage2_ir", False),
             ])),
             ("n_features", len(selected_features)),
             ("names", selected_features),
@@ -2674,7 +2680,7 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
         model_fingerprint_json=np.array(json.dumps(metadata.get("model_fingerprint", {}), ensure_ascii=False)),
         feature_names_json=np.array(json.dumps(list(metadata.get("feature_names", [])), ensure_ascii=False)),
         skip_initial_windows=np.array(int(metadata.get("skip_initial_windows", 0)), dtype=np.int64),
-        use_stage2_ir=np.array(int(metadata.get("use_stage2_ir", result.get("use_stage2_ir", 0))), dtype=np.int64),
+        use_stage2_ir=np.array(0, dtype=np.int64),
     )
     return fpath
 
@@ -2708,7 +2714,7 @@ def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, mo
                 "model_fingerprint": metadata.get("model_fingerprint", {}),
                 "feature_names": list(metadata.get("feature_names", [])),
                 "skip_initial_windows": int(metadata.get("skip_initial_windows", 0)),
-                "use_stage2_ir": bool(metadata.get("use_stage2_ir", r.get("use_stage2_ir", False))),
+                "use_stage2_ir": False,
                 "fallback": int(bool(r.get("fallback", False))),
                 "fallback_reason": str(r.get("fallback_reason", "")),
             })

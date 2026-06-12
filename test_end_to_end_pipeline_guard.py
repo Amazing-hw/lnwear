@@ -143,4 +143,4 @@ def test_s08_synthetic_grouped_h5_smoke_exports_consistent_deploy_artifacts(tmp_
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     assert module.FEATURE_ORDER == selected
-    assert module.USE_STAGE2_IR is False
+    assert not hasattr(module, "USE_STAGE2_IR")
