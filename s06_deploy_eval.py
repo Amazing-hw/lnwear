@@ -2727,7 +2727,7 @@ def main(args=None):
     parser.add_argument("--split", type=str, default="test", choices=["train", "valid", "test"])
     parser.add_argument("--method", type=str, default="state_machine",
                         choices=["mean_vote", "prob_mean", "state_machine"])
-    parser.add_argument("--window_sec", type=int, default=3)
+    parser.add_argument("--window_sec", type=int, default=5)
     parser.add_argument("--stride_sec", type=int, default=1)
     parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,
                         help="drop this many leading Stage2 windows per sample")

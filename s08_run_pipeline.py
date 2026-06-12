@@ -491,7 +491,7 @@ def export_feature_extractor_script(artifact_dir):
         window_model_threshold=float(bundle.get("threshold", 0.5)),
         use_stage2_ir=bool(meta.get("use_stage2_ir", False)),
         default_fs=float(meta.get("fs_ppg", 25.0)),
-        window_sec=float(meta.get("win_sec", 3.0)),
+        window_sec=float(meta.get("win_sec", 5.0)),
     )
 
     out_path = os.path.join(artifact_dir, "deploy_feature_extractor.py")
@@ -587,7 +587,7 @@ def export_golden_vectors(artifact_dir, n_vectors=1):
         raise ValueError("deploy_feature_extractor.py FEATURE_ORDER mismatch before golden export")
 
     fs = float(bundle.get("meta", {}).get("fs_ppg", 25.0))
-    win_sec = float(bundle.get("meta", {}).get("win_sec", 3.0))
+    win_sec = float(bundle.get("meta", {}).get("win_sec", 5.0))
     n = max(32, int(round(fs * win_sec)))
     rng = __import__("numpy").random.default_rng(12345)
     np = __import__("numpy")
@@ -1615,7 +1615,7 @@ def main():
                    help="运行到此步骤后停止；默认 s06_cb，即导出部署配方后停止")
 
     # ── s03 参数 ──
-    p.add_argument("--window_sec", type=int, default=3, choices=[3, 5],
+    p.add_argument("--window_sec", type=int, default=5, choices=[3, 5],
                    help="Stage2 窗口秒数：3s (75点@25Hz) 或 5s (125点@25Hz)")
     p.add_argument("--stride_sec", type=int, default=1, help="Stage2 滑窗步长（秒）")
     p.add_argument("--skip_initial_windows", type=int, default=3,

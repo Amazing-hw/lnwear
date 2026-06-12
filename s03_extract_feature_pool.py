@@ -2628,7 +2628,7 @@ def main(args=None):
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
-    parser.add_argument("--window_sec", type=int, default=3, choices=[3, 5],
+    parser.add_argument("--window_sec", type=int, default=5, choices=[3, 5],
                         help="Stage2 窗口秒数：3s (75点@25Hz) 或 5s (125点@25Hz)")
     parser.add_argument("--stride_sec", type=int, default=1)
     parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,

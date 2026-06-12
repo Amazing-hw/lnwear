@@ -5,7 +5,7 @@
 1. **Stage1：IR DC/ACDC 流式粗筛**  
    用 1s primitive window 和 3s decision gate 快速过滤明显非佩戴片段。
 
-2. **Stage2：3s/1s 单窗模型**  
+2. **Stage2：5s/1s 单窗模型**  
    对通过 Stage1 的窗口提取特征，用 XGBoost 输出逐窗口佩戴概率。
 
 3. **Stage3：状态机后处理**  
@@ -116,7 +116,7 @@ numpy, scipy, pandas, scikit-learn, xgboost, joblib, h5py, matplotlib, pytest
 ```text
 Stage1 primitive window: 1s
 Stage1 decision gate:    连续 3 个 primitive 通过后开启 Stage2
-Stage2 window:           3s (也支持 5s，通过 --window_sec 5 切换)
+Stage2 window:           5s (也支持 3s，通过 --window_sec 3 切换)
 Stage2 stride:           1s
 skip_initial_windows:    3
 use_stage2_ir:           false
@@ -124,8 +124,8 @@ postprocess latency:     first_worn_output_p95 <= 6s
 ```
 
 Stage2 窗长选择：
-- `--window_sec 3`（默认）：75 点@25Hz，响应快，适合实时佩戴检测
-- `--window_sec 5`：125 点@25Hz，频域分辨率更高（0.2Hz），适合需要精确心率频段的场景
+- `--window_sec 5`（默认）：125 点@25Hz，频域分辨率更高（0.2Hz），适合需要精确心率频段的场景
+- `--window_sec 3`：75 点@25Hz，响应快，适合实时佩戴检测
 
 `use_stage2_ir=false` 只影响 Stage2：特征提取前把 IR 信号置零。Stage1 始终使用真实 IR 做 DC/ACDC 门控。
 
@@ -208,29 +208,24 @@ s06_feat/s06_cb     导出部署特征脚本和部署配方
 
 如果 `--stop_after` 直接指向可选步骤，例如 `s07_post`、`s09_cmp` 或 `s10_audit`，`s08` 会把该目标视为显式请求，并自动打开必要前置步骤；默认不带这些 stop target 时仍保持精简主流程。
 
-推荐一条命令（默认 3s 窗口，自动多 k 搜参）：
+推荐一条命令（默认 5s 窗口，自动多 k 搜参）：
 
 ```bash
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --window_sec 3 \
-  --stride_sec 1 \
-  --skip_initial_windows 3 \
-  --no-use_stage2_ir \
   --max_features 20 \
-  --model_search \
   --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --split test
 ```
 
-5s 窗口版本：
+3s 窗口版本：
 ```bash
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --window_sec 5 \
+  --window_sec 3 \
   --max_features 20 \
   --model_search_feature_counts "8,10,12,15,18"
 ```
