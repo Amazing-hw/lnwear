@@ -56,6 +56,34 @@ def test_window_error_analysis_exports_fp_fn_strata(tmp_path):
     assert payload["summary"]["total_windows"] == 3
 
 
+def test_window_stream_metrics_uses_per_window_targets_for_grouped_h5():
+    results = [
+        {
+            "sample_name": "mixed_record",
+            "target": 1,
+            "stage1_pass": True,
+            "fallback": False,
+            "window_probs": [0.1, 0.9, 0.9],
+            "window_targets": [0, 1, 1],
+            "quality_metas": [{}, {}, {}],
+        }
+    ]
+    cfg = {
+        "alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.5,
+        "K_on": 1,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+    }
+
+    metrics = s06.compute_window_stream_metrics(results, cfg, warmup_frames=0)
+
+    assert metrics["confusion_matrix"] == {"TN": 1, "FP": 0, "FN": 0, "TP": 2}
+    assert metrics["accuracy"] == 1.0
+
+
 def test_postprocess_replay_records_valid_selection_and_test_metrics():
     valid_cache = {
         "sample_name": "valid-pos",

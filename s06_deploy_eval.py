@@ -1489,19 +1489,22 @@ def compute_window_stream_metrics(results, cfg, warmup_frames=0):
             K_off=cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]),
             cooldown_sec=cfg.get("cooldown_sec", DEFAULT_POSTPROCESS_CONFIG["cooldown_sec"]),
         )
-        t = int(r["target"])
+        sample_target = int(r["target"])
+        window_targets = r.get("window_targets", [])
         qt = _BUNDLE.get("quality_thresholds") if _BUNDLE is not None else None
         # 先把所有窗的 state 跑出来，再按 warmup_frames 裁剪
         sample_states = []
+        sample_targets = []
         probs_for_state = causal_median_filter_1d(probs, cfg.get("median_k", DEFAULT_POSTPROCESS_CONFIG["median_k"]))
         for i, p in enumerate(probs_for_state):
             meta_i = qm[i] if i < len(qm) else None
             q = compute_quality(meta_i, thresholds=qt) if meta_i else 1.0
             state, _ = sm.update(p, quality=q)
             sample_states.append(int(state))
+            sample_targets.append(int(_safe_list_get(window_targets, i, sample_target)))
         start = min(warmup_frames, len(sample_states))
         skipped_windows += start
-        for s in sample_states[start:]:
+        for t, s in zip(sample_targets[start:], sample_states[start:]):
             y_true.append(t)
             y_pred.append(s)
 

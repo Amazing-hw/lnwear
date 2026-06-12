@@ -11,6 +11,7 @@ import pytest
 from xgboost import XGBClassifier
 
 import s06_deploy_eval as s06
+import s03_extract_feature_pool as s03
 import s08_run_pipeline as s08
 
 
@@ -23,6 +24,75 @@ def test_ambx_bp_shape_features_have_deploy_formulas():
     assert "amb_bp" in formulas["AMBX_bp_kurtosis"].get("intermediate_signals", {})
     assert "std" in formulas["AMBX_bp_skewness"]["formula"]
     assert "std" in formulas["AMBX_bp_kurtosis"]["formula"]
+
+
+def test_all_s03_window_features_have_deploy_formulas():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+
+    features = list(s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs).keys())
+
+    formulas = s08.build_selected_feature_formulas(features)
+
+    assert "G_consensus_AC_MAD_range" in formulas
+    assert len(formulas) == len(features)
+
+
+def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    acc = np.column_stack([
+        0.01 * np.sin(2 * np.pi * 1.0 * t),
+        0.02 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
+    ])
+    selected = list(s03.extract_window_features(ppg, fs=fs, acc_window=acc).keys())
+
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "clip_bounds": {},
+            "threshold": 0.37,
+            "meta": {
+                "fs_ppg": float(fs),
+                "win_sec": 5.0,
+                "step_sec": 1.0,
+                "use_stage2_ir": False,
+            },
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+
+    out_path = s08.export_feature_extractor_script(str(tmp_path))
+    py_compile.compile(str(out_path), doraise=True)
+    spec = importlib.util.spec_from_file_location("deploy_feature_extractor_all_features", out_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    vector = module.extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=float(fs))
+
+    assert "G_consensus_AC_MAD_range" in module.FEATURE_ORDER
+    # IR features are stripped when use_stage2_ir=false (bundle meta default)
+    _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
+                    "corr_IR_", "log_IR_", "ACC_IR_")
+    _ir_stripped_count = len([f for f in selected
+                              if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)])
+    assert len(module.FEATURE_ORDER) == _ir_stripped_count
+    assert len(vector) == _ir_stripped_count
 
 
 def test_rendered_deploy_feature_extractor_is_project_source_independent():
@@ -135,7 +205,7 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     assert "sys.path" not in script
 
 
-def test_export_feature_extractor_preserves_ir_feature_order_when_stage2_ir_disabled(tmp_path):
+def test_export_feature_extractor_strips_ir_features_when_stage2_ir_disabled(tmp_path):
     selected = [
         "GREEN_CORR",
         "IRX_bp_skewness",
@@ -155,12 +225,12 @@ def test_export_feature_extractor_preserves_ir_feature_order_when_stage2_ir_disa
     script = Path(out_path).read_text(encoding="utf-8")
 
     assert '"GREEN_CORR"' in script
-    assert '"IRX_bp_skewness"' in script
+    assert '"IRX_bp_skewness"' not in script  # IR stripped when use_stage2_ir=false
     assert '"AMBX_bp_skewness"' in script
 
 
 def test_deploy_feature_extractor_applies_stage2_ir_policy_when_disabled(tmp_path):
-    selected = ["IR_mean"]
+    selected = ["GREEN_AC", "AMB_AC"]
     joblib.dump(
         {
             "feature_names": selected,

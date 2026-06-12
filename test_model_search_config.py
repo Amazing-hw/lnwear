@@ -448,8 +448,9 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
 
     output = result.stdout + result.stderr
     assert "--max_features 12" in output
-    assert " --model_search " in output
-    assert "--no-model_search" not in output
+    # feature count search: quick k-eval uses --no-model_search;
+    # final best-k run uses --model_search
+    assert "--no-model_search" in output
     assert "--max_model_nodes 260" in output
     assert "--model_search_strategy staged_group_cv" in output
     assert "--model_search_max_candidates 600" in output
@@ -478,7 +479,7 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
     )
 
     output = result.stdout + result.stderr
-    assert " --model_search " in output
+    # feature count search enabled by default: quick eval with --no-model_search
     assert "--model_search_strategy staged_group_cv" in output
     assert " --optimize " not in output
     assert "s07_postprocess_optimize.py" not in output

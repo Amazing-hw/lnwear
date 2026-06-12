@@ -340,7 +340,7 @@ GROUP_LIMITS_DEFAULT = {
     "green_stats": 2,
     "ambient_stats": 1,
     "green_spatial": 2,
-    "green_3ch_consistency": 1,
+    "green_3ch_consistency": 2,
     "ir_g_amplitude": 1,
     "ir_g_correlation": 1,
     "amb_cross": 1,
@@ -348,8 +348,8 @@ GROUP_LIMITS_DEFAULT = {
     "frequency": 2,
     "spatial_coupling": 1,
     "signal_complexity": 2,
-    "waveform_morphology": 2,
-    "acc_features": 2,
+    "waveform_morphology": 3,
+    "acc_features": 1,
     "acc_per_axis": 1,
     "acc_tremor": 1,
     "acc_orientation": 1,
@@ -1785,6 +1785,16 @@ def main(args=None):
     df_valid = pd.read_csv(os.path.join(args.artifact_dir, "feature_pool_valid.csv"))
 
     feature_cols = get_feature_cols(df_train)
+
+    # 默认 IR 不参与 Stage2（use_stage2_ir=false），剔除 IR 相关特征避免噪声
+    _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
+                    "corr_IR_", "log_IR_", "ACC_IR_")
+    _before = len(feature_cols)
+    feature_cols = [f for f in feature_cols
+                    if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)]
+    _dropped = _before - len(feature_cols)
+    if _dropped > 0:
+        print(f"[s04 IR strip] 从候选池移除 {_dropped} 个 IR 特征 (保留 {len(feature_cols)} 个)")
 
     print_s04_workload_estimate(df_train, df_valid, feature_cols, args)
 

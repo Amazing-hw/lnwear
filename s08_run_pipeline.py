@@ -29,6 +29,14 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
 
 如果 --stop_after 直接指向 s07_post/s09_cmp/s10_audit，脚本会视为显式请求并自动打开对应可选步骤。
 
+Preflight gates before a real-data run:
+    python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py s10_generalization_audit.py
+    python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp .pytest_tmp_deploy_guard
+
+Do not pass an empty string to --model_search_feature_counts. For a fixed feature
+count, pass one explicit value, for example:
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --max_features 15 --model_search_feature_counts 15
+
 用法:
     # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/s10 审计/商用对比）
     python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
@@ -64,10 +72,15 @@ import argparse
 import glob
 import os
 import json
+import logging
+import re
 import subprocess
+import sys
+import time
 import joblib
 import ast
 import importlib.util
+from datetime import timedelta
 
 
 THREAD_ENV_DEFAULTS = {
@@ -452,6 +465,19 @@ def export_feature_extractor_script(artifact_dir):
     bundle = joblib.load(bp)
     selected = list(bundle["feature_names"])
     meta = bundle.get("meta", {}) or {}
+    use_stage2_ir = bool(meta.get("use_stage2_ir", False))
+
+    # 若 use_stage2_ir=false，剔除 IR 相关特征（训练时 IR 已置零，部署不应计算）
+    if not use_stage2_ir:
+        _IR_PREFIXES = ("IR_", "IRX_", "GREEN_IR_", "IR_AMB_", "IR_over_",
+                        "corr_IR_", "log_IR_", "ACC_IR_")
+        _before = len(selected)
+        selected = [f for f in selected
+                    if not any(f.startswith(p) or f == p.rstrip("_") for p in _IR_PREFIXES)]
+        _dropped = _before - len(selected)
+        if _dropped > 0:
+            print(f"[IR strip] use_stage2_ir=false, 从部署脚本中移除 {_dropped} 个 IR 特征 "
+                  f"(保留 {len(selected)} 个非 IR 特征)")
 
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
@@ -809,6 +835,8 @@ def _build_full_feature_recipe(selected_features):
         "g_mean_raw": "(g1_raw + g2_raw + g3_raw) / 3.0",
         "g_mean_bp":  "(g1_bp + g2_bp + g3_bp) / 3.0",
         "g_mean_dc":  "median(g_mean_raw)",
+        "g_top2_bp":  "mean of the two green channels with highest AC RMS",
+        "g_top2_raw": "raw-clean mean of the same two green channels",
         "acc_mag":    "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
         "acc_mag_bp": "bandpass(acc_mag - mean(acc_mag), 0.5Hz, 5.0Hz, 4th_order, fs=25)",
         "acc_x":      "acc[:, 0]",
@@ -1112,10 +1140,153 @@ def _build_full_feature_recipe(selected_features):
         "ACC_LOW_MOTION_RATIO":  {"depends": ["acc_mag"], "formula": "sum(rfft^2 over 0.5-3Hz) / sum(rfft^2)"},
     }
 
+    def _single_channel_feature_info(prefix, base):
+        raw = f"{prefix.lower()}_raw"
+        bp = f"{prefix.lower()}_bp"
+        dc = f"{prefix.lower()}_dc"
+        formulas = {
+            "DC_MEDIAN": {"depends": [raw], "formula": f"median({raw})"},
+            "DC_IQR": {"depends": [raw], "formula": f"robust_iqr({raw})"},
+            "AC_RMS": {"depends": [bp], "formula": f"sqrt(mean({bp}^2))"},
+            "AC_MAD": {"depends": [bp], "formula": f"robust_mad({bp})"},
+            "AC_DC_RATIO": {"depends": [bp, dc], "formula": f"safe_div(sqrt(mean({bp}^2)), |{dc}|)"},
+            "DERIV_MAD": {"depends": [bp], "formula": f"robust_mad(diff({bp}))"},
+            "FFT_PEAK_MEDIAN_RATIO": {"depends": [bp], "formula": f"fft_peak_features({bp}, fs, 0.5, 5.0)[0]"},
+            "DOM_FREQ": {"depends": [bp], "formula": f"fft_peak_features({bp}, fs, 0.5, 5.0)[1]"},
+            "AUTO_CORR_PEAK": {"depends": [bp], "formula": f"autocorr_peak_lag({bp}, fs, 40, 180)[0]"},
+            "AUTO_CORR_LAG_SEC": {"depends": [bp], "formula": f"autocorr_peak_lag({bp}, fs, 40, 180)[1]"},
+        }
+        return formulas.get(base)
+
+    def _consensus_feature_info(base, stat):
+        values = [f"G1_{base}", f"G2_{base}", f"G3_{base}"]
+        arr = f"[{values[0]}, {values[1]}, {values[2]}]"
+        formulas = {
+            "min": f"min({arr})",
+            "max": f"max({arr})",
+            "range": f"max({arr}) - min({arr})",
+            "cv": f"std({arr}) / (mean(abs({arr})) + 1e-12)",
+            "top2_mean": f"mean(largest_two({arr}))",
+        }
+        if stat not in formulas:
+            return None
+        return {
+            "depends": values,
+            "formula": formulas[stat],
+        }
+
+    def _infer_feature_info(name):
+        for prefix in ("G1", "G2", "G3"):
+            marker = f"{prefix}_"
+            if name.startswith(marker):
+                inferred = _single_channel_feature_info(prefix, name[len(marker):])
+                if inferred is not None:
+                    return inferred
+
+        if name.startswith("G_consensus_"):
+            suffix = name[len("G_consensus_"):]
+            for stat in ("top2_mean", "range", "min", "max", "cv"):
+                stat_suffix = f"_{stat}"
+                if suffix.endswith(stat_suffix):
+                    base = suffix[:-len(stat_suffix)]
+                    return _consensus_feature_info(base, stat)
+
+        fixed = {
+            "G_TOP2_CHANNEL_COUNT": {
+                "depends": ["g1_bp", "g2_bp", "g3_bp"],
+                "formula": "count(two green channels with highest AC RMS)",
+            },
+            "G_TOP2_WORST_IDX": {
+                "depends": ["g1_bp", "g2_bp", "g3_bp"],
+                "formula": "argmin([sqrt(mean(g1_bp^2)), sqrt(mean(g2_bp^2)), sqrt(mean(g3_bp^2))])",
+            },
+            "G_DROPOUT_COUNT": {
+                "depends": ["g1_bp", "g2_bp", "g3_bp"],
+                "formula": "count(channel_ac_rms < 0.05 * max(channel_ac_rms))",
+            },
+            "G_MIN_CHANNEL_ID": {
+                "depends": ["g1_bp", "g2_bp", "g3_bp"],
+                "formula": "argmin(channel_ac_rms)",
+            },
+            "G_DROPOUT_ANGLE": {
+                "depends": ["g1_bp", "g2_bp", "g3_bp"],
+                "formula": "degrees(atan2((sqrt(3)/2)*(ac2-ac3), ac1-0.5*ac2-0.5*ac3))",
+            },
+            "GREEN_SAT_FRAC": {
+                "depends": ["g_mean_raw"],
+                "formula": "mean(g_mean_raw >= 0.98 * max(g_mean_raw))",
+            },
+            "GREEN_CLIP_RATE": {
+                "depends": ["g_mean_raw"],
+                "formula": "mean(abs(diff(g_mean_raw)) < 1e-10)",
+            },
+            "IR_SAT_FRAC": {
+                "depends": ["ir_raw"],
+                "formula": "mean(ir_raw >= 0.98 * max(ir_raw))",
+            },
+            "IR_CLIP_RATE": {
+                "depends": ["ir_raw"],
+                "formula": "mean(abs(diff(ir_raw)) < 1e-10)",
+            },
+            "TOTAL_INVALID_COUNT": {
+                "depends": [],
+                "formula": "count(all feature values that are None/NaN/inf before s03 zero-fill)",
+            },
+            "PPG_INVALID_COUNT": {
+                "depends": [],
+                "formula": "count(PPG-related feature values that are None/NaN/inf before s03 zero-fill)",
+            },
+            "GREEN_INVALID_COUNT": {
+                "depends": [],
+                "formula": "count(green-related feature values that are None/NaN/inf before s03 zero-fill)",
+            },
+            "GTOP2_Hjorth_Activity": {
+                "depends": ["g_top2_bp"],
+                "formula": "var(g_top2_bp)",
+            },
+            "GTOP2_Hjorth_Mobility": {
+                "depends": ["g_top2_bp"],
+                "formula": "sqrt(var(diff(g_top2_bp)) / var(g_top2_bp))",
+            },
+            "GTOP2_Hjorth_Complexity": {
+                "depends": ["g_top2_bp"],
+                "formula": "sqrt(var(diff2(g_top2_bp)) / var(diff(g_top2_bp)))",
+            },
+            "GTOP2_Deriv_d1_mean": {"depends": ["g_top2_bp"], "formula": "mean(diff(g_top2_bp))"},
+            "GTOP2_Deriv_d1_std": {"depends": ["g_top2_bp"], "formula": "std(diff(g_top2_bp))"},
+            "GTOP2_Deriv_d1_max": {"depends": ["g_top2_bp"], "formula": "max(diff(g_top2_bp))"},
+            "GTOP2_Deriv_d1_min": {"depends": ["g_top2_bp"], "formula": "min(diff(g_top2_bp))"},
+            "GTOP2_Deriv_d1_zcr": {
+                "depends": ["g_top2_bp"],
+                "formula": "sum(abs(diff(sign(diff(g_top2_bp))))) / (2 * len(diff(g_top2_bp)))",
+            },
+            "GTOP2_Temporal_slope_mean": {
+                "depends": ["g_top2_bp"],
+                "formula": "linear_regression(g_top2_bp ~ arange(N)): slope",
+            },
+            "GTOP2_Temporal_slope_std": {
+                "depends": ["g_top2_bp"],
+                "formula": "std(residuals after linear detrend of g_top2_bp)",
+            },
+            "GTOP2_Temporal_peak_prominence": {
+                "depends": ["g_top2_bp"],
+                "formula": "mean(find_peaks(g_top2_bp, prominence>0).prominences)",
+            },
+            "GTOP2_Temporal_peak_ratio": {
+                "depends": ["g_top2_bp"],
+                "formula": "len(peaks in g_top2_bp) / len(g_top2_bp)",
+            },
+            "GTOP2_Temporal_valley_ratio": {
+                "depends": ["g_top2_bp"],
+                "formula": "len(peaks in -g_top2_bp) / len(g_top2_bp)",
+            },
+        }
+        return fixed.get(name)
+
     # ---- 为每个入选特征组装完整配方 ----
     recipe = {}
     for f in selected_features:
-        info = FEATURE_FULL.get(f)
+        info = FEATURE_FULL.get(f) or _infer_feature_info(f)
         if info is None:
             recipe[f] = {"formula": "[未匹配]"}
             continue
@@ -1495,8 +1666,8 @@ def main():
                    help="number of stage-1 structure candidates advanced to stage-2 refine")
     p.add_argument("--model_search_stage2_top_k", type=int, default=80,
                    help="number of stage-A candidates kept for s05 staged_group_cv")
-    p.add_argument("--model_search_feature_counts", type=str, default="10,12,15,18,20",
-                   help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。留空则用 --max_features")
+    p.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
+                   help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。固定特征数时传单个值，如 --max_features 15 --model_search_feature_counts 15")
     p.add_argument("--model_search_cv_folds", type=int, default=3,
                    help="s05 staged_group_cv folds")
     p.add_argument("--model_search_cv_repeats", type=int, default=2,
@@ -1505,7 +1676,7 @@ def main():
                    help="s05 model-search sampling/CV seed")
     p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60",
                    help="comma-separated s05 n_estimators candidates")
-    p.add_argument("--model_search_max_depth", default="2,3,4",
+    p.add_argument("--model_search_max_depth", default="2,3,4,5",
                    help="comma-separated s05 max_depth candidates")
     p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10",
                    help="comma-separated s05 learning_rate candidates")
@@ -1945,7 +2116,47 @@ def main():
                 break
             continue
 
-        ok = _run(display_name, cmd, dry_run=args.dry_run)
+        # 特征数量搜参：先快速评估各 k（无 model_search），再对最优 k 做完整搜参
+        if key == "s05" and args.model_search_feature_counts:
+            _counts = [int(x.strip()) for x in args.model_search_feature_counts.split(",") if x.strip()]
+            _counts = sorted(set(_counts))
+            if len(_counts) > 1:
+                print(f"\n[特征数量搜参] 快速评估 k = {_counts}（使用默认参数，无 model_search）")
+                _best_k, _best_acc = None, -1.0
+                # 构建无 model_search 的命令模板
+                _cmd_no_search = cmd.replace(" --model_search ", " --no-model_search ")
+                for _k in _counts:
+                    _cmd_k = re.sub(r' --max_features \d+', f' --max_features {_k}', _cmd_no_search)
+                    _cmd_k = re.sub(r'--model_search_feature_counts "[^"]*"',
+                                    f'--model_search_feature_counts "{_k}"', _cmd_k)
+                    print(f"\n  --- k={_k} ---")
+                    _ok = _run(f'{display_name} (k={_k}, quick)', _cmd_k, dry_run=args.dry_run)
+                    if not _ok:
+                        continue
+                    # 读取 CV 结果判断最优 k
+                    _rec_path = os.path.join(args.artifact_dir, 'model_search_records.json')
+                    if os.path.exists(_rec_path):
+                        try:
+                            with open(_rec_path, 'r') as _rf:
+                                _records = json.load(_rf)
+                            if _records:
+                                _acc = _records[0].get('mean_cv_accuracy', 0.0)
+                                if _acc > _best_acc:
+                                    _best_k, _best_acc = _k, _acc
+                        except Exception:
+                            pass
+                if _best_k is not None and _best_k != _counts[-1]:
+                    print(f"\n[特征数量搜参] 最优 k={_best_k} (acc={_best_acc:.4f})，完整搜参")
+                    _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_best_k}', cmd)
+                    _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
+                                       f'--model_search_feature_counts "{_best_k}"', _cmd_best)
+                    ok = _run(f'{display_name} (k={_best_k}, full search)', _cmd_best, dry_run=args.dry_run)
+                else:
+                    ok = True  # 最后一个 k 已最优
+            else:
+                ok = _run(display_name, cmd, dry_run=args.dry_run)
+        else:
+            ok = _run(display_name, cmd, dry_run=args.dry_run)
         results[key] = ok
         if ok:
             completed_keys.add(key)

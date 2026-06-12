@@ -62,7 +62,7 @@ MODEL_SEARCH_PARAM_KEYS = [
 
 DEFAULT_MODEL_SEARCH_SPACE = {
     "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60],
-    "max_depth": [2, 3, 4],
+    "max_depth": [2, 3, 4, 5],
     "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
     "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
     "reg_lambda": [5, 8, 10, 12, 16, 20, 30],
@@ -1600,7 +1600,7 @@ def main(args=None):
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument("--max_features", type=int, default=None,
                         help="从 ranked_features.json 取 top-k 特征；默认 None 时回退到 selected_features.json")
-    parser.add_argument("--model_search_feature_counts", type=str, default="10,12,15,18,20",
+    parser.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
                         help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。留空则使用 --max_features 固定值")
     parser.add_argument(
         "--threshold_objective", type=str, default="fbeta",
@@ -1902,7 +1902,8 @@ def main(args=None):
     #   按部署时 Stage2 输入的期望 P(target=1 | Stage1 pass) 重加权，
     #   使训练 effective 分布 ≈ 部署条件分布。
     #   公式: scale_pos_weight = r * (1 - p_train) / ((1 - r) * p_train)
-    if not _feature_counts:
+    # 单 k 或空：走正常训练流程；多 k：由下方循环处理
+    if len(_feature_counts) <= 1:
         neg_count = int(np.sum(y_train == 0))
         pos_count = int(np.sum(y_train == 1))
         n_total = max(neg_count + pos_count, 1)

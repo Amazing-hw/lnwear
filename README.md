@@ -254,7 +254,7 @@ python s08_run_pipeline.py \
 | colsample_bytree | 0.70, 0.75, 0.80, 0.85, 0.90 | 5 |
 | **总计** | | **~8.9M × 5k** |
 
-通过 `--model_search_feature_counts ""` 可禁用特征数搜参，仅用 `--max_features` 固定值。
+不要用空字符串来禁用特征数搜参；PowerShell 下空字符串参数可能会被解析成缺少参数。若希望固定特征数量，请显式传单个 k，并让它与 `--max_features` 一致，例如 `--max_features 15 --model_search_feature_counts 15`。
 
 一键流水线开启示例：
 
@@ -795,10 +795,25 @@ python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_featur
 运行测试：
 
 ```bash
-python -B -m pytest D:\wearing_liveness\new\tests .\test_model_search_config.py .\test_window_error_reports.py .\test_generalization_audit.py .\test_deploy_feature_extractor.py -q --rootdir D:\wearing_liveness\new\new_codex --basetemp .\.pytest_tmp_all -o cache_dir=.pytest_cache_all
+python -m pytest -q --basetemp .pytest_tmp_all
 ```
 
-如果直接从上级目录跑 pytest，在某些 Windows 权限环境里可能会因为默认 Temp 或 `.pytest_cache` 权限导致退出阶段异常。上面的命令把 rootdir、basetemp 和 cache_dir 都固定到当前项目目录，比较稳。
+部署公式和端到端烟测门禁：
+
+```bash
+python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp .pytest_tmp_deploy_guard
+```
+
+这组测试会检查所有 `s03` 可导出的窗口特征都有部署公式，并用合成 grouped H5 跑到 `s08 -> s06_cb`，确认部署脚本、XGBoost JSON、部署配方、golden vectors 和一致性校验都能通过。以后如果再次出现 `No deploy formula registered for selected features: ...`，应先在这组测试里失败，而不是等真实数据跑到导出阶段才发现。
+
+如果直接从上级目录跑 pytest，在某些 Windows 权限环境里可能会因为默认 Temp 或 `.pytest_cache` 权限导致退出阶段异常。上面的命令把 basetemp 固定到当前项目目录，比较稳。
+
+真实数据最终验收仍需要在数据机上运行完整默认流程并保存日志：
+
+```bash
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts > full_pipeline.log 2>&1
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --run_generalization_audit --stop_after s10_audit > generalization_audit.log 2>&1
+```
 
 ## 常见问题
 
