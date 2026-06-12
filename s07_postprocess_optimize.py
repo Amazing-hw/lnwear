@@ -316,7 +316,7 @@ def iter_param_grid():
                         for K_off in [2, 3, 4, 5]:
                             if K_on < K_off:
                                 continue
-                            for cooldown_sec in [0.0, 1.0, 2.0]:
+                            for cooldown_sec in [0.0, 1.0, 2.0, 3.0, 5.0]:
                                 yield {
                                     "ema_alpha": ema_alpha,
                                     "median_k": median_k,

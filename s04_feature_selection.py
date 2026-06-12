@@ -204,19 +204,13 @@ FEATURE_GROUPS = {
     # -- 3s/75点短窗信号质量与鲁棒性 --
     "signal_quality": [
         "SQI_FLAT_RATIO", "SQI_SPIKE_RATIO",
-        "IR_ROBUST_RANGE_RATIO", "GREEN_ROBUST_RANGE_RATIO", "AMB_ROBUST_RANGE_RATIO",
+        "GREEN_ROBUST_RANGE_RATIO", "AMB_ROBUST_RANGE_RATIO",
     ],
     "short_window_stability": [
-        "IR_SEG_ACDC_CV", "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
+        "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
     ],
     "short_window_frequency": [
-        "GREEN_BAND_ENERGY_RATIO", "IR_BAND_ENERGY_RATIO", "AMB_BAND_ENERGY_RATIO",
-    ],
-    # -- IR 通道: 原始统计(5) + 鲁棒 DC/AC(6) = 11 - limit 2 --
-    "ir_stats": [
-        "IR_mean", "IR_std", "IR_p95", "IR_diff_std", "IR_acdc",
-        "IRX_DC_MEDIAN", "IRX_DC_IQR", "IRX_AC_RMS", "IRX_AC_MAD",
-        "IRX_AC_DC_RATIO", "IRX_DERIV_MAD",
+        "GREEN_BAND_ENERGY_RATIO", "AMB_BAND_ENERGY_RATIO",
     ],
     # -- Green 单通道: 原始(4) + 鲁棒 DC/AC(6) = 10 - limit 2 --
     "green_stats": [
@@ -227,7 +221,7 @@ FEATURE_GROUPS = {
     # -- Ambient 统计(11) - limit 1 --
     "ambient_stats": [
         "Ambient_mean", "Ambient_std", "Ambient_p95",
-        "corr_Ambient_IR", "corr_Ambient_Gmean",
+        "corr_Ambient_Gmean",
         "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
         "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
     ],
@@ -245,42 +239,21 @@ FEATURE_GROUPS = {
         "G_bp_corr_mean", "G_bp_corr_min", "G_bp_corr_std",
         "G_bp_lag_std",
     ],
-    # -- IR-Green 幅度/比值关系(7) - limit 1 --
-    "ir_g_amplitude": [
-        "log_IR_Gmean_mean", "IR_over_Gmean_mean", "IR_over_Gmean_std",
-        "corr_IR_Gmean", "GREEN_IR_AC_RATIO", "GREEN_IR_DC_RATIO",
-        "GREEN_IR_ACDC_RATIO_RATIO",
-        "IR_over_Ambient_mean", "IR_over_Ambient_std",
-    ],
-    # -- IR-Green 波形相关性(4) - limit 1 --
-    "ir_g_correlation": [
-        "GREEN_IR_RAW_CORR", "GREEN_IR_BP_CORR", "GREEN_IR_ENV_CORR",
-        "GREEN_IR_MAX_XCORR",
-    ],
-    # -- Ambient 交叉泄露(8) - limit 1 --
+    # -- Ambient 交叉泄露(5) - limit 1 --
     "amb_cross": [
-        "GREEN_AMB_BP_CORR", "IR_AMB_BP_CORR",
-        "GREEN_AMB_ENV_CORR", "IR_AMB_ENV_CORR",
-        "GREEN_AMB_LEAK", "IR_AMB_LEAK",
+        "GREEN_AMB_BP_CORR",
+        "GREEN_AMB_ENV_CORR",
+        "GREEN_AMB_LEAK",
         "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
-    ],
-    # -- 环境光 Stage1 软特征(3) - limit 1 --
-    "ambient_stage1": [
-        "AMB_STAGE1_RATIO", "AMB_STAGE1_PASS", "IR_DC_LEVEL",
     ],
     # -- 周期性/频域: FFT + Autocorr + 谐波 (limit 2) --
     "frequency": [
         "GREEN_FFT_PEAK_MEDIAN_RATIO", "GREEN_DOM_FREQ",
         "GREEN_AUTO_CORR_PEAK", "GREEN_AUTO_CORR_LAG_SEC",
-        "IRX_FFT_PEAK_MEDIAN_RATIO", "IRX_DOM_FREQ",
-        "IRX_AUTO_CORR_PEAK", "IRX_AUTO_CORR_LAG_SEC",
         "AMBX_FFT_PEAK_MEDIAN_RATIO", "AMBX_DOM_FREQ",
         "AMBX_AUTO_CORR_PEAK", "AMBX_AUTO_CORR_LAG_SEC",
-        "GREEN_IR_DOM_FREQ_DIFF",
         "GREEN_FFT_peak_width_Hz", "GREEN_FFT_SNR",
         "GREEN_FFT_harmonic_ratio", "GREEN_FFT_harmonic_present",
-        "IR_FFT_SNR", "IR_FFT_harmonic_ratio",
-        "IR_FFT_harmonic_present", "IR_FFT_peak_width_Hz",
         "AMB_DOM_FREQ", "AMB_FFT_PEAK_MEDIAN_RATIO",
     ],
     # -- 空间-光强耦合(5) - limit 1 --
@@ -338,16 +311,12 @@ GROUP_LIMITS_DEFAULT = {
     "signal_quality": 2,
     "short_window_stability": 1,
     "short_window_frequency": 1,
-    "ir_stats": 2,
     "green_stats": 2,
-    "ambient_stats": 1,
+    "ambient_stats": 2,
     "green_spatial": 2,
     "green_3ch_consistency": 2,
-    "ir_g_amplitude": 1,
-    "ir_g_correlation": 1,
-    "amb_cross": 1,
-    "ambient_stage1": 1,
-    "frequency": 2,
+    "amb_cross": 2,
+    "frequency": 3,
     "spatial_coupling": 1,
     "signal_complexity": 2,
     "waveform_morphology": 3,

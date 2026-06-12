@@ -1184,7 +1184,7 @@ def _build_full_feature_recipe(selected_features):
         }
 
     def _infer_feature_info(name):
-        for prefix in ("G1", "G2", "G3"):
+        for prefix in ("G1", "G2", "G3", "GTOP2"):
             marker = f"{prefix}_"
             if name.startswith(marker):
                 inferred = _single_channel_feature_info(prefix, name[len(marker):])
@@ -1247,6 +1247,18 @@ def _build_full_feature_recipe(selected_features):
             "GREEN_INVALID_COUNT": {
                 "depends": [],
                 "formula": "count(green-related feature values that are None/NaN/inf before s03 zero-fill)",
+            },
+            "GTOP2_ROBUST_RANGE_RATIO": {
+                "depends": ["g_top2_raw"],
+                "formula": "(P95(g_top2_raw) - P5(g_top2_raw)) / (|median(g_top2_raw)| + 1e-8)",
+            },
+            "GTOP2_SEG_ACDC_CV": {
+                "depends": ["g_top2_raw"],
+                "formula": "CV of AC/DC ratios over three 1s segments of g_top2_raw",
+            },
+            "GTOP2_BAND_ENERGY_RATIO": {
+                "depends": ["g_top2_bp"],
+                "formula": "sum(FFT(g_top2_bp)^2 0.7-3Hz) / sum(FFT(g_top2_bp)^2 0.5-5Hz)",
             },
             "GTOP2_Hjorth_Activity": {
                 "depends": ["g_top2_bp"],

@@ -974,11 +974,11 @@ def finite_signal(x, fill_value=0.0):
 
 
 # =========================================================
-# 3s / 25Hz short-window robust features
+# 5s / 25Hz window robust features
 # =========================================================
 
 def robust_range_ratio(x):
-    """Short-window robust dynamic range normalized by median level."""
+    """Robust dynamic range normalized by median level."""
     x = finite_signal(x)
     if len(x) < 4:
         return 0.0
@@ -988,7 +988,7 @@ def robust_range_ratio(x):
 
 
 def segment_acdc_cv(raw, n_segments=3):
-    """CV of 1-second segment AC/DC values inside a 3-second window."""
+    """CV of segment AC/DC values (window divided into n_segments equal parts)."""
     raw = finite_signal(raw)
     if len(raw) < n_segments * 4:
         return 0.0
@@ -1840,7 +1840,6 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         'g3': compute_fft_cache(g3_bp, fs, fmin=0.5, fmax=5.0),
     }
 
-    # 3s/75-point robust deployment features: low-cost, stable on short windows.
     feat["GREEN_ROBUST_RANGE_RATIO"] = robust_range_ratio(g_mean_raw)
     feat["AMB_ROBUST_RANGE_RATIO"] = robust_range_ratio(amb_raw)
     feat["GREEN_SEG_ACDC_CV"] = segment_acdc_cv(g_mean_raw)
@@ -2164,6 +2163,15 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     #       worst channel when watch is tilted.
     #       SampEn skipped: O(N²) not worth duplicating.
     # =====================================================
+    # GTOP2 单通道基础特征 (Tier 4): DC/AC/FFT/autocorr from top-2 robust signal
+    _gtop2_dc = float(np.median(g_top2_raw))
+    _gtop2_cache = compute_fft_cache(g_top2_bp, fs, fmin=0.5, fmax=5.0)
+    feat["GTOP2_ROBUST_RANGE_RATIO"] = robust_range_ratio(g_top2_raw)
+    feat["GTOP2_SEG_ACDC_CV"] = segment_acdc_cv(g_top2_raw)
+    feat["GTOP2_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(_gtop2_cache)
+    feat.update(extract_single_channel_features(
+        g_top2_raw, g_top2_bp, _gtop2_dc, fs, "GTOP2", fft_cache=_gtop2_cache
+    ))
     feat.update(extract_hjorth_parameters(g_top2_bp, prefix="GTOP2"))
     feat.update(extract_derivative_features(g_top2_bp, fs, prefix="GTOP2"))
     feat.update(extract_temporal_dynamic_features(g_top2_bp, fs, prefix="GTOP2"))
