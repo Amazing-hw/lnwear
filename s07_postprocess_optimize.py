@@ -6,6 +6,7 @@ under FP-sensitive multi-objective scoring. No s03/s05/s06 re-run needed.
 """
 
 import argparse, json, os, time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -306,17 +307,17 @@ def metrics_satisfy_constraints(metrics, constraints):
 # =========================================================
 
 def iter_param_grid():
-    for ema_alpha in [0.15, 0.25, 0.35, 0.45, 0.6]:
-        for median_k in [1, 3, 5]:
-            for T_on in [0.55, 0.65, 0.75, 0.85]:
-                for T_off in [0.20, 0.30, 0.40, 0.50]:
+    for ema_alpha in [0.2, 0.4, 0.6]:
+        for median_k in [1, 3]:
+            for T_on in [0.55, 0.70, 0.85]:
+                for T_off in [0.20, 0.35, 0.50]:
                     if T_on <= T_off:
                         continue
-                    for K_on in [3, 4, 5, 6]:
-                        for K_off in [2, 3, 4, 5]:
+                    for K_on in [3, 5, 8]:
+                        for K_off in [2, 3, 5]:
                             if K_on < K_off:
                                 continue
-                            for cooldown_sec in [0.0, 1.0, 2.0, 3.0, 5.0]:
+                            for cooldown_sec in [0.0, 2.0, 5.0]:
                                 yield {
                                     "ema_alpha": ema_alpha,
                                     "median_k": median_k,
@@ -471,6 +472,20 @@ def load_split_caches(artifact_dir, cache_root, split):
 
 
 # =========================================================
+# Worker globals for parallel evaluation
+_WORKER_CACHES = None
+
+
+def _eval_one_param(params):
+    """Evaluate a single parameter combination on all cached samples."""
+    caches = _WORKER_CACHES
+    if caches is None:
+        raise RuntimeError("worker caches not initialized")
+    details = [run_postprocess_on_cache(c, params) for c in caches]
+    metrics = compute_dataset_metrics(details, _params_label(params))
+    return params, metrics
+
+
 # Main
 # =========================================================
 
@@ -510,23 +525,35 @@ def main():
             print(f"  skip {fn}: {e}")
     print(f"  loaded {len(caches)} {args.split} caches")
 
-    # Grid search
+    # Grid search (parallel)
     grid = list(iter_param_grid())
     print(f"Searching {len(grid)} parameter combinations...")
+    n_workers = max(1, int(args.n_workers))
     t0 = time.time()
 
+    # Module-level cache for worker access
+    import s07_postprocess_optimize as _s07
+    _s07._WORKER_CACHES = caches
+
     results = []
-    for idx, params in enumerate(grid):
-        if (idx + 1) % 500 == 0:
-            print(f"  {idx+1}/{len(grid)}...")
-        details = [run_postprocess_on_cache(c, params) for c in caches]
-        metrics = compute_dataset_metrics(details, _params_label(params))
-        constraints = {
-            "max_sample_fp_rate": args.max_sample_fp_rate,
-            "max_false_worn_event_rate": args.max_false_worn_event_rate,
-            "max_first_worn_output_p95_sec": args.max_first_worn_output_p95_sec,
-        }
-        metrics["is_valid"] = metrics_satisfy_constraints(metrics, constraints)
+    n_done = 0
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_eval_one_param, p): p for p in grid}
+        for fut in as_completed(futures):
+            n_done += 1
+            if n_done % 200 == 0:
+                print(f"  {n_done}/{len(grid)}...")
+            try:
+                params, metrics = fut.result()
+            except Exception as e:
+                print(f"  worker error: {e}")
+                continue
+            constraints = {
+                "max_sample_fp_rate": args.max_sample_fp_rate,
+                "max_false_worn_event_rate": args.max_false_worn_event_rate,
+                "max_first_worn_output_p95_sec": args.max_first_worn_output_p95_sec,
+            }
+            metrics["is_valid"] = metrics_satisfy_constraints(metrics, constraints)
         metrics["score"] = score_metrics(metrics, fp_cost=args.fp_cost)
         results.append(metrics_with_params(metrics, params))
 

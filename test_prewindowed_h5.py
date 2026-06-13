@@ -46,7 +46,7 @@ def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
 
     rows = s03._extract_rows_for_sample(
         {"sample_name": "sample_a", "h5_file": "x.h5", "target": 1},
-        dc_threshold=3.6e6,
+        dc_threshold=1.5e6,
         ac_dc_threshold=0.35,
         window_len=300,
         stride_len=100,
@@ -106,7 +106,7 @@ def test_s06_prewindowed_inference_emits_existing_windows(monkeypatch):
         base,
         normalized_ppg,
         acc=None,
-        dc_threshold=3.6e6,
+        dc_threshold=1.5e6,
         ac_dc_threshold=0.35,
         window_sec=3,
         stride_sec=1,
@@ -209,7 +209,7 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
 
     rows = s03._extract_rows_for_sample(
         sample,
-        dc_threshold=3.6e6,
+        dc_threshold=1.5e6,
         ac_dc_threshold=0.35,
         window_len=300,
         stride_len=100,
@@ -270,7 +270,7 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
 
     result = s06._infer_one_sample(
         sample,
-        dc_threshold=3.6e6,
+        dc_threshold=1.5e6,
         ac_dc_threshold=0.35,
         window_sec=3,
         stride_sec=1,

@@ -23,7 +23,7 @@ def test_s02_uses_fixed_stage1_deploy_threshold_constants():
 
     dc, acdc = s02.resolve_fixed_deploy_thresholds(args)
 
-    assert dc == 3.6e6
+    assert dc == 1.5e6
     assert acdc == 0.35
 
 

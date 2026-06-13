@@ -508,7 +508,7 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
     output = result.stdout + result.stderr
     # feature count search enabled by default: quick eval with --no-model_search
     assert "--model_search_strategy staged_group_cv" in output
-    assert "representative full model search" in output
+    assert "representative model search" in output
     assert " --model_search " in output
     assert " --optimize " not in output
     assert "s07_postprocess_optimize.py" not in output
@@ -614,7 +614,7 @@ def test_s08_hard_negative_optimize_can_stop_after_s05_before_cache_and_postproc
     output = result.stdout + result.stderr
     assert "--mine_hard_negatives" in output
     assert output.count("--mine_hard_negatives") == 1
-    assert "representative full hard-negative search" in output
+    assert "representative hard-negative search" in output
     assert "--export_window_cache" not in output
     assert "s07_postprocess_optimize.py" not in output
     assert "s10_generalization_audit.py" not in output
@@ -670,7 +670,7 @@ def test_hard_negative_oof_splits_keep_sample_groups_disjoint():
 def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
-    selected = ["f0", "f1"]
+    selected = ["GREEN_AC_RMS", "G_TOP2_CORR_MIN"]
     (artifact_dir / "selected_features.json").write_text(
         json.dumps({"selected_features": selected}),
         encoding="utf-8",
@@ -684,8 +684,8 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
             "window_index": i,
             "target": target,
             "mode": i % 2,
-            "f0": float(i),
-            "f1": float(target) + 0.05 * i,
+            "GREEN_AC_RMS": float(i),
+            "G_TOP2_CORR_MIN": float(target) + 0.05 * i,
         })
     valid_rows = []
     for i in range(8):
@@ -696,8 +696,8 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
             "window_index": i,
             "target": target,
             "mode": i % 2,
-            "f0": float(i),
-            "f1": float(target) + 0.03 * i,
+            "GREEN_AC_RMS": float(i),
+            "G_TOP2_CORR_MIN": float(target) + 0.03 * i,
         })
     pd.DataFrame(train_rows).to_csv(artifact_dir / "feature_pool_train.csv", index=False)
     pd.DataFrame(valid_rows).to_csv(artifact_dir / "feature_pool_valid.csv", index=False)

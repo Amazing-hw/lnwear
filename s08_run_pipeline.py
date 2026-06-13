@@ -88,6 +88,9 @@ import time
 import joblib
 
 from s03_extract_feature_pool import is_stage2_ir_feature
+from s04_feature_selection import (
+    summarize_deployment_feature_costs,
+)
 import ast
 import importlib.util
 from datetime import timedelta
@@ -503,6 +506,567 @@ if __name__ == "__main__":
 '''
 
 
+def _render_deployment_feature_extractor(selected_features, fill_values, clip_bounds, formulas,
+                                         window_model_threshold=0.5,
+                                         default_fs=25.0,
+                                         window_sec=5.0):
+    order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
+    fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
+    clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
+    formulas_json = json.dumps(formulas, ensure_ascii=False, indent=2)
+    threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
+    default_fs_py = repr(float(default_fs))
+    window_sec_py = repr(float(window_sec))
+
+    return f'''# -*- coding: utf-8 -*-
+"""Auto-generated deployment feature extractor for watch wearing-liveness."""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+
+import numpy as np
+
+
+FEATURE_ORDER = {order_json}
+FILL_VALUES = {fill_json}
+CLIP_BOUNDS = {clip_json}
+FEATURE_FORMULAS = {formulas_json}
+WINDOW_MODEL_THRESHOLD = {threshold_json}
+DEFAULT_FS = {default_fs_py}
+DEFAULT_WINDOW_SEC = {window_sec_py}
+EPS = 1e-12
+
+
+def _finite(x):
+    x = np.asarray(x, dtype=float).reshape(-1)
+    if x.size == 0:
+        return x
+    mask = np.isfinite(x)
+    if mask.all():
+        return x
+    fill = float(np.median(x[mask])) if mask.any() else 0.0
+    return np.where(mask, x, fill).astype(float)
+
+
+def _safe_div(a, b):
+    b = float(b)
+    return 0.0 if abs(b) < EPS else float(a) / b
+
+
+def _mad(x):
+    x = _finite(x)
+    if x.size == 0:
+        return 0.0
+    med = float(np.median(x))
+    return float(np.median(np.abs(x - med)))
+
+
+def _iqr(x):
+    x = _finite(x)
+    if x.size == 0:
+        return 0.0
+    q75, q25 = np.percentile(x, [75, 25])
+    return float(q75 - q25)
+
+
+def _moving_average(x, window):
+    x = _finite(x)
+    window = max(1, int(window))
+    if window <= 1 or x.size == 0:
+        return x.copy()
+    kernel = np.ones(window, dtype=float) / float(window)
+    return np.convolve(x, kernel, mode="same")
+
+
+def _median_filter(x, window):
+    x = _finite(x)
+    window = max(1, int(window))
+    if window <= 1 or x.size < window:
+        return x.copy()
+    half = window // 2
+    out = np.empty_like(x)
+    for i in range(x.size):
+        lo = max(0, i - half)
+        hi = min(x.size, i + half + 1)
+        out[i] = np.median(x[lo:hi])
+    return out
+
+
+def _remove_step(x, step_k=10.0):
+    x = _finite(x).copy()
+    if x.size < 2:
+        return x
+    d = np.diff(x)
+    thr = max(step_k * _mad(d), EPS)
+    for i in range(1, x.size):
+        if abs(x[i] - x[i - 1]) > thr:
+            x[i] = x[i - 1]
+    return x
+
+
+def _preprocess(x, fs):
+    x = _remove_step(x)
+    mf = max(3, int(round(0.05 * fs)))
+    if mf % 2 == 0:
+        mf += 1
+    x = _median_filter(x, mf)
+    ma = max(2, int(round(0.03 * fs)))
+    raw = _moving_average(x, ma)
+    trend = _moving_average(raw, max(5, int(round(0.6 * fs))))
+    bp = _moving_average(raw - trend, ma)
+    dc = float(np.median(raw)) if raw.size else 0.0
+    return raw, bp, dc
+
+
+def _corr(x, y):
+    x = _finite(x)
+    y = _finite(y)
+    n = min(x.size, y.size)
+    if n < 4:
+        return 0.0
+    x = x[:n] - np.mean(x[:n])
+    y = y[:n] - np.mean(y[:n])
+    sx = float(np.std(x))
+    sy = float(np.std(y))
+    if sx < EPS or sy < EPS:
+        return 0.0
+    return float(np.mean(x * y) / (sx * sy + EPS))
+
+
+def _fft_metrics(x, fs):
+    x = _finite(x)
+    if x.size < 16:
+        return 0.0, 0.0, 0.0
+    x = x - np.mean(x)
+    nfft = 1
+    while nfft < x.size:
+        nfft <<= 1
+    nfft = max(256, nfft)
+    spec = np.abs(np.fft.rfft(x * np.hamming(x.size), n=nfft))
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+    total_mask = (freqs >= 0.5) & (freqs <= 5.0)
+    band_mask = (freqs >= 0.7) & (freqs <= 3.0)
+    if not np.any(total_mask):
+        return 0.0, 0.0, 0.0
+    band_spec = spec[total_mask]
+    band_freqs = freqs[total_mask]
+    med = float(np.median(band_spec))
+    peak_idx = int(np.argmax(band_spec))
+    peak_ratio = _safe_div(float(np.max(band_spec)), med + EPS)
+    dom_freq = float(band_freqs[peak_idx])
+    total = float(np.sum(spec[total_mask] ** 2))
+    band = float(np.sum(spec[band_mask] ** 2))
+    band_ratio = _safe_div(band, total + EPS)
+    return band_ratio, peak_ratio, dom_freq
+
+
+def _single_channel(features, prefix, raw, bp, dc):
+    features[f"{{prefix}}_DC_MEDIAN"] = float(dc)
+    features[f"{{prefix}}_DC_IQR"] = _iqr(raw)
+    ac_rms = float(np.sqrt(np.mean(bp ** 2))) if len(bp) else 0.0
+    features[f"{{prefix}}_AC_RMS"] = ac_rms
+    features[f"{{prefix}}_AC_MAD"] = _mad(bp)
+    features[f"{{prefix}}_AC_DC_RATIO"] = _safe_div(ac_rms, abs(dc) + EPS)
+    features[f"{{prefix}}_DERIV_MAD"] = _mad(np.diff(bp)) if len(bp) > 1 else 0.0
+
+
+def _robust_range_ratio(x):
+    x = _finite(x)
+    if x.size < 4:
+        return 0.0
+    p95, p5 = np.percentile(x, [95, 5])
+    return _safe_div(float(p95 - p5), abs(float(np.median(x))) + EPS)
+
+
+def _seg_acdc_cv(raw):
+    raw = _finite(raw)
+    if raw.size < 12:
+        return 0.0
+    vals = []
+    seg_len = max(1, raw.size // 3)
+    for i in range(3):
+        seg = raw[i * seg_len:(i + 1) * seg_len] if i < 2 else raw[i * seg_len:]
+        if seg.size >= 4:
+            vals.append(_safe_div(_mad(np.diff(seg)), abs(float(np.median(seg))) + EPS))
+    if len(vals) < 2:
+        return 0.0
+    vals = np.asarray(vals, dtype=float)
+    return _safe_div(float(np.std(vals)), abs(float(np.mean(vals))) + EPS)
+
+
+def _acc_features(features, acc):
+    keys = [
+        "MAG_MEAN", "MAG_STD", "MAG_MAD", "AXIS_STD_SUM", "GRAVITY_DOM_RATIO",
+        "BP_RMS", "DIFF_MAD", "STILL_SCORE", "MAG_P50", "MAG_P90", "YSUM",
+        "X_MEAN", "Y_MEAN", "Z_MEAN", "X_STD", "Y_STD", "Z_STD",
+        "X_ENERGY", "Y_ENERGY", "Z_ENERGY", "AXIS_MEAN_SUM", "MAG_ENERGY",
+        "MAG_P2P", "TILT_ANGLE", "DOM_AXIS", "GRAVITY_RATIO",
+    ]
+    if acc is None:
+        for k in keys:
+            features[f"ACC_{{k}}"] = 0.0
+        return
+    acc = np.asarray(acc, dtype=float)
+    if acc.ndim == 1:
+        acc = acc.reshape(-1, 1)
+    if acc.shape[1] < 3:
+        pad = np.zeros((acc.shape[0], 3 - acc.shape[1]))
+        acc = np.hstack([acc, pad])
+    mag = np.sqrt(np.sum(acc[:, :3] ** 2, axis=1) + EPS)
+    features["ACC_MAG_MEAN"] = float(np.mean(mag))
+    features["ACC_MAG_STD"] = float(np.std(mag))
+    features["ACC_MAG_MAD"] = _mad(mag)
+    features["ACC_AXIS_STD_SUM"] = float(np.sum(np.std(acc[:, :3], axis=0)))
+    features["ACC_GRAVITY_DOM_RATIO"] = _safe_div(float(np.max(np.abs(np.mean(acc[:, :3], axis=0)))), float(np.mean(mag)) + EPS)
+    trend = _moving_average(mag, 9)
+    bp = mag - trend
+    features["ACC_BP_RMS"] = float(np.sqrt(np.mean(bp ** 2))) if len(bp) else 0.0
+    features["ACC_DIFF_MAD"] = _mad(np.diff(mag)) if len(mag) > 1 else 0.0
+    features["ACC_STILL_SCORE"] = 1.0 / (1.0 + features["ACC_DIFF_MAD"] + features["ACC_MAG_STD"])
+    features["ACC_MAG_P50"] = float(np.percentile(mag, 50))
+    features["ACC_MAG_P90"] = float(np.percentile(mag, 90))
+    features["ACC_YSUM"] = float(np.mean(mag))
+    for i, axis in enumerate(["X", "Y", "Z"]):
+        x = acc[:, i]
+        features[f"ACC_{{axis}}_MEAN"] = float(np.mean(x))
+        features[f"ACC_{{axis}}_STD"] = float(np.std(x))
+        features[f"ACC_{{axis}}_ENERGY"] = float(np.mean(x ** 2))
+    features["ACC_AXIS_MEAN_SUM"] = float(np.sum(np.abs(np.mean(acc[:, :3], axis=0))))
+    features["ACC_MAG_ENERGY"] = float(np.mean(mag ** 2))
+    features["ACC_MAG_P2P"] = float(np.max(mag) - np.min(mag))
+    mean_axis = np.mean(acc[:, :3], axis=0)
+    norm = float(np.linalg.norm(mean_axis))
+    features["ACC_TILT_ANGLE"] = float(np.degrees(np.arccos(np.clip(mean_axis[2] / (norm + EPS), -1.0, 1.0)))) if norm > EPS else 0.0
+    features["ACC_DOM_AXIS"] = float(np.argmax(np.abs(mean_axis)))
+    features["ACC_GRAVITY_RATIO"] = _safe_div(norm, float(np.mean(mag)) + EPS)
+
+
+def _derivative_features(features, x, fs, prefix):
+    x = _finite(x)
+    if len(x) < 4:
+        for k in ["Deriv_d1_mean","Deriv_d1_std","Deriv_d1_max","Deriv_d1_min","Deriv_d1_zcr"]:
+            features[f"{{prefix}}_{{k}}"] = 0.0
+        return
+    d1 = np.diff(x)
+    features[f"{{prefix}}_Deriv_d1_mean"] = float(np.mean(d1))
+    features[f"{{prefix}}_Deriv_d1_std"] = float(np.std(d1))
+    features[f"{{prefix}}_Deriv_d1_max"] = float(np.max(d1))
+    features[f"{{prefix}}_Deriv_d1_min"] = float(np.min(d1))
+    n = len(d1)
+    features[f"{{prefix}}_Deriv_d1_zcr"] = float(np.sum(np.abs(np.diff(np.sign(d1)))) / (2.0 * n)) if n > 1 else 0.0
+
+
+def _temporal_features(features, x, fs, prefix):
+    x = _finite(x); n = len(x)
+    if n < 4:
+        for k in ["Temporal_slope_mean","Temporal_slope_std","Temporal_peak_prominence","Temporal_peak_ratio"]:
+            features[f"{{prefix}}_{{k}}"] = 0.0
+        return
+    t = np.arange(n, dtype=float)
+    slope = np.polyfit(t, x, 1)[0] if n > 1 else 0.0
+    features[f"{{prefix}}_Temporal_slope_mean"] = float(slope)
+    features[f"{{prefix}}_Temporal_slope_std"] = float(np.std(x - np.polyval([slope, np.mean(x) - slope * np.mean(t)], t)))
+    threshold = float(np.mean(x)) + 0.5 * float(np.std(x))
+    above = x > threshold
+    peaks = 0
+    for i in range(1, n - 1):
+        if above[i] and x[i] > x[i - 1] and x[i] > x[i + 1]:
+            peaks += 1
+    features[f"{{prefix}}_Temporal_peak_ratio"] = float(peaks / n)
+    features[f"{{prefix}}_Temporal_peak_prominence"] = float(np.max(x) - np.median(x)) if peaks else 0.0
+
+
+def _hjorth(features, x, prefix):
+    x = _finite(x)
+    if len(x) < 2:
+        features[f"{{prefix}}_Hjorth_Activity"] = 0.0
+        features[f"{{prefix}}_Hjorth_Mobility"] = 0.0
+        return
+    activity = float(np.var(x))
+    d1 = np.diff(x)
+    var_d1 = float(np.var(d1)) if len(d1) > 1 else 0.0
+    features[f"{{prefix}}_Hjorth_Activity"] = activity
+    features[f"{{prefix}}_Hjorth_Mobility"] = float(np.sqrt(var_d1 / activity)) if activity > EPS else 0.0
+
+
+def _entropy_sampen(features, x, prefix):
+    x = _finite(x); n = len(x)
+    if n < 10:
+        features[f"{{prefix}}_Entropy_SampEn"] = 0.0; return
+    r_val = 0.2 * float(np.std(x))
+    if r_val < EPS:
+        features[f"{{prefix}}_Entropy_SampEn"] = 0.0; return
+    def _count(m):
+        c = 0
+        for i in range(n - m):
+            xi = x[i:i + m]
+            for j in range(i + 1, n - m):
+                if np.max(np.abs(xi - x[j:j + m])) <= r_val:
+                    c += 1
+        return c
+    b2 = _count(2); b3 = _count(3)
+    features[f"{{prefix}}_Entropy_SampEn"] = float(-np.log((b3 + EPS) / (b2 + EPS))) if b2 > 0 and b3 > 0 else 0.0
+
+
+def _bp_skew_kurt(features, bp, prefix):
+    bp = _finite(bp); m = float(np.mean(bp)); s = float(np.std(bp))
+    if s > EPS:
+        features[f"{{prefix}}_bp_skewness"] = float(np.mean((bp - m) ** 3) / (s ** 3))
+        features[f"{{prefix}}_bp_kurtosis"] = float(np.mean((bp - m) ** 4) / (s ** 4))
+    else:
+        features[f"{{prefix}}_bp_skewness"] = 0.0
+        features[f"{{prefix}}_bp_kurtosis"] = 0.0
+
+
+def _fft_extras(features, bp, fs, prefix):
+    bp = _finite(bp); n = len(bp)
+    if n < 16:
+        for k in ["FFT_SNR","FFT_harmonic_ratio","FFT_harmonic_present","FFT_peak_width_Hz"]:
+            features[f"{{prefix}}_{{k}}"] = 0.0
+        return
+    x = bp - np.mean(bp); nfft = 1
+    while nfft < n: nfft <<= 1
+    nfft = max(nfft, 256)
+    spec = np.abs(np.fft.rfft(x * np.hamming(n), nfft))
+    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+    band = (freqs >= 0.5) & (freqs <= 5.0)
+    bs = spec[band]; bf = freqs[band]
+    in_pow = float(np.sum(bs ** 2))
+    out_pow = float(np.sum(spec ** 2)) - in_pow
+    features[f"{{prefix}}_FFT_SNR"] = _safe_div(in_pow, out_pow + EPS)
+    if len(bs) < 2:
+        features[f"{{prefix}}_FFT_harmonic_ratio"] = 0.0
+        features[f"{{prefix}}_FFT_harmonic_present"] = 0.0
+        features[f"{{prefix}}_FFT_peak_width_Hz"] = 0.0
+    else:
+        f0_idx = int(np.argmax(bs)); f0 = bf[f0_idx]; f0_pow = float(bs[f0_idx] ** 2)
+        h2_mask = (bf >= f0 * 2 - 0.3) & (bf <= f0 * 2 + 0.3)
+        if np.any(h2_mask):
+            h2_pow = float(np.max(bs[h2_mask] ** 2))
+            features[f"{{prefix}}_FFT_harmonic_ratio"] = _safe_div(h2_pow, f0_pow + EPS)
+            features[f"{{prefix}}_FFT_harmonic_present"] = 1.0 if h2_pow > f0_pow * 0.1 else 0.0
+        else:
+            features[f"{{prefix}}_FFT_harmonic_ratio"] = 0.0
+            features[f"{{prefix}}_FFT_harmonic_present"] = 0.0
+        peak_val = np.max(bs); above_half = bs > peak_val * 0.5
+        features[f"{{prefix}}_FFT_peak_width_Hz"] = float(bf[above_half][-1] - bf[above_half][0]) if np.any(above_half) else 0.0
+
+
+def _consensus_stats(features, prefix, base_names):
+    for base in base_names:
+        vals = np.asarray([features.get(f"{{p}}_{{base}}", 0.0) for p in ["G1","G2","G3"]], dtype=float)
+        features[f"G_consensus_{{base}}_min"] = float(np.min(vals))
+        features[f"G_consensus_{{base}}_max"] = float(np.max(vals))
+        features[f"G_consensus_{{base}}_range"] = float(np.max(vals) - np.min(vals))
+        m = np.mean(np.abs(vals))
+        features[f"G_consensus_{{base}}_cv"] = float(np.std(vals) / (m + EPS))
+        sv = np.sort(vals)
+        features[f"G_consensus_{{base}}_top2_mean"] = float(np.mean(sv[-2:]))
+
+
+def _dropout_and_spatial(features, g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp, g_imbalance, vmag):
+    ch_ac = np.asarray([features.get(f"G{{i}}_AC_RMS", 0.0) for i in [1,2,3]])
+    max_ac = float(np.max(ch_ac)) if ch_ac.size else 0.0
+    features["G_DROPOUT_COUNT"] = float(np.sum(ch_ac < 0.05 * max_ac)) if max_ac > EPS else 3.0
+    features["G_MIN_CHANNEL_ID"] = float(np.argmin(ch_ac))
+    vx_d = ch_ac[0] - 0.5 * ch_ac[1] - 0.5 * ch_ac[2]
+    vy_d = (np.sqrt(3.0) / 2.0) * (ch_ac[1] - ch_ac[2])
+    features["G_DROPOUT_ANGLE"] = float(np.degrees(np.arctan2(vy_d, vx_d + EPS)))
+    features["G_TOP2_CHANNEL_COUNT"] = 2.0
+    features["G_TOP2_WORST_IDX"] = features["G_MIN_CHANNEL_ID"]
+    features["corr_Ambient_vmag"] = 0.0
+    features["corr_Gmean_G_imbalance"] = _corr(g1_raw + g2_raw + g3_raw, g_imbalance) if len(g_imbalance) else 0.0
+    features["corr_Gmean_vmag"] = _corr(g1_raw + g2_raw + g3_raw, vmag) if len(vmag) else 0.0
+    c12 = _corr(g1_bp, g2_bp); c23 = _corr(g2_bp, g3_bp); c31 = _corr(g3_bp, g1_bp)
+    cp = np.array([c12, c23, c31])
+    features["G_bp_corr_mean"] = float(np.mean(cp))
+    features["G_bp_corr_min"] = float(np.min(cp))
+    features["G_bp_corr_std"] = float(np.std(cp))
+    l12 = np.correlate(g1_bp - np.mean(g1_bp), g2_bp - np.mean(g2_bp), mode="same")
+    l23 = np.correlate(g2_bp - np.mean(g2_bp), g3_bp - np.mean(g3_bp), mode="same")
+    lag12 = int(np.argmax(np.abs(l12)) - len(l12) // 2) if len(l12) else 0
+    lag23 = int(np.argmax(np.abs(l23)) - len(l23) // 2) if len(l23) else 0
+    features["G_bp_lag_std"] = float(np.std([lag12, lag23]))
+
+
+def _clean_value(name, value):
+    if value is None or not np.isfinite(value):
+        return float(FILL_VALUES.get(name, 0.0))
+    v = float(value)
+    bound = CLIP_BOUNDS.get(name)
+    if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
+        lo, hi = float(bound[0]), float(bound[1])
+        v = min(max(v, lo), hi)
+    return v
+
+
+def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
+    features = OrderedDict()
+    ambient = _finite(ambient)
+    g1 = _finite(g1)
+    g2 = _finite(g2)
+    g3 = _finite(g3)
+    n = min(ambient.size, g1.size, g2.size, g3.size)
+    ambient, g1, g2, g3 = ambient[:n], g1[:n], g2[:n], g3[:n]
+    amb_raw, amb_bp, amb_dc = _preprocess(ambient, fs)
+    g1_raw, g1_bp, g1_dc = _preprocess(g1, fs)
+    g2_raw, g2_bp, g2_dc = _preprocess(g2, fs)
+    g3_raw, g3_bp, g3_dc = _preprocess(g3, fs)
+    g_mean_raw = (g1_raw + g2_raw + g3_raw) / 3.0
+    g_mean_bp = (g1_bp + g2_bp + g3_bp) / 3.0
+    g_mean_dc = float(np.median(g_mean_raw)) if len(g_mean_raw) else 0.0
+
+    ch_raw = [g1_raw, g2_raw, g3_raw]
+    ch_bp = [g1_bp, g2_bp, g3_bp]
+    ch_ac = np.asarray([float(np.sqrt(np.mean((x - np.median(x)) ** 2))) for x in ch_raw])
+    top2_idx = np.argsort(ch_ac)[-2:]
+    g_top2_raw = np.mean([ch_raw[int(i)] for i in top2_idx], axis=0)
+    g_top2_bp = np.mean([ch_bp[int(i)] for i in top2_idx], axis=0)
+    g_top2_dc = float(np.median(g_top2_raw)) if len(g_top2_raw) else 0.0
+
+    features["SQI_FLAT_RATIO"] = 0.5 * (
+        float(np.mean(np.abs(np.diff(amb_raw)) <= 1e-6)) if len(amb_raw) > 1 else 1.0
+    ) + 0.5 * (
+        float(np.mean(np.abs(np.diff(g_mean_raw)) <= 1e-6)) if len(g_mean_raw) > 1 else 1.0
+    )
+    features["SQI_SPIKE_RATIO"] = 0.0
+    features["GREEN_ROBUST_RANGE_RATIO"] = _robust_range_ratio(g_mean_raw)
+    features["AMB_ROBUST_RANGE_RATIO"] = _robust_range_ratio(amb_raw)
+    features["GREEN_SEG_ACDC_CV"] = _seg_acdc_cv(g_mean_raw)
+    features["AMB_SEG_ACDC_CV"] = _seg_acdc_cv(amb_raw)
+    features["G_mean_mean"] = float(np.mean(g_mean_raw))
+    features["G_mean_std"] = float(np.std(g_mean_raw))
+    features["G_mean_diff_std"] = float(np.std(np.diff(g_mean_raw))) if len(g_mean_raw) > 1 else 0.0
+    g_ac_rms = float(np.sqrt(np.mean(g_mean_bp ** 2))) if len(g_mean_bp) else 0.0
+    features["G_mean_acdc"] = _safe_div(g_ac_rms, abs(g_mean_dc) + EPS)
+    features["Ambient_mean"] = float(np.mean(amb_raw))
+    features["Ambient_std"] = float(np.std(amb_raw))
+    features["Ambient_p95"] = float(np.percentile(amb_raw, 95))
+    features["corr_Ambient_Gmean"] = _corr(amb_raw, g_mean_raw)
+    _single_channel(features, "GREEN", g_mean_raw, g_mean_bp, g_mean_dc)
+    _single_channel(features, "AMBX", amb_raw, amb_bp, amb_dc)
+    _single_channel(features, "GTOP2", g_top2_raw, g_top2_bp, g_top2_dc)
+    features["GTOP2_ROBUST_RANGE_RATIO"] = _robust_range_ratio(g_top2_raw)
+    features["GTOP2_SEG_ACDC_CV"] = _seg_acdc_cv(g_top2_raw)
+    features["GREEN_AC"] = 0.5 * g_ac_rms + 0.5 * _mad(g_mean_bp) * 1.4826
+    features["AMB_AC"] = 0.5 * float(np.sqrt(np.mean(amb_bp ** 2))) + 0.5 * _mad(amb_bp) * 1.4826
+    features["GREEN_DC"] = g_mean_dc
+    features["AMB_DC"] = float(np.median(ambient)) if len(ambient) else 0.0
+    features["GREEN_CORR"] = _corr(g_mean_bp, _moving_average(g_mean_bp, max(2, int(round(0.15 * fs)))))
+    features["GREEN_AMB_BP_CORR"] = _corr(g_mean_bp, amb_bp)
+    features["GREEN_AMB_ENV_CORR"] = _corr(np.abs(g_mean_bp), np.abs(amb_bp))
+    features["GREEN_AMB_LEAK"] = abs(features["GREEN_AMB_BP_CORR"]) * _safe_div(float(np.sqrt(np.mean(amb_bp ** 2))), g_ac_rms + EPS)
+    features["AMB_AC_TO_GREEN_AC"] = _safe_div(float(np.sqrt(np.mean(amb_bp ** 2))), g_ac_rms + EPS)
+    features["AMB_DC_TO_GREEN_DC"] = _safe_div(float(np.median(amb_raw)), abs(g_mean_dc) + EPS)
+
+    g_stack = np.vstack(ch_raw)
+    g_spatial_mean = np.mean(g_stack, axis=0)
+    g_imbalance = np.std(g_stack, axis=0) / (np.abs(g_spatial_mean) + 1e-8)
+    g_range_norm = (np.max(g_stack, axis=0) - np.min(g_stack, axis=0)) / (np.sum(np.abs(g_stack), axis=0) + 1e-8)
+    vx = g1_raw - 0.5 * g2_raw - 0.5 * g3_raw
+    vy = (np.sqrt(3.0) / 2.0) * (g2_raw - g3_raw)
+    vmag = np.sqrt(vx ** 2 + vy ** 2) / (np.sum(np.abs(g_stack), axis=0) + 1e-8)
+    features["G_imbalance_mean"] = float(np.mean(g_imbalance))
+    features["G_imbalance_p90"] = float(np.percentile(g_imbalance, 90))
+    features["G_imbalance_iqr"] = _iqr(g_imbalance)
+    features["G_rangeNorm_mean"] = float(np.mean(g_range_norm))
+    features["G_rangeNorm_p90"] = float(np.percentile(g_range_norm, 90))
+    features["G_spatial_vmag_mean"] = float(np.mean(vmag))
+    features["G_spatial_vmag_p90"] = float(np.percentile(vmag, 90))
+    features["G_spatial_vmag_iqr"] = _iqr(vmag)
+    features["G_spatial_vmag_std"] = float(np.std(vmag))
+    dc_vals = np.asarray([g1_dc, g2_dc, g3_dc], dtype=float)
+    features["G_ch_dc_cv"] = _safe_div(float(np.std(dc_vals)), abs(float(np.mean(dc_vals))) + EPS)
+    features["G_ch_dc_max_min_ratio"] = _safe_div(float(np.max(np.abs(dc_vals))), float(np.min(np.abs(dc_vals))) + EPS)
+    features["GCH_DC_RANGE_RATIO"] = _safe_div(float(np.max(dc_vals) - np.min(dc_vals)), abs(float(np.mean(dc_vals))) + EPS)
+    features["GCH_AC_RANGE_RATIO"] = _safe_div(float(np.max(ch_ac) - np.min(ch_ac)), abs(float(np.mean(ch_ac))) + EPS)
+    max_ac = float(np.max(ch_ac)) if ch_ac.size else 0.0
+    if max_ac <= EPS:
+        features["G_2OF3_AC_SUPPORT"] = 0.0
+        features["G_TOP2_TO_ALL_AC_RATIO"] = 0.0
+        features["G_TOP2_CORR_MIN"] = 0.0
+        features["G_WEAK_CHANNEL_GAP"] = 0.0
+        features["G_SPATIAL_STABILITY_SCORE"] = 0.0
+    else:
+        top2_ac = ch_ac[top2_idx]
+        top2_corr = _corr(ch_bp[int(top2_idx[0])], ch_bp[int(top2_idx[1])])
+        top2_mean = float(np.mean(top2_ac))
+        features["G_2OF3_AC_SUPPORT"] = float(np.sum(ch_ac >= 0.5 * max_ac) / 3.0)
+        features["G_TOP2_TO_ALL_AC_RATIO"] = _safe_div(float(np.sum(top2_ac)), float(np.sum(ch_ac)) + EPS)
+        features["G_TOP2_CORR_MIN"] = float(top2_corr)
+        features["G_WEAK_CHANNEL_GAP"] = max(0.0, _safe_div(top2_mean - float(np.min(ch_ac)), top2_mean + EPS))
+        features["G_SPATIAL_STABILITY_SCORE"] = features["G_2OF3_AC_SUPPORT"] * max(0.0, top2_corr) / (1.0 + float(np.mean(vmag)))
+
+    band, peak, dom = _fft_metrics(g_top2_bp, fs)
+    features["GTOP2_BAND_ENERGY_RATIO"] = band
+    features["GTOP2_FFT_PEAK_MEDIAN_RATIO"] = peak
+    features["GTOP2_DOM_FREQ"] = dom
+
+    # Waveform features: derivative, temporal, Hjorth, entropy
+    for _pfx, _sig in [("GREEN", g_mean_bp), ("GTOP2", g_top2_bp), ("AMBX", amb_bp)]:
+        _derivative_features(features, _sig, fs, _pfx)
+        _temporal_features(features, _sig, fs, _pfx)
+    for _pfx, _sig in [("GREEN", g_mean_bp), ("GTOP2", g_top2_bp)]:
+        _hjorth(features, _sig, _pfx)
+    _entropy_sampen(features, g_mean_bp, "GREEN")
+    _bp_skew_kurt(features, g_mean_bp, "GREEN")
+    _bp_skew_kurt(features, amb_bp, "AMBX")
+    _fft_extras(features, g_mean_bp, fs, "GREEN")
+    band_a, peak_a, dom_a = _fft_metrics(amb_bp, fs)
+    features["AMB_BAND_ENERGY_RATIO"] = band_a
+    features["AMB_FFT_PEAK_MEDIAN_RATIO"] = peak_a
+    features["AMB_DOM_FREQ"] = dom_a
+    band_g, peak_g, dom_g = _fft_metrics(g_mean_bp, fs)
+    features["GREEN_BAND_ENERGY_RATIO"] = band_g
+    features["FFT_PEAK_MEDIAN_RATIO"] = peak_g
+    features["GREEN_XCORR"] = _corr(g_mean_bp, np.roll(g_mean_bp, 1))
+    features["GREEN_SAT_FRAC"] = float(np.mean(g_mean_raw >= 0.98 * np.max(g_mean_raw))) if len(g_mean_raw) else 0.0
+    features["GREEN_CLIP_RATE"] = float(np.mean(np.abs(np.diff(g_mean_raw)) < 1e-10)) if len(g_mean_raw) > 1 else 0.0
+
+    # Per-channel single features for G1/G2/G3
+    for _i, (_pfx, _r, _b, _d) in enumerate([
+        ("G1", g1_raw, g1_bp, g1_dc), ("G2", g2_raw, g2_bp, g2_dc), ("G3", g3_raw, g3_bp, g3_dc)]):
+        _single_channel(features, _pfx, _r, _b, _d)
+
+    # Consensus statistics across G1/G2/G3
+    _consensus_stats(features, "G", [
+        "DC_MEDIAN","AC_RMS","AC_MAD","AC_DC_RATIO","DERIV_MAD",
+        "FFT_PEAK_MEDIAN_RATIO","AUTO_CORR_PEAK",
+    ])
+
+    # Dropout + spatial correlation features
+    _dropout_and_spatial(features, g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp, g_imbalance, vmag)
+
+    _acc_features(features, acc)
+    features["ACC_GREEN_BP_CORR"] = _corr(
+        np.sqrt(np.sum(np.asarray(acc, dtype=float)[:, :3] ** 2, axis=1)) if acc is not None and len(acc) else [],
+        g_top2_bp,
+    )
+    features["ACC_ENERGY_TO_GREEN_AC"] = _safe_div(features.get("ACC_MAG_ENERGY", 0.0), float(np.sqrt(np.mean(g_top2_bp ** 2))) + EPS)
+    features["SIG_LEN"] = float(n)
+    features["SIG_SEC"] = float(n / fs) if fs else 0.0
+    features["mode"] = float(mode)
+    features["TOTAL_INVALID_COUNT"] = 0.0
+    features["PPG_INVALID_COUNT"] = 0.0
+    features["GREEN_INVALID_COUNT"] = 0.0
+
+    missing = [name for name in FEATURE_ORDER if name not in features]
+    if missing:
+        raise KeyError("Selected deployment features missing from deploy extractor: " + ", ".join(missing))
+    return {{name: _clean_value(name, features[name]) for name in FEATURE_ORDER}}
+
+
+def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
+    feature_dict = extract_feature_dict(ir, ambient, g1, g2, g3, acc=acc, fs=fs, mode=mode)
+    return [feature_dict[name] for name in FEATURE_ORDER]
+
+
+def classify_probability(probability):
+    return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
+'''
+
+
 def export_feature_extractor_script(artifact_dir):
     """Export a compact extractor for the actual selected deployment features."""
     bp = os.path.join(artifact_dir, "model_bundle.pkl")
@@ -525,14 +1089,12 @@ def export_feature_extractor_script(artifact_dir):
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
     formulas = build_selected_feature_formulas(selected)
-    script_text = _render_selected_feature_extractor(
+    script_text = _render_deployment_feature_extractor(
         selected,
         fill_values,
         clip_bounds,
         formulas,
-        scripts_dir=SCRIPTS_DIR,
         window_model_threshold=float(bundle.get("threshold", 0.5)),
-        use_stage2_ir=bool(meta.get("use_stage2_ir", False)),
         default_fs=float(meta.get("fs_ppg", 25.0)),
         window_sec=float(meta.get("win_sec", 5.0)),
     )
@@ -1415,6 +1977,7 @@ def export_deploy_cookbook(artifact_dir):
     fill_values = bundle["fill_values"]
     clip_bounds = bundle.get("clip_bounds", {})
     threshold = float(bundle["threshold"])
+    meta = bundle.get("meta", {}) or {}
     model = bundle["model"]
     raw = bundle.get("raw_model", model)
     booster = raw.get_booster()
@@ -1428,6 +1991,14 @@ def export_deploy_cookbook(artifact_dir):
         "_title": "手表佩戴活体检测 — 部署配方 (Deployment Cookbook)",
         "_for": "嵌入式/工程化部署工程师。本文件自包含，无需查任何其他文件。",
         "_input": "25Hz PPG窗口 (125 samples x N_ch) + ACC窗口 (125 samples x 3)",
+        "A_deployment_operator_budget": {
+            "feature_set": "deployment_friendly",
+            "selected_feature_cost_summary": summarize_deployment_feature_costs(selected),
+            "operator_notes": (
+                "Stage2 uses scalar statistics, ratio/MAD/IQR features, simple correlations, "
+                "and a fixed green-top2 FFT source for deployment-friendly implementation."
+            ),
+        },
 
         # ---- Section A: 公共计算（所有特征共用） ----
         "A_channel_extraction": {
@@ -2270,16 +2841,16 @@ def main():
                     _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
                                        f'--model_search_feature_counts "{_dry_k}"', _cmd_best)
                     _label = (
-                        f'{display_name} (representative full hard-negative search)'
+                        f'{display_name} (representative hard-negative search)'
                         if args.hard_negative_optimize
-                        else f'{display_name} (representative full model search)'
+                        else f'{display_name} (representative model search)'
                     )
                     ok = _run(_label, _cmd_best, dry_run=True)
                 else:
                     print(
                         "\n[FAIL] feature-count quick search finished, but no quick "
                         "accuracy was found in final_model_config.json; refusing to "
-                        "skip the required full model search."
+                        "skip the required representative model search."
                     )
                     ok = False
             else:

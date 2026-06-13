@@ -331,6 +331,114 @@ GROUP_LIMITS_DEFAULT = {
     "other": 2,
 }
 
+DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
+    # Signal quality and robust scalar features.
+    "SQI_FLAT_RATIO", "SQI_SPIKE_RATIO",
+    "GREEN_ROBUST_RANGE_RATIO", "AMB_ROBUST_RANGE_RATIO",
+    "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
+    # Green and ambient statistics.
+    "G_mean_mean", "G_mean_std", "G_mean_diff_std", "G_mean_acdc",
+    "GREEN_DC_MEDIAN", "GREEN_DC_IQR", "GREEN_AC_RMS", "GREEN_AC_MAD",
+    "GREEN_AC_DC_RATIO", "GREEN_DERIV_MAD",
+    "Ambient_mean", "Ambient_std", "Ambient_p95", "corr_Ambient_Gmean",
+    "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
+    "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
+    "GREEN_AC", "AMB_AC", "GREEN_DC", "AMB_DC", "GREEN_CORR",
+    "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
+    "GREEN_AMB_BP_CORR", "GREEN_AMB_ENV_CORR", "GREEN_AMB_LEAK",
+    # Three-green spatial and reliability features.
+    "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
+    "G_rangeNorm_mean", "G_rangeNorm_p90",
+    "G_spatial_vmag_mean", "G_spatial_vmag_p90", "G_spatial_vmag_iqr",
+    "G_spatial_vmag_std", "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
+    "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
+    "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
+    "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
+    # Top-2 green non-FFT statistics.
+    "GTOP2_ROBUST_RANGE_RATIO", "GTOP2_SEG_ACDC_CV",
+    "GTOP2_DC_MEDIAN", "GTOP2_DC_IQR", "GTOP2_AC_RMS", "GTOP2_AC_MAD",
+    "GTOP2_AC_DC_RATIO", "GTOP2_DERIV_MAD",
+    # ACC features that stay simple for endpoint deployment.
+    "ACC_MAG_MEAN", "ACC_MAG_STD", "ACC_MAG_MAD", "ACC_AXIS_STD_SUM",
+    "ACC_GRAVITY_DOM_RATIO", "ACC_BP_RMS", "ACC_DIFF_MAD", "ACC_STILL_SCORE",
+    "ACC_MAG_P50", "ACC_MAG_P90", "ACC_YSUM",
+    "ACC_X_MEAN", "ACC_Y_MEAN", "ACC_Z_MEAN",
+    "ACC_X_STD", "ACC_Y_STD", "ACC_Z_STD",
+    "ACC_X_ENERGY", "ACC_Y_ENERGY", "ACC_Z_ENERGY",
+    "ACC_AXIS_MEAN_SUM", "ACC_MAG_ENERGY", "ACC_MAG_P2P",
+    "ACC_TILT_ANGLE", "ACC_DOM_AXIS", "ACC_GRAVITY_RATIO",
+    "ACC_ENERGY_TO_GREEN_AC", "ACC_GREEN_BP_CORR",
+    # Metadata.
+    "SIG_LEN", "SIG_SEC", "mode",
+    "TOTAL_INVALID_COUNT", "PPG_INVALID_COUNT", "GREEN_INVALID_COUNT",
+}
+
+DEPLOYMENT_FFT_FEATURE_SOURCES = {
+    "GTOP2_BAND_ENERGY_RATIO": "green_top2",
+    "GTOP2_FFT_PEAK_MEDIAN_RATIO": "green_top2",
+    "GTOP2_DOM_FREQ": "green_top2",
+    "AMB_BAND_ENERGY_RATIO": "ambient",
+    "AMB_FFT_PEAK_MEDIAN_RATIO": "ambient",
+    "AMB_DOM_FREQ": "ambient",
+    "AMBX_FFT_PEAK_MEDIAN_RATIO": "ambient",
+    "AMBX_DOM_FREQ": "ambient",
+}
+
+DEPLOYMENT_FORBIDDEN_TOKENS = (
+    "coherence", "Entropy", "SampEn", "ApEn", "Hjorth",
+    "Temporal_peak", "TREMOR", "lag_std", "XCORR",
+    "harmonic", "SNR", "peak_width",
+)
+
+DEPLOYMENT_ALLOWED_FFT_SOURCES = {"green_top2"}
+
+
+def _deployment_fft_source_rank(source):
+    order = {"green_top2": 0, "ambient": 1}
+    return order.get(source, 99)
+
+
+def deployment_fft_source_for_feature(feature):
+    return DEPLOYMENT_FFT_FEATURE_SOURCES.get(str(feature))
+
+
+def is_deployment_allowed_feature(feature):
+    name = str(feature)
+    if any(token in name for token in DEPLOYMENT_FORBIDDEN_TOKENS):
+        return False
+    if name in DEPLOYMENT_ALLOWED_NON_FFT_FEATURES:
+        return True
+    source = deployment_fft_source_for_feature(name)
+    if source is None:
+        return False
+    return source in DEPLOYMENT_ALLOWED_FFT_SOURCES
+
+
+def filter_features_for_deployment(features):
+    """Keep only Stage2 features that are suitable for direct deployment."""
+    filtered = filter_stage2_ir_features(list(features))
+    return [f for f in filtered if is_deployment_allowed_feature(f)]
+
+
+def summarize_deployment_feature_costs(features):
+    fft_sources = sorted({
+        deployment_fft_source_for_feature(f)
+        for f in features
+        if deployment_fft_source_for_feature(f) is not None
+    }, key=_deployment_fft_source_rank)
+    forbidden_selected = [
+        f for f in features
+        if not is_deployment_allowed_feature(f)
+    ]
+    return {
+        "feature_set": "deployment_friendly",
+        "feature_count": int(len(features)),
+        "fft_sources": fft_sources,
+        "fft_source_count": int(len(fft_sources)),
+        "forbidden_selected": forbidden_selected,
+        "forbidden_selected_count": int(len(forbidden_selected)),
+    }
+
 
 def get_feature_cols(df):
     exclude = set(META_COLS)
@@ -981,8 +1089,8 @@ DEPLOYMENT_COST_BY_GROUP = {
 }
 
 
-def deployment_feature_profile(feature):
-    """Return a deployment-practicality profile for a candidate feature.
+def deployment_feature_summary(feature):
+    """Return deployment-practicality metadata for a candidate feature.
 
     s04 runs before the final s05/s06 model and state machine exist, so this is
     a deployment proxy: prefer lower-cost, scale-robust features when train-only
@@ -1021,10 +1129,10 @@ def add_deployment_scores(summary, deployment_score_weight=0.25):
     out = []
     for item in summary:
         enriched = dict(item)
-        profile = deployment_feature_profile(enriched["feature"])
-        enriched.update(profile)
+        deployment_meta = deployment_feature_summary(enriched["feature"])
+        enriched.update(deployment_meta)
         base = float(enriched.get("combined_score", 0.0))
-        enriched["deployment_score"] = float((1.0 - w) * base + w * profile["deployment_fit"])
+        enriched["deployment_score"] = float((1.0 - w) * base + w * deployment_meta["deployment_fit"])
         enriched["deployment_score_weight"] = w
         out.append(enriched)
     return sorted(out, key=lambda x: x["deployment_score"], reverse=True)
@@ -1202,7 +1310,7 @@ def compute_all_feature_diagnostics(df_train, df_valid, feature_cols, fill_value
 
     for f in feature_cols:
         group = feature_to_group(f)
-        profile = deployment_feature_profile(f)
+        profile = deployment_feature_summary(f)
         is_removed = f not in kept_set
         removed_reason = removed_reasons.get(f, "")
 
@@ -1751,7 +1859,6 @@ def main(args=None):
                         help="并行 worker 数")
     parser.add_argument("--deployment_score_weight", type=float, default=0.25,
                         help="部署导向重排权重。0=保持原始重要性排序，建议 0.2-0.35。")
-
     parser.add_argument("--fp_cost_weight", type=float, default=0.25,
                         help="sample/state-machine FP cost proxy reranking weight.")
     parser.add_argument("--fp_proxy_recall_floor", type=float, default=0.95,
@@ -1778,6 +1885,18 @@ def main(args=None):
     _dropped = _before - len(feature_cols)
     if _dropped > 0:
         print(f"[s04 IR strip] 从候选池移除 {_dropped} 个 IR 特征 (保留 {len(feature_cols)} 个)")
+    _deploy_before = len(feature_cols)
+    feature_cols = filter_features_for_deployment(feature_cols)
+    _deploy_dropped = _deploy_before - len(feature_cols)
+    if _deploy_dropped > 0:
+        print(
+            f"[s04 deployment filter] 移除 {_deploy_dropped} 个不适合端侧部署的复杂特征 "
+            f"(保留 {len(feature_cols)} 个)"
+        )
+    if not feature_cols:
+        raise ValueError(
+            "deployment-friendly feature filter left no Stage2 candidate features; rerun s03."
+        )
 
     print_s04_workload_estimate(df_train, df_valid, feature_cols, args)
 
@@ -1880,6 +1999,16 @@ def main(args=None):
         max_features=args.max_features,
         group_limits=GROUP_LIMITS_DEFAULT,
     )
+    selected = filter_features_for_deployment(selected)
+    if len(selected) < min(args.max_features, len(combined_summary)):
+        selected, group_count = select_by_group_from_combined(
+            [
+                item for item in combined_summary
+                if item["feature"] in set(filter_features_for_deployment([item["feature"]]))
+            ],
+            max_features=args.max_features,
+            group_limits=GROUP_LIMITS_DEFAULT,
+        )
 
     print("\n最终选择特征:")
     for i, f in enumerate(selected):
@@ -1968,6 +2097,7 @@ def main(args=None):
             )
             if best_info and best_info.get("features"):
                 selected = best_info["features"]
+                selected = filter_features_for_deployment(selected)
                 group_count = {}
                 for f in selected:
                     g = feature_to_group(f)
@@ -2011,8 +2141,9 @@ def main(args=None):
         "train_fill_values": fill_values,
         "valid_selected_feature_summary": valid_summary,
         "selected_deployment_summary": {
-            f: deployment_feature_profile(f) for f in selected
+            f: deployment_feature_summary(f) for f in selected
         },
+        "deployment_feature_cost_summary": summarize_deployment_feature_costs(selected),
         "scale_dependency": {
             "scale_dependent_selected": scale_dep_in_sel,
             "scale_invariant_selected": scale_inv_in_sel,
@@ -2028,6 +2159,10 @@ def main(args=None):
 
     # 输出完整排序列表（供 s05 搜参时测试不同 max_features）
     ranked = sorted(combined_summary, key=lambda x: x["combined_score"], reverse=True)
+    ranked = [
+        r for r in ranked
+        if r["feature"] in set(filter_features_for_deployment([r["feature"]]))
+    ]
     ranked_path = os.path.join(args.artifact_dir, "ranked_features.json")
     with open(ranked_path, "w", encoding="utf-8") as f:
         json.dump([{

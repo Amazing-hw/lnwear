@@ -5,7 +5,7 @@
 步骤2：Stage1 IR DC/ACDC 固定阈值配置。
 
 当前部署阈值固定为：
-- dc_threshold = 3.6e6
+- dc_threshold = 1.5e6
 - ac_dc_threshold = 0.35
 
 本脚本不再做阈值搜参；只提取 train/valid 的 Stage1 primitive windows，
@@ -26,7 +26,7 @@ STAGE1_DECISION_SEC = 3.0
 DEFAULT_MIN_DURATION_SEC = STAGE1_DECISION_SEC
 STAGE1_FS = 5
 STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
-FIXED_DEPLOY_DC_THRESHOLD = 3.6e6
+FIXED_DEPLOY_DC_THRESHOLD = 1.5e6
 FIXED_DEPLOY_AC_DC_THRESHOLD = 0.35
 
 

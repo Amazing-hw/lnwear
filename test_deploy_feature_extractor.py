@@ -12,6 +12,7 @@ from xgboost import XGBClassifier
 
 import s06_deploy_eval as s06
 import s03_extract_feature_pool as s03
+import s04_feature_selection as s04
 import s05_train_final_model as s05
 import s08_run_pipeline as s08
 
@@ -145,7 +146,9 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
         0.02 * np.cos(2 * np.pi * 0.5 * t),
         1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
     ])
-    selected = list(s03.extract_window_features(ppg, fs=fs, acc_window=acc).keys())
+    selected = s04.filter_features_for_deployment(
+        list(s03.extract_window_features(ppg, fs=fs, acc_window=acc).keys())
+    )
 
     joblib.dump(
         {
@@ -173,7 +176,7 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
 
     assert not [name for name in selected if s03.is_stage2_ir_feature(name)]
     assert list(module.FEATURE_ORDER) == selected
-    assert "G_consensus_AC_MAD_range" in module.FEATURE_ORDER
+    assert "GTOP2_BAND_ENERGY_RATIO" in module.FEATURE_ORDER
     assert len(vector) == len(selected)
 
 
@@ -185,8 +188,8 @@ def test_rendered_deploy_feature_extractor_is_project_source_independent():
         "ACC_YSUM",
         "GREEN_DC",
         "AMB_DC",
-        "GREEN_XCORR",
-        "FFT_PEAK_MEDIAN_RATIO",
+        "G_TOP2_CORR_MIN",
+        "GTOP2_BAND_ENERGY_RATIO",
         "mode",
     ]
     formulas = {name: {"formula": name, "intermediate_signals": {}} for name in selected}
@@ -223,8 +226,8 @@ def test_rendered_deploy_feature_extractor_compiles_and_runs_standalone(tmp_path
         "ACC_YSUM",
         "GREEN_DC",
         "AMB_DC",
-        "GREEN_XCORR",
-        "FFT_PEAK_MEDIAN_RATIO",
+        "G_TOP2_CORR_MIN",
+        "GTOP2_BAND_ENERGY_RATIO",
         "mode",
     ]
     formulas = {name: {"formula": name, "intermediate_signals": {}} for name in selected}
@@ -267,8 +270,8 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
         "ACC_YSUM",
         "GREEN_DC",
         "AMB_DC",
-        "GREEN_XCORR",
-        "FFT_PEAK_MEDIAN_RATIO",
+        "G_TOP2_CORR_MIN",
+        "GTOP2_BAND_ENERGY_RATIO",
     ]
     joblib.dump(
         {
@@ -447,8 +450,8 @@ def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_
         "ACC_YSUM",
         "GREEN_DC",
         "AMB_DC",
-        "GREEN_XCORR",
-        "FFT_PEAK_MEDIAN_RATIO",
+        "G_TOP2_CORR_MIN",
+        "GTOP2_BAND_ENERGY_RATIO",
     ]
     model = XGBClassifier(
         n_estimators=1,
@@ -479,7 +482,7 @@ def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_
         tmp_path / "model_bundle.pkl",
     )
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":3600000,"ac_dc_threshold":0.35}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":0.35}}',
         encoding="utf-8",
     )
 
@@ -509,7 +512,7 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
     model.fit(np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float), np.asarray([0, 1]))
 
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":3600000,"ac_dc_threshold":0.35}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":0.35}}',
         encoding="utf-8",
     )
     (tmp_path / "selected_features.json").write_text(
@@ -562,7 +565,7 @@ def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(t
     model.fit(np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float), np.asarray([0, 1]))
 
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":3600000,"ac_dc_threshold":0.35}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":0.35}}',
         encoding="utf-8",
     )
     joblib.dump(
@@ -609,8 +612,8 @@ def test_export_golden_vectors_and_validate_feature_order(tmp_path):
         "ACC_YSUM",
         "GREEN_DC",
         "AMB_DC",
-        "GREEN_XCORR",
-        "FFT_PEAK_MEDIAN_RATIO",
+        "G_TOP2_CORR_MIN",
+        "GTOP2_BAND_ENERGY_RATIO",
     ]
     model = XGBClassifier(
         n_estimators=1,
@@ -624,7 +627,7 @@ def test_export_golden_vectors_and_validate_feature_order(tmp_path):
         np.asarray([0, 1]),
     )
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":3600000,"ac_dc_threshold":0.35}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":0.35}}',
         encoding="utf-8",
     )
     joblib.dump(

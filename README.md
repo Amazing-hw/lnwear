@@ -11,6 +11,12 @@
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
+### 部署友好特征池
+
+Stage2 默认只有一套部署友好特征池；不再提供研究型/部署型模式开关。限制发生在 `s04` 特征筛选和 `s05` 训练之前，不是在部署导出阶段裁剪，因此最终 `model_bundle.pkl`、`deploy_xgboost.json`、`deploy_feature_extractor.py` 的特征顺序和维度保持一致。
+
+当前部署友好特征池只允许统计量、MAD/IQR、ratio、三绿光一致性、少量相关性和固定的绿光 top2 FFT source。它会从候选池源头排除 `coherence`、`find_peaks`、entropy/SampEn/ApEn、Hjorth、复杂 temporal peak、ACC tremor FFT、per-channel G1/G2/G3 全量 FFT、cross-correlation lag、harmonic/SNR/peak width 等不利于端侧维护的算子。`final_model_config.json`、`model_search_results.csv` 和 `deploy_cookbook.json` 会记录最终入选特征的部署算子成本摘要。
+
 - 只跑到模型搜参 + train-only hard negative 回流训练，不导出 NPZ、不跑后处理：
 
 ```bash
@@ -54,7 +60,7 @@ new_codex/
     扫描 H5，过滤 PPG shape 不符合要求的样本，按 sample/record 分层切分 train/valid/test。
 
   s02_ir_dc_threshold.py
-    固定 Stage1 IR DC/ACDC 阈值为 3.6e6 / 0.35，导出 primitive window 统计和散点图。
+    固定 Stage1 IR DC/ACDC 阈值为 1.5e6 / 0.35，导出 primitive window 统计和散点图。
 
   s03_extract_feature_pool.py
     提取 Stage2 特征池；3D 预切窗直接逐个使用已有 3s 窗口，连续时序才按 3s/1s 滑窗。
@@ -348,7 +354,7 @@ python s02_ir_dc_threshold.py \
 当前 Stage1 部署阈值固定，不做搜参：
 
 ```text
-dc_threshold = 3.6e6
+dc_threshold = 1.5e6
 ac_dc_threshold = 0.35
 ```
 

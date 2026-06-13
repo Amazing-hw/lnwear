@@ -910,7 +910,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Compare commercial AdaBoost baseline with deployed XGBoost artifacts.")
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument("--split", type=str, default="test", choices=["train", "valid", "test"])
-    parser.add_argument("--commercial_dc_threshold", type=float, default=3.6e6)
+    parser.add_argument("--commercial_dc_threshold", type=float, default=1.5e6)
     parser.add_argument("--fp_cost", type=float, default=1.5)
     parser.add_argument("--method", type=str, default="state_machine", choices=["state_machine", "mean_vote", "prob_mean"])
     parser.add_argument("--window_sec", type=float, default=None, help="Override deployed XGBoost window seconds.")

@@ -31,6 +31,10 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, StratifiedGroupKFold, train_test_split
 
 from s03_extract_feature_pool import filter_stage2_ir_features, is_stage2_ir_feature
+from s04_feature_selection import (
+    filter_features_for_deployment,
+    summarize_deployment_feature_costs,
+)
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1063,6 +1067,9 @@ def build_model_search_result_rows(model_search_records):
             "chosen_reason": str(r.get("chosen_reason", "")),
             "feature_count": int(r.get("feature_count", r.get("n_features", 0))),
             "n_features": int(r.get("n_features", r.get("feature_count", 0))),
+            "feature_set": str((r.get("deployment_feature_cost_summary") or {}).get("feature_set", "")),
+            "deployment_fft_source_count": int((r.get("deployment_feature_cost_summary") or {}).get("fft_source_count", 0)),
+            "deployment_forbidden_selected_count": int((r.get("deployment_feature_cost_summary") or {}).get("forbidden_selected_count", 0)),
         }
         for name, value in (r.get("metrics") or {}).items():
             if name == "confusion_matrix":
@@ -1776,6 +1783,7 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
     for _record in model_search_records:
         _record.setdefault("feature_count", int(k))
         _record.setdefault("n_features", len(features))
+        _record.setdefault("deployment_feature_cost_summary", summarize_deployment_feature_costs(features))
 
     total_nodes = count_xgb_nodes(raw_model)
     best_score = float(model_search_summary.get("best", {}).get("score", float("-inf")))
@@ -1909,6 +1917,10 @@ def main(args=None):
     if os.path.exists(ranked_features_path):
         with open(ranked_features_path, "r", encoding="utf-8") as f:
             ranked = json.load(f)
+        ranked = [
+            r for r in ranked
+            if r.get("feature") in set(filter_features_for_deployment([r.get("feature")]))
+        ]
         _k = min(args.max_features if args.max_features is not None else 15, len(ranked))
         selected_features = [r["feature"] for r in ranked[:_k]]
         logger.info(f"从 ranked_features.json 取 top {_k} 特征（共 {len(ranked)} 个候选）")
@@ -1918,6 +1930,11 @@ def main(args=None):
         selected_features = fs["selected_features"]
 
     selected_features = enforce_no_stage2_ir_features(selected_features, "initial selected_features")
+    selected_features = filter_features_for_deployment(selected_features)
+    if not selected_features:
+        raise ValueError(
+            "deployment-friendly feature filter left no selected features for s05; rerun s04."
+        )
 
     feature_pool_train_path = os.path.join(args.artifact_dir, "feature_pool_train.csv")
     feature_pool_valid_path = os.path.join(args.artifact_dir, "feature_pool_valid.csv")
@@ -1948,6 +1965,10 @@ def main(args=None):
             _ranked = json.load(_f)
         _ranked_before = len(_ranked)
         _ranked = [r for r in _ranked if not is_stage2_ir_feature(r.get("feature", ""))]
+        _ranked = [
+            r for r in _ranked
+            if r.get("feature") in set(filter_features_for_deployment([r.get("feature")]))
+        ]
         _ranked_dropped = _ranked_before - len(_ranked)
         if _ranked_dropped > 0:
             logger.warning(
@@ -2388,6 +2409,7 @@ def main(args=None):
         for _record in model_search_records:
             _record.setdefault("feature_count", len(selected_features))
             _record.setdefault("n_features", len(selected_features))
+            _record.setdefault("deployment_feature_cost_summary", summarize_deployment_feature_costs(selected_features))
         rows = build_model_search_result_rows(model_search_records)
         results_df = pd.DataFrame(rows)
         if "cv_folds_completed" in results_df.columns and int(results_df["cv_folds_completed"].max()) > 0:
@@ -2478,6 +2500,7 @@ def main(args=None):
             "max_model_nodes": int(args.max_model_nodes),
         },
         "model_search": model_search_summary,
+        "deployment_feature_cost_summary": summarize_deployment_feature_costs(selected_features),
         "valid_default_threshold_metrics": valid_default,
         "valid_best_threshold_metrics": valid_best,
         "threshold_split_default_metrics": threshold_default,
