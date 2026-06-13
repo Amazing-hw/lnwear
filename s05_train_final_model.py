@@ -28,7 +28,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, confusion_matrix
 )
-from sklearn.model_selection import KFold, StratifiedKFold, StratifiedGroupKFold, train_test_split
+from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, StratifiedGroupKFold, train_test_split
 
 from s03_extract_feature_pool import filter_stage2_ir_features, is_stage2_ir_feature
 
@@ -791,6 +791,179 @@ def build_repeated_group_cv_splits(y, groups=None, n_folds=3, n_repeats=2, rando
     }
 
 
+def build_hard_negative_oof_splits(y, groups=None, n_folds=3, random_state=42):
+    """Build train-only OOF splits for hard-negative mining without sample-group leakage."""
+    y = np.asarray(y, dtype=int)
+    n_samples = len(y)
+    if n_samples < 2:
+        idx = np.arange(n_samples)
+        return [(idx, idx)], {
+            "source_split": "train_only",
+            "fallback": True,
+            "reason": "insufficient_rows",
+            "n_splits": 1,
+            "n_groups": 0,
+        }
+
+    n_folds = max(2, int(n_folds))
+    if groups is not None:
+        groups = np.asarray(groups, dtype=object)
+    if groups is not None and len(groups) == n_samples:
+        unique_groups = pd.unique(groups)
+        if len(unique_groups) >= 2:
+            group_df = pd.DataFrame({"group": groups, "target": y}).drop_duplicates("group")
+            group_counts = group_df["target"].value_counts()
+            if group_df["target"].nunique() >= 2 and int(group_counts.min()) >= 2:
+                effective_folds = min(n_folds, int(group_counts.min()), int(len(group_df)))
+                cv = StratifiedGroupKFold(
+                    n_splits=effective_folds,
+                    shuffle=True,
+                    random_state=int(random_state),
+                )
+                return list(cv.split(np.zeros(n_samples), y, groups)), {
+                    "source_split": "train_only",
+                    "fallback": False,
+                    "reason": "stratified_group_kfold",
+                    "n_splits": int(effective_folds),
+                    "n_groups": int(len(group_df)),
+                }
+            effective_folds = min(n_folds, int(len(unique_groups)))
+            cv = GroupKFold(n_splits=effective_folds)
+            return list(cv.split(np.zeros(n_samples), y, groups)), {
+                "source_split": "train_only",
+                "fallback": False,
+                "reason": "group_kfold",
+                "n_splits": int(effective_folds),
+                "n_groups": int(len(unique_groups)),
+            }
+
+    class_counts = pd.Series(y).value_counts()
+    if y.size >= 4 and len(class_counts) >= 2 and int(class_counts.min()) >= 2:
+        effective_folds = min(n_folds, int(class_counts.min()), n_samples)
+        cv = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=int(random_state))
+        return list(cv.split(np.zeros(n_samples), y)), {
+            "source_split": "train_only",
+            "fallback": True,
+            "reason": "row_stratified_kfold",
+            "n_splits": int(effective_folds),
+            "n_groups": 0,
+        }
+
+    effective_folds = min(n_folds, n_samples)
+    cv = KFold(n_splits=effective_folds, shuffle=True, random_state=int(random_state))
+    return list(cv.split(np.zeros(n_samples))), {
+        "source_split": "train_only",
+        "fallback": True,
+        "reason": "row_kfold",
+        "n_splits": int(effective_folds),
+        "n_groups": 0,
+    }
+
+
+def build_hard_negative_training_weights_from_oof(
+        df_train, oof_probs, min_probability=0.5, top_percentile=0.10,
+        hard_negative_weight=3.0):
+    """Select train-only negative windows with high OOF probabilities and build sample weights."""
+    n_rows = len(df_train)
+    probs = np.asarray(oof_probs, dtype=float)
+    if len(probs) != n_rows:
+        raise ValueError("oof_probs length must match df_train rows")
+
+    targets = df_train["target"].to_numpy(dtype=int)
+    neg_mask = targets == 0
+    finite_neg = neg_mask & np.isfinite(probs)
+    weights = np.ones(n_rows, dtype=float)
+    report_cols = [
+        "sample_name", "h5_file", "window_index", "target", "mode", "quality_bin",
+        "prob_oof", "selected_reason",
+    ]
+
+    if not np.any(finite_neg):
+        empty = pd.DataFrame(columns=report_cols)
+        return weights, empty, {
+            "enabled": True,
+            "source_split": "train_only",
+            "n_train_rows": int(n_rows),
+            "n_negative_rows": int(np.sum(neg_mask)),
+            "n_hard_negatives": 0,
+            "hard_negative_weight": float(hard_negative_weight),
+            "min_probability": float(min_probability),
+            "top_percentile": float(top_percentile),
+            "probability_cutoff": None,
+        }
+
+    top_percentile = min(max(float(top_percentile), 0.0), 1.0)
+    if top_percentile > 0:
+        percentile_cutoff = float(np.quantile(probs[finite_neg], 1.0 - top_percentile))
+    else:
+        percentile_cutoff = float("inf")
+    min_probability = float(min_probability)
+    cutoff = min(min_probability, percentile_cutoff)
+    selected_mask = finite_neg & ((probs >= min_probability) | (probs >= percentile_cutoff))
+    weights[selected_mask] = float(hard_negative_weight)
+
+    report = df_train.loc[selected_mask].copy()
+    report["prob_oof"] = probs[selected_mask]
+    reasons = []
+    for p in report["prob_oof"].astype(float).to_numpy():
+        hit_min = p >= min_probability
+        hit_top = p >= percentile_cutoff
+        if hit_min and hit_top:
+            reasons.append("probability_and_top_percentile")
+        elif hit_min:
+            reasons.append("probability")
+        else:
+            reasons.append("top_percentile")
+    report["selected_reason"] = reasons
+    for col in report_cols:
+        if col not in report.columns:
+            report[col] = None
+    report = report[report_cols].sort_values("prob_oof", ascending=False).reset_index(drop=True)
+
+    return weights, report, {
+        "enabled": True,
+        "source_split": "train_only",
+        "n_train_rows": int(n_rows),
+        "n_negative_rows": int(np.sum(neg_mask)),
+        "n_hard_negatives": int(np.sum(selected_mask)),
+        "hard_negative_weight": float(hard_negative_weight),
+        "min_probability": float(min_probability),
+        "top_percentile": float(top_percentile),
+        "probability_cutoff": float(cutoff) if np.isfinite(cutoff) else None,
+        "percentile_cutoff": float(percentile_cutoff) if np.isfinite(percentile_cutoff) else None,
+    }
+
+
+def mine_hard_negative_training_weights(
+        df_train, X_train, y_train, groups, params, min_probability=0.5,
+        top_percentile=0.10, hard_negative_weight=3.0, n_folds=3,
+        random_state=42):
+    """Run train-only group-aware OOF mining and return final sample weights plus audit report."""
+    splits, split_meta = build_hard_negative_oof_splits(
+        y_train, groups=groups, n_folds=n_folds, random_state=random_state)
+    oof_sum = np.zeros(len(y_train), dtype=float)
+    oof_count = np.zeros(len(y_train), dtype=int)
+    for train_idx, valid_idx in splits:
+        if len(train_idx) == 0 or len(valid_idx) == 0 or len(np.unique(y_train[train_idx])) < 2:
+            continue
+        fold_model = train_xgb_with_params(params, X_train[train_idx], y_train[train_idx])
+        oof_sum[valid_idx] += fold_model.predict_proba(X_train[valid_idx])[:, 1]
+        oof_count[valid_idx] += 1
+    oof_probs = np.full(len(y_train), np.nan, dtype=float)
+    covered = oof_count > 0
+    oof_probs[covered] = oof_sum[covered] / oof_count[covered]
+    weights, report, summary = build_hard_negative_training_weights_from_oof(
+        df_train,
+        oof_probs,
+        min_probability=min_probability,
+        top_percentile=top_percentile,
+        hard_negative_weight=hard_negative_weight,
+    )
+    summary["oof_split"] = split_meta
+    summary["oof_covered_rows"] = int(np.sum(covered))
+    return weights, report, summary
+
+
 def _mean_or_none(values):
     values = [float(v) for v in values if v is not None and np.isfinite(float(v))]
     if not values:
@@ -1006,22 +1179,25 @@ def _json_safe_model_search_record(record):
     return out
 
 
-def train_xgb_with_params(params, X_train, y_train):
+def train_xgb_with_params(params, X_train, y_train, sample_weight=None):
     fit_params = dict(params)
     fit_params["n_jobs"] = get_inner_n_jobs()
     model = xgb.XGBClassifier(**fit_params)
-    model.fit(X_train, y_train, verbose=False)
+    fit_kwargs = {"verbose": False}
+    if sample_weight is not None:
+        fit_kwargs["sample_weight"] = np.asarray(sample_weight, dtype=float)
+    model.fit(X_train, y_train, **fit_kwargs)
     return model
 
 
 def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y_select,
-                                             scale_pos_weight=1.0):
+                                             scale_pos_weight=1.0, sample_weight=None):
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
     records = []
     models = []
     logger.info("model_search enabled: evaluating %d XGBoost candidates", len(grid))
     for idx, params in enumerate(grid, 1):
-        candidate = train_xgb_with_params(params, X_train, y_train)
+        candidate = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
         metrics = eval_model(candidate, X_select, y_select, threshold=0.5)
         selection_metrics = evaluate_accuracy_first_threshold(candidate, X_select, y_select)
         total_nodes = count_xgb_nodes(candidate)
@@ -1086,7 +1262,7 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
 
 
 def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=None,
-                                                scale_pos_weight=1.0):
+                                                scale_pos_weight=1.0, sample_weight=None):
     axes = build_model_search_axes(args)
     total_combinations = _model_search_combo_count(axes)
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
@@ -1111,7 +1287,9 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         total_combinations,
     )
     for idx, params in enumerate(grid, 1):
-        candidate = train_xgb_with_params(params, X_train[stage_train_idx], y_train[stage_train_idx])
+        sw_stage = sample_weight[stage_train_idx] if sample_weight is not None else None
+        candidate = train_xgb_with_params(
+            params, X_train[stage_train_idx], y_train[stage_train_idx], sample_weight=sw_stage)
         selection_metrics = evaluate_accuracy_first_threshold(
             candidate,
             X_train[stage_valid_idx],
@@ -1168,14 +1346,16 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
     for idx, params in enumerate(stage2_params, 1):
         fold_metrics = []
         for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits, 1):
-            fold_model = train_xgb_with_params(params, X_train[train_idx], y_train[train_idx])
+            sw_fold = sample_weight[train_idx] if sample_weight is not None else None
+            fold_model = train_xgb_with_params(
+                params, X_train[train_idx], y_train[train_idx], sample_weight=sw_fold)
             fold_metrics.append(evaluate_accuracy_first_threshold(
                 fold_model,
                 X_train[valid_idx],
                 y_train[valid_idx],
             ))
         cv_summary = summarize_cv_metrics(fold_metrics)
-        final_model = train_xgb_with_params(params, X_train, y_train)
+        final_model = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
         final_total_nodes = count_xgb_nodes(final_model)
         final_models.append(final_model)
         mean_accuracy = float(cv_summary.get("mean_cv_accuracy") or 0.0)
@@ -1274,7 +1454,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
 
 
 def search_xgb_hyperparameters(args, X_train, y_train, X_select=None, y_select=None,
-                               scale_pos_weight=1.0, groups=None):
+                               scale_pos_weight=1.0, groups=None, sample_weight=None):
     strategy = getattr(args, "model_search_strategy", "single_split")
     if strategy == "staged_group_cv":
         return _search_xgb_hyperparameters_staged_group_cv(
@@ -1283,6 +1463,7 @@ def search_xgb_hyperparameters(args, X_train, y_train, X_select=None, y_select=N
             y_train,
             groups=groups,
             scale_pos_weight=scale_pos_weight,
+            sample_weight=sample_weight,
         )
     if X_select is None or y_select is None:
         raise ValueError("single_split model_search requires X_select and y_select")
@@ -1293,6 +1474,7 @@ def search_xgb_hyperparameters(args, X_train, y_train, X_select=None, y_select=N
         X_select,
         y_select,
         scale_pos_weight=scale_pos_weight,
+        sample_weight=sample_weight,
     )
 
 
@@ -1636,7 +1818,7 @@ def main(args=None):
                         help="Fraction of valid sample groups reserved for threshold selection.")
     parser.add_argument("--calibration_random_state", type=int, default=42,
                         help="Random seed for splitting valid into calibration/threshold groups.")
-    parser.add_argument("--window_sec", type=float, default=3.0,
+    parser.add_argument("--window_sec", type=float, default=5.0,
                         help="Feature window seconds recorded into model metadata.")
     parser.add_argument("--step_sec", type=float, default=1.0,
                         help="Feature/evaluation stride seconds recorded into model metadata.")
@@ -1693,6 +1875,14 @@ def main(args=None):
     parser.add_argument("--model_search_colsample_bytree", type=str,
                         default=_model_search_default_csv("colsample_bytree"),
                         help="comma-separated colsample_bytree candidates for --model_search")
+    parser.add_argument("--mine_hard_negatives", action="store_true", default=False,
+                        help="mine train-only OOF hard negatives and upweight them before final calibration")
+    parser.add_argument("--hard_negative_weight", type=float, default=3.0,
+                        help="sample weight assigned to mined train hard-negative windows")
+    parser.add_argument("--hard_negative_top_percentile", type=float, default=0.10,
+                        help="fraction of highest-probability train negatives selected as hard negatives")
+    parser.add_argument("--hard_negative_min_probability", type=float, default=None,
+                        help="minimum OOF probability for hard-negative mining; defaults to initial window threshold")
     parser.add_argument("--ood_q_low", type=float, default=0.05)
     parser.add_argument("--ood_q_high", type=float, default=0.95)
     parser.add_argument(
@@ -1989,6 +2179,93 @@ def main(args=None):
             )
             model_search_summary["split"] = model_selection_split
 
+    hard_negative_summary = {
+        "enabled": bool(args.mine_hard_negatives),
+        "source_split": "train_only",
+        "n_hard_negatives": 0,
+        "hard_negative_weight": float(args.hard_negative_weight),
+        "top_percentile": float(args.hard_negative_top_percentile),
+        "min_probability": (
+            None if args.hard_negative_min_probability is None
+            else float(args.hard_negative_min_probability)
+        ),
+    }
+    hard_negative_report_path = None
+    hard_negative_weights_path = None
+    if args.mine_hard_negatives:
+        df_train_for_hn = clip_outliers(
+            df_train_raw, selected_features, k=1.5, bounds=clip_bounds)
+        X_train_hn, y_train_hn, _ = prepare_xy(
+            df_train_for_hn, selected_features, fill_values=fill_values)
+        groups_hn = (
+            df_train_for_hn["sample_name"].astype("object").to_numpy()
+            if "sample_name" in df_train_for_hn.columns else None
+        )
+        hn_min_probability = args.hard_negative_min_probability
+        threshold_source = "cli"
+        if hn_min_probability is None:
+            threshold_source = "initial_valid_threshold_split"
+            try:
+                initial_threshold = search_threshold_by_valid(
+                    raw_model,
+                    X_threshold,
+                    y_threshold,
+                    objective=args.threshold_objective,
+                    beta=args.threshold_beta,
+                    min_precision=args.threshold_min_precision,
+                )
+                hn_min_probability = float(initial_threshold["threshold"])
+            except Exception as e:
+                logger.warning("hard-negative mining threshold fallback to 0.5: %s", e)
+                threshold_source = "fallback_0.5"
+                hn_min_probability = 0.5
+
+        hn_params = dict(
+            model_search_summary.get("best", {}).get("params")
+            or build_default_xgb_params(scale_pos_weight=scale_pos_weight)
+        )
+        hn_weights, hn_report, hard_negative_summary = mine_hard_negative_training_weights(
+            df_train_for_hn,
+            X_train_hn,
+            y_train_hn,
+            groups_hn,
+            hn_params,
+            min_probability=hn_min_probability,
+            top_percentile=args.hard_negative_top_percentile,
+            hard_negative_weight=args.hard_negative_weight,
+            n_folds=args.model_search_cv_folds,
+            random_state=args.model_search_random_state,
+        )
+        hard_negative_summary["threshold_source"] = threshold_source
+        hard_negative_summary["params_source"] = (
+            "model_search_best" if model_search_summary.get("best") else "default_xgb_params"
+        )
+        hard_negative_report_path = os.path.join(args.artifact_dir, "hard_negative_mining_train.csv")
+        hard_negative_weights_path = os.path.join(args.artifact_dir, "hard_negative_training_weights.csv")
+        hn_report.to_csv(hard_negative_report_path, index=False)
+        weight_cols = [
+            c for c in ["sample_name", "h5_file", "window_index", "target", "mode"]
+            if c in df_train_for_hn.columns
+        ]
+        weight_df = df_train_for_hn[weight_cols].copy() if weight_cols else pd.DataFrame(index=df_train_for_hn.index)
+        weight_df["sample_weight"] = hn_weights
+        weight_df["is_hard_negative"] = hn_weights > 1.0
+        weight_df.to_csv(hard_negative_weights_path, index=False)
+        hard_negative_summary["report_path"] = hard_negative_report_path
+        hard_negative_summary["weights_path"] = hard_negative_weights_path
+        logger.info(
+            "hard-negative mining: selected %d/%d train rows; retraining final raw model with weights",
+            int(hard_negative_summary.get("n_hard_negatives", 0)),
+            int(hard_negative_summary.get("n_train_rows", len(y_train_hn))),
+        )
+        raw_model = train_xgb_with_params(
+            hn_params,
+            X_train_hn,
+            y_train_hn,
+            sample_weight=hn_weights,
+        )
+        model_search_summary["hard_negative_mining"] = hard_negative_summary
+
     # 确保 quality_thresholds 已初始化（多 k 分支可能跳过）
     try:
         _ = quality_thresholds
@@ -2160,6 +2437,7 @@ def main(args=None):
             "step_sec": float(args.step_sec),
             "use_stage2_ir": bool(args.use_stage2_ir),
             "model_search": model_search_summary,
+            "hard_negative_mining": hard_negative_summary,
         },
     }
     joblib.dump(model_bundle, bundle_path)
@@ -2191,6 +2469,7 @@ def main(args=None):
             "scale_pos_weight_strategy": scale_pos_weight_strategy,
             "target_deploy_ratio": args.target_deploy_ratio,
         },
+        "hard_negative_mining": hard_negative_summary,
 
         "xgboost_params": raw_model.get_params(),
         "model_complexity": {

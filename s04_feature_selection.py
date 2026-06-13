@@ -497,6 +497,11 @@ def clean_features_by_train(df_train, df_valid, feature_cols, missing_thresh=0.3
         from sklearn.linear_model import Ridge
         _kept = list(kept3)
         _X = df_train[_kept].values.astype(float)
+        _mu = np.nanmean(_X, axis=0)
+        _sd = np.nanstd(_X, axis=0)
+        _sd[~np.isfinite(_sd) | (_sd < 1e-12)] = 1.0
+        _X = (_X - _mu) / _sd
+        _X = np.nan_to_num(_X, nan=0.0, posinf=0.0, neginf=0.0)
         _max_iter = max(len(_kept) // 2, 1)
         _orig_n = len(_kept)
         for _iter in range(_max_iter):
@@ -511,7 +516,9 @@ def clean_features_by_train(df_train, df_valid, feature_cols, missing_thresh=0.3
                 X_rest = _X[:, col_mask]  # 列索引切片，无复制
                 y_j = _X[:, j]
                 try:
-                    ridge = Ridge(alpha=1.0, fit_intercept=True)
+                    # VIF uses highly collinear feature blocks by design; lsqr avoids
+                    # Cholesky/normal-equation warnings on nearly singular matrices.
+                    ridge = Ridge(alpha=1.0, fit_intercept=False, solver="lsqr")
                     ridge.fit(X_rest, y_j)
                     y_pred = ridge.predict(X_rest)
                     ss_res = np.sum((y_j - y_pred) ** 2)
@@ -535,6 +542,11 @@ def clean_features_by_train(df_train, df_valid, feature_cols, missing_thresh=0.3
                     removed["high_vif"].append(_kept[j])
                     _kept.pop(j)
             _X = df_train[_kept].values.astype(float)  # 重建（仅当有删除时）
+            _mu = np.nanmean(_X, axis=0)
+            _sd = np.nanstd(_X, axis=0)
+            _sd[~np.isfinite(_sd) | (_sd < 1e-12)] = 1.0
+            _X = (_X - _mu) / _sd
+            _X = np.nan_to_num(_X, nan=0.0, posinf=0.0, neginf=0.0)
         kept3 = _kept
         print(f"  VIF: {_orig_n} -> {len(kept3)} features")
 

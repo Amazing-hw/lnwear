@@ -1,5 +1,35 @@
 # Wearing Liveness Detection Pipeline
 
+## 当前默认流程准则
+
+- 默认 Stage2 窗长是 `5s`、stride 是 `1s`；如需兼容旧 3s 窗口，显式传 `--window_sec 3`。
+- 对 grouped/pre-windowed H5，窗口会按名称里的 `w数字` 排序，排序后跳过前三个窗口；预切窗口直接使用，不会二次滑窗。
+- IR 只用于 Stage1 DC/ACDC 门控；Stage2 特征筛选、XGBoost、s06/s07、部署脚本和 golden vectors 都只允许环境光、三绿光和 ACC 特征。
+- 默认主命令会做特征数量搜索 `8,10,12,15,18` 和 XGBoost 参数搜索，不导出 NPZ、不跑 s07 后处理搜参、不跑 s10 审计：
+
+```bash
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
+```
+
+- 只跑到模型搜参 + train-only hard negative 回流训练，不导出 NPZ、不跑后处理：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --hard_negative_optimize \
+  --stop_after s05
+```
+
+- 完整 hard negative 闭环、NPZ、s07 后处理搜参和 s10 审计：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --hard_negative_optimize
+```
+
 这是一个基于手表 PPG + ACC 信号的佩戴状态 / 活体检测项目。代码把流程拆成三个层级：
 
 1. **Stage1：IR DC/ACDC 流式粗筛**  
@@ -452,22 +482,42 @@ Stage2 final training set =
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --window_sec 3 \
-  --stride_sec 1 \
-  --skip_initial_windows 3 \
-  --no-use_stage2_ir \
-  --threshold_objective precision_constrained \
-  --threshold_min_precision 0.995 \
-  --model_search_fp_cost 4.0 \
-  --model_search_feature_counts "8,10,12,15,18" \
-  --max_model_nodes 500 \
-  --full_optimize \
-  --max_sample_fp_rate 0.005 \
-  --max_false_worn_event_rate 0.005 \
-  --postprocess_fp_cost 8.0
+  --hard_negative_optimize
 ```
 
-这条命令会同时做特征数量搜索、XGBoost 参数搜索、窗口缓存导出和 s07 后处理搜参。窗口模型阶段用 `precision_constrained` 和较高 `threshold_min_precision` 先压低 object-worn FP 风险；后处理阶段再用 `max_false_worn_event_rate` 与更高 `postprocess_fp_cost` 约束样本级误触发。
+这条命令会同时做特征数量搜索、XGBoost 参数搜索、train-only OOF hard negative 挖掘、hard negative 加权重训、valid/test 窗口缓存导出、s07 后处理搜参、s06 端到端评估、s10 泛化审计和部署产物导出。窗口模型阶段会自动切到 `precision_constrained` 和 `threshold_min_precision=0.995`，训练阶段只从 `feature_pool_train.csv` 挖 hard negatives 并写出 `hard_negative_mining_train.csv` / `hard_negative_training_weights.csv`，后处理阶段再用 `max_false_worn_event_rate=0.005` 与 `postprocess_fp_cost=8.0` 约束样本级误触发。
+
+如果只想先跑到模型搜参 + hard negative 回流训练为止，暂时不导出 NPZ、不跑 s07 后处理搜参、不跑 s10 审计，使用：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --hard_negative_optimize \
+  --stop_after s05
+```
+
+这会停在 `s05`，产物重点看：
+
+```text
+artifacts/final_model.json
+artifacts/final_model_config.json
+artifacts/model_bundle.pkl
+artifacts/model_search_results.csv
+artifacts/hard_negative_mining_train.csv
+artifacts/hard_negative_training_weights.csv
+```
+
+如果需要调整回流强度，可以额外加：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --hard_negative_optimize \
+  --hard_negative_weight 4.0 \
+  --hard_negative_top_percentile 0.15
+```
 
 如果模型已经训练完，只想基于当前结果导出窗口缓存并做后处理搜参，使用：
 

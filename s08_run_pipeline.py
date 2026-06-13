@@ -9,7 +9,7 @@
 这条命令会默认跑到 s06_cb：
     s01 数据切分
     s02 Stage1 固定阈值
-    s03 Stage2 特征窗口（默认 3s/1s，也支持 5s/1s）
+    s03 Stage2 特征窗口（默认 5s/1s，也支持 3s/1s）
     s04 特征筛选 + s04_search 候选子集搜索
     s05 XGBoost 训练；默认执行节点预算约束下的 staged group-CV 搜参
     s06_eval 用当前已固化/默认状态机做 test 端到端评估
@@ -114,6 +114,39 @@ def dataset_has_h5_files(dataset_dir):
     if not os.path.isabs(dataset_dir):
         patterns.append(os.path.join("..", dataset_dir, "*.h5"))
     return any(glob.glob(pattern) for pattern in patterns)
+
+
+def _read_s05_quick_k_score(artifact_dir):
+    """Read the window-accuracy score written by a quick s05 run."""
+    config_path = os.path.join(artifact_dir, "final_model_config.json")
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return None
+
+    for section in (
+        "valid_best_threshold_metrics",
+        "threshold_split_best_metrics",
+        "valid_default_threshold_metrics",
+    ):
+        metrics = config.get(section) or {}
+        try:
+            value = metrics.get("accuracy")
+            if value is not None:
+                return float(value)
+        except Exception:
+            continue
+
+    try:
+        value = config.get("model_search", {}).get("feature_search", {}).get("best_score")
+        if value is not None:
+            return float(value)
+    except Exception:
+        pass
+    return None
 
 EXTRA_FEATURE_FORMULAS = {
     "GREEN_CORR": {
@@ -317,7 +350,7 @@ def _render_selected_feature_extractor(selected_features, fill_values, clip_boun
                                        window_model_threshold=0.5,
                                        use_stage2_ir=False,
                                        default_fs=25.0,
-                                       window_sec=3.0):
+                                       window_sec=5.0):
     order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
     fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
     clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
@@ -1751,6 +1784,8 @@ def main():
                    help="run s07 FP-sensitive postprocess optimization on cached windows")
     p.add_argument("--full_optimize", action="store_true",
                    help="enable full search loop: model/feature-count search, window cache export, and s07 postprocess optimization")
+    p.add_argument("--hard_negative_optimize", action="store_true",
+                   help="enable FP-sensitive train-only hard-negative mining, cache export, s07 postprocess search, and s10 audit")
     p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
                    help="split used by s07 postprocess optimization")
     p.add_argument("--postprocess_fp_cost", type=float, default=4.0,
@@ -1773,10 +1808,27 @@ def main():
                    help="run optional s10 generalization audit after s06_eval")
     p.add_argument("--audit_min_support", type=int, default=10,
                    help="minimum sample/window count before a stratum is treated as reliable in s10")
+    p.add_argument("--hard_negative_weight", type=float, default=3.0,
+                   help="s05 sample weight assigned to train-only mined hard negatives")
+    p.add_argument("--hard_negative_top_percentile", type=float, default=0.10,
+                   help="s05 fraction of highest-probability train negatives selected as hard negatives")
+    p.add_argument("--hard_negative_min_probability", type=float, default=None,
+                   help="s05 minimum OOF probability for hard-negative mining; defaults to initial threshold")
     p.add_argument("--export_deploy_cookbook", action=argparse.BooleanOptionalAction, default=True,
                    help="导出部署配方给嵌入式同事 (--no-export_deploy_cookbook 跳过)")
 
     args = p.parse_args()
+    if args.hard_negative_optimize:
+        args.model_search = True
+        args.threshold_objective = "precision_constrained"
+        args.threshold_min_precision = 0.995
+        args.model_search_fp_cost = 4.0
+        args.export_window_cache = True
+        args.optimize_postprocess = True
+        args.postprocess_fp_cost = 8.0
+        args.max_sample_fp_rate = 0.005
+        args.max_false_worn_event_rate = 0.005
+        args.run_generalization_audit = True
     if args.full_optimize:
         args.model_search = True
         args.export_window_cache = True
@@ -1834,6 +1886,12 @@ def main():
     stage2_ir_flag = "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir"
     s04_skip_vif_flag = "--skip_vif" if args.skip_vif else ""
     model_search_flag = "--model_search" if args.model_search else "--no-model_search"
+    hard_negative_mining_flag = " --mine_hard_negatives" if args.hard_negative_optimize else ""
+    hard_negative_min_prob_arg = (
+        ""
+        if args.hard_negative_min_probability is None
+        else f" --hard_negative_min_probability {args.hard_negative_min_probability}"
+    )
     cache_export_flag = " --export_window_cache" if args.export_window_cache else ""
     if not args.dry_run and "s01" not in skip_set and not dataset_has_h5_files(args.dataset_dir):
         print(f"[ERROR] no .h5 files found in dataset_dir={args.dataset_dir!r}")
@@ -1941,6 +1999,10 @@ def main():
             f'--model_search_reg_alpha "{args.model_search_reg_alpha}" '
             f'--model_search_subsample "{args.model_search_subsample}" '
             f'--model_search_colsample_bytree "{args.model_search_colsample_bytree}"'
+            f'{hard_negative_mining_flag} '
+            f'--hard_negative_weight {args.hard_negative_weight} '
+            f'--hard_negative_top_percentile {args.hard_negative_top_percentile}'
+            f'{hard_negative_min_prob_arg}'
         )
 
     # s06_opt
@@ -2175,8 +2237,14 @@ def main():
                 _best_k, _best_acc = None, -1.0
                 # 构建无 model_search 的命令模板
                 _cmd_no_search = cmd.replace(" --model_search ", " --no-model_search ")
+                _cmd_quick_template = _cmd_no_search
+                if args.hard_negative_optimize:
+                    _cmd_quick_template = _cmd_quick_template.replace(" --mine_hard_negatives", "")
+                    _cmd_quick_template = re.sub(r" --hard_negative_weight [^\s]+", "", _cmd_quick_template)
+                    _cmd_quick_template = re.sub(r" --hard_negative_top_percentile [^\s]+", "", _cmd_quick_template)
+                    _cmd_quick_template = re.sub(r" --hard_negative_min_probability [^\s]+", "", _cmd_quick_template)
                 for _k in _counts:
-                    _cmd_k = re.sub(r' --max_features \d+', f' --max_features {_k}', _cmd_no_search)
+                    _cmd_k = re.sub(r' --max_features \d+', f' --max_features {_k}', _cmd_quick_template)
                     _cmd_k = re.sub(r'--model_search_feature_counts "[^"]*"',
                                     f'--model_search_feature_counts "{_k}"', _cmd_k)
                     print(f"\n  --- k={_k} ---")
@@ -2184,25 +2252,36 @@ def main():
                     if not _ok:
                         continue
                     # 读取 CV 结果判断最优 k
-                    _rec_path = os.path.join(args.artifact_dir, 'model_search_records.json')
-                    if os.path.exists(_rec_path):
-                        try:
-                            with open(_rec_path, 'r') as _rf:
-                                _records = json.load(_rf)
-                            if _records:
-                                _acc = _records[0].get('mean_cv_accuracy', 0.0)
-                                if _acc > _best_acc:
-                                    _best_k, _best_acc = _k, _acc
-                        except Exception:
-                            pass
-                if _best_k is not None and _best_k != _counts[-1]:
+                    if not args.dry_run:
+                        _acc = _read_s05_quick_k_score(args.artifact_dir)
+                        if _acc is not None:
+                            print(f"  [k={_k}] quick valid accuracy={_acc:.6f}")
+                            if _acc > _best_acc:
+                                _best_k, _best_acc = _k, _acc
+                if _best_k is not None:
                     print(f"\n[特征数量搜参] 最优 k={_best_k} (acc={_best_acc:.4f})，完整搜参")
                     _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_best_k}', cmd)
                     _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
                                        f'--model_search_feature_counts "{_best_k}"', _cmd_best)
                     ok = _run(f'{display_name} (k={_best_k}, full search)', _cmd_best, dry_run=args.dry_run)
+                elif args.dry_run:
+                    _dry_k = _counts[-1]
+                    _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_dry_k}', cmd)
+                    _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
+                                       f'--model_search_feature_counts "{_dry_k}"', _cmd_best)
+                    _label = (
+                        f'{display_name} (representative full hard-negative search)'
+                        if args.hard_negative_optimize
+                        else f'{display_name} (representative full model search)'
+                    )
+                    ok = _run(_label, _cmd_best, dry_run=True)
                 else:
-                    ok = True  # 最后一个 k 已最优
+                    print(
+                        "\n[FAIL] feature-count quick search finished, but no quick "
+                        "accuracy was found in final_model_config.json; refusing to "
+                        "skip the required full model search."
+                    )
+                    ok = False
             else:
                 ok = _run(display_name, cmd, dry_run=args.dry_run)
         else:

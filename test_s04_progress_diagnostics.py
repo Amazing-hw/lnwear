@@ -1,4 +1,5 @@
 import s04_feature_selection as s04
+import numpy as np
 import pandas as pd
 import subprocess
 import sys
@@ -72,6 +73,43 @@ def test_diagnostics_can_reuse_cleaning_result_without_reclean(monkeypatch):
     removed = diag.set_index("feature").loc["f_removed"]
     assert int(removed["removed"]) == 1
     assert removed["removed_reason"] == "low_variance"
+
+
+def test_vif_uses_stable_ridge_solver_for_collinear_features(monkeypatch):
+    calls = []
+
+    class RecordingRidge:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+
+        def fit(self, X, y):
+            self._pred = float(np.mean(y))
+            return self
+
+        def predict(self, X):
+            return np.full(X.shape[0], self._pred)
+
+    monkeypatch.setattr("sklearn.linear_model.Ridge", RecordingRidge)
+
+    base = np.linspace(0.0, 1.0, 12)
+    df_train = pd.DataFrame({
+        "target": [0, 1] * 6,
+        "f0": base,
+        "f1": base + 1e-9,
+        "f2": 1.0 - base,
+    })
+    df_valid = df_train.copy()
+
+    s04.clean_features_by_train(
+        df_train,
+        df_valid,
+        ["f0", "f1", "f2"],
+        corr_thresh=1.01,
+        skip_vif=False,
+    )
+
+    assert calls
+    assert all(call.get("solver") == "lsqr" for call in calls)
 
 
 def test_s08_can_forward_skip_vif_to_s04():
