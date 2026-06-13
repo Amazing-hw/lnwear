@@ -1684,6 +1684,9 @@ def main():
                    help="F-beta 参数 (<1 偏precision)")
 
     # ── s06 参数 ──
+    p.add_argument("--threshold_min_precision", type=float, default=0.95,
+                   help="s05 precision_constrained threshold search minimum precision")
+
     # s05 model-search params
     p.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=True,
                    help="enable s05 XGBoost param search under a node budget; use --no-model_search to disable")
@@ -1909,6 +1912,7 @@ def main():
             f'--max_features {args.max_features} '
             f'--threshold_objective {args.threshold_objective} '
             f'--threshold_beta {args.threshold_beta} '
+            f'--threshold_min_precision {args.threshold_min_precision} '
             f'--calibration_method {args.calibration_method} '
             f'--threshold_valid_fraction {args.threshold_valid_fraction} '
             f'--calibration_random_state {args.calibration_random_state} '

@@ -565,3 +565,25 @@ def test_s08_model_search_can_be_disabled_for_fast_dry_runs():
     output = result.stdout + result.stderr
     assert "--no-model_search" in output
     assert " --model_search " not in output
+
+
+def test_s08_passes_threshold_min_precision_to_s05_for_fp_sensitive_runs():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--threshold_objective",
+            "precision_constrained",
+            "--threshold_min_precision",
+            "0.995",
+        ],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert "--threshold_objective precision_constrained" in output
+    assert "--threshold_min_precision 0.995" in output

@@ -402,6 +402,156 @@ python s05_train_final_model.py \
   --calibration_method isotonic
 ```
 
+如果真实运行中主要错误来自“非人体佩戴在物体上”这类高舆情风险 FP，优先把窗口阈值切到 precision 约束模式，而不是只追求总体 accuracy：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --threshold_objective precision_constrained \
+  --threshold_min_precision 0.995 \
+  --model_search_fp_cost 4.0 \
+  --full_optimize \
+  --max_sample_fp_rate 0.005 \
+  --max_false_worn_event_rate 0.005 \
+  --postprocess_fp_cost 8.0
+```
+
+这会让 s05 的窗口阈值选择优先满足高 precision，再让 s07 后处理搜参更强地惩罚 false-worn event。若召回下降，先检查这些 object-worn hard negatives 是否已充分进入 train/valid，而不是降低 FP 约束。
+
+### Stage2 训练分布策略：不要盲目全量训练
+
+当前部署链路是两阶段：Stage1 先用 IR DC/ACDC gate 决定哪些窗口有机会进入 Stage2，Stage2 XGBoost 只在这些窗口上输出佩戴概率。因此，Stage2 的默认训练分布应尽量贴近真实部署输入：**Stage1 通过或接近通过的窗口**。不建议为了“看起来覆盖全量数据”而直接把所有明显 Stage1 失败的 easy negatives 混入 Stage2 训练，否则会带来训练/部署分布错位：模型可能学到很多部署时根本看不到的简单负样本，窗口级 accuracy 变好，但对 object-worn、松戴、物体表面反光这类真正会穿过 Stage1 的 hard negatives 反而不够敏感。
+
+更推荐的策略是：
+
+```text
+Stage2 final training set =
+  positives that pass the normal Stage1/skip policy
+  + negatives that pass Stage1
+  + object-worn / hard-negative windows that pass or nearly pass Stage1
+```
+
+也就是说，object-worn 不应该作为普通负样本“随机混进去”，而应该作为高风险 hard-negative 子类被固定纳入 train/valid/test，并在泛化审计里单独看 FP rate / false-worn event rate。如果数据里能提供 `negative_type=object_worn`、`scene_type=object_worn` 或类似字段，建议按这个字段做分层审计；如果暂时没有字段，至少在 `sample_name` / H5 分组命名中保留可解析标记，方便 s10 和人工复盘。
+
+什么时候可以考虑“全量数据”？
+
+- 用于 Stage1 阈值审计：可以看全量 negatives 中哪些会穿过 Stage1。
+- 用于 hard-negative mining：从全量 negatives 里挖出 Stage1 pass / near-pass 的 object-worn 窗口，再加入 Stage2 训练。
+- 不建议直接用于最终 Stage2 模型训练，除非有显式采样/加权，保证 easy negatives 不淹没 object-worn hard negatives。
+
+### Hard negative 数据闭环与命令
+
+这里的 hard negative 指真实标签为未佩戴/非人体佩戴，但 Stage2 或状态机给出高佩戴概率、甚至输出佩戴事件的样本。当前最需要优先处理的是 `object-worn`：手表戴在物体、桌面、布料、塑料、假体或其他非人体介质上却被识别为佩戴。它比“人手上但识别为未佩戴”的舆情风险更高，因此训练、阈值和后处理都应优先约束这类 false positive。
+
+如果数据能提供 `negative_type=object_worn`、`scene_type=object_worn`、`subject_type=non_human` 等字段，建议保留到 s01/s03 后续表格中；如果暂时没有元数据，至少在 H5 record、`sample_name` 或文件名中保留 `object_worn` / `non_human` / `hard_negative` 标记，方便 s06/s10 分层复盘。
+
+推荐的高 FP 风险完整训练命令：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --window_sec 3 \
+  --stride_sec 1 \
+  --skip_initial_windows 3 \
+  --no-use_stage2_ir \
+  --threshold_objective precision_constrained \
+  --threshold_min_precision 0.995 \
+  --model_search_fp_cost 4.0 \
+  --model_search_feature_counts "8,10,12,15,18" \
+  --max_model_nodes 500 \
+  --full_optimize \
+  --max_sample_fp_rate 0.005 \
+  --max_false_worn_event_rate 0.005 \
+  --postprocess_fp_cost 8.0
+```
+
+这条命令会同时做特征数量搜索、XGBoost 参数搜索、窗口缓存导出和 s07 后处理搜参。窗口模型阶段用 `precision_constrained` 和较高 `threshold_min_precision` 先压低 object-worn FP 风险；后处理阶段再用 `max_false_worn_event_rate` 与更高 `postprocess_fp_cost` 约束样本级误触发。
+
+如果模型已经训练完，只想基于当前结果导出窗口缓存并做后处理搜参，使用：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --skip s01,s02,s03,s04,s04_search,s05 \
+  --export_window_cache \
+  --optimize_postprocess \
+  --postprocess_split valid \
+  --split test \
+  --max_sample_fp_rate 0.005 \
+  --max_false_worn_event_rate 0.005 \
+  --postprocess_fp_cost 8.0 \
+  --stop_after s07_post
+```
+
+如果只想单独生成 hard negative 与错误分析文件，运行：
+
+```bash
+python s06_deploy_eval.py \
+  --artifact_dir artifacts \
+  --split test \
+  --method state_machine \
+  --window_sec 3 \
+  --stride_sec 1 \
+  --skip_initial_windows 3 \
+  --no-use_stage2_ir
+```
+
+重点查看这些输出：
+
+```text
+artifacts/hard_negatives_test_state_machine.json
+artifacts/window_error_analysis_test_state_machine.csv
+artifacts/window_error_analysis_test_state_machine.json
+artifacts/error_stratification_test_state_machine.json
+artifacts/end_to_end_eval_test_state_machine.json
+```
+
+复盘顺序建议：
+
+1. 先看 `hard_negatives_test_state_machine.json`，确认高置信 FP 是否集中在 object-worn、反光物体、松戴、低质量或某个 mode。
+2. 再看 `window_error_analysis_test_state_machine.csv`，筛选 `target == 0` 且 `pred_raw == 1` 或 `pred_state_machine == 1` 的窗口，按 `prob_raw`、`sample_name`、`h5_file`、`window_index` 排序。
+3. 然后看 `error_stratification_test_state_machine.json`，确认 FP 是否集中在 `mode`、H5/record、早期窗口、quality/OOD 分层。
+4. 最后看 `end_to_end_eval_test_state_machine.json` 中的 `sample_fp_rate`、`false_worn_event_rate` 和首个佩戴输出延迟，避免只看窗口 accuracy。
+
+泛化审计命令：
+
+```bash
+python s10_generalization_audit.py \
+  --artifact_dir artifacts \
+  --split test \
+  --method state_machine \
+  --min_support 10
+```
+
+或在 s08 里显式追加审计：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --run_generalization_audit \
+  --stop_after s10_audit
+```
+
+审计后重点看：
+
+```text
+artifacts/generalization_audit/summary.md
+artifacts/generalization_audit/action_items.csv
+artifacts/generalization_audit/window_strata.csv
+artifacts/generalization_audit/sample_strata.csv
+```
+
+数据回流原则：
+
+- 优先把 object-worn false positives 作为固定高风险负样本组加入下一轮 train/valid/test，而不是只随机增加 easy negatives。
+- train/valid/test 必须按 sample/record/H5 或更强的 subject/device/session 分组隔离，避免同一物体场景泄漏到多个 split。
+- 如果 object-worn FP 仍集中在某些材质、反光、低质量或特定 mode，优先补这些场景的数据和特征审计，不要简单降低 precision 约束。
+- 如果窗口 accuracy 很高但 `false_worn_event_rate` 偏高，应优先检查后处理参数、warmup、连续触发条件和 hard negative 分层，而不是只继续扩大 XGBoost 搜参。
+
 输出：
 
 ```text
