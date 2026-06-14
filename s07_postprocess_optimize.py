@@ -476,6 +476,12 @@ def load_split_caches(artifact_dir, cache_root, split):
 _WORKER_CACHES = None
 
 
+def _init_worker_caches(caches):
+    """Initialize per-process cache state for ProcessPoolExecutor workers."""
+    global _WORKER_CACHES
+    _WORKER_CACHES = caches
+
+
 def _eval_one_param(params):
     """Evaluate a single parameter combination on all cached samples."""
     caches = _WORKER_CACHES
@@ -524,6 +530,11 @@ def main():
         except Exception as e:
             print(f"  skip {fn}: {e}")
     print(f"  loaded {len(caches)} {args.split} caches")
+    if not caches:
+        raise RuntimeError(
+            f"No usable window caches loaded from {cache_dir}; "
+            "rerun s06_deploy_eval.py --export_window_cache and inspect skipped files."
+        )
 
     # Grid search (parallel)
     grid = list(iter_param_grid())
@@ -531,31 +542,60 @@ def main():
     n_workers = max(1, int(args.n_workers))
     t0 = time.time()
 
-    # Module-level cache for worker access
-    import s07_postprocess_optimize as _s07
-    _s07._WORKER_CACHES = caches
+    _init_worker_caches(caches)
 
     results = []
     n_done = 0
-    with ProcessPoolExecutor(max_workers=n_workers) as ex:
-        futures = {ex.submit(_eval_one_param, p): p for p in grid}
-        for fut in as_completed(futures):
+    constraints = {
+        "max_sample_fp_rate": args.max_sample_fp_rate,
+        "max_false_worn_event_rate": args.max_false_worn_event_rate,
+        "max_first_worn_output_p95_sec": args.max_first_worn_output_p95_sec,
+    }
+    worker_errors = []
+    if n_workers == 1:
+        for params in grid:
             n_done += 1
             if n_done % 200 == 0:
                 print(f"  {n_done}/{len(grid)}...")
             try:
-                params, metrics = fut.result()
+                params, metrics = _eval_one_param(params)
             except Exception as e:
-                print(f"  worker error: {e}")
+                worker_errors.append(str(e))
+                if len(worker_errors) <= 5:
+                    print(f"  worker error: {e}")
                 continue
-            constraints = {
-                "max_sample_fp_rate": args.max_sample_fp_rate,
-                "max_false_worn_event_rate": args.max_false_worn_event_rate,
-                "max_first_worn_output_p95_sec": args.max_first_worn_output_p95_sec,
-            }
             metrics["is_valid"] = metrics_satisfy_constraints(metrics, constraints)
-        metrics["score"] = score_metrics(metrics, fp_cost=args.fp_cost)
-        results.append(metrics_with_params(metrics, params))
+            metrics["score"] = score_metrics(metrics, fp_cost=args.fp_cost)
+            results.append(metrics_with_params(metrics, params))
+    else:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker_caches,
+            initargs=(caches,),
+        ) as ex:
+            futures = {ex.submit(_eval_one_param, p): p for p in grid}
+            for fut in as_completed(futures):
+                n_done += 1
+                if n_done % 200 == 0:
+                    print(f"  {n_done}/{len(grid)}...")
+                try:
+                    params, metrics = fut.result()
+                except Exception as e:
+                    worker_errors.append(str(e))
+                    if len(worker_errors) <= 5:
+                        print(f"  worker error: {e}")
+                    continue
+                metrics["is_valid"] = metrics_satisfy_constraints(metrics, constraints)
+                metrics["score"] = score_metrics(metrics, fp_cost=args.fp_cost)
+                results.append(metrics_with_params(metrics, params))
+
+    if not results:
+        unique_errors = sorted(set(worker_errors))[:5]
+        raise RuntimeError(
+            "Postprocess grid search produced no successful candidates. "
+            f"Loaded caches={len(caches)}, candidates={len(grid)}, "
+            f"first_errors={unique_errors}"
+        )
 
     dt = time.time() - t0
     print(f"  done in {dt:.1f}s")

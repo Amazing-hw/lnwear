@@ -208,6 +208,8 @@ FEATURE_GROUPS = {
     ],
     "short_window_stability": [
         "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
+        "GTOP2_HALF_ACDC_DELTA", "GTOP2_SEG_ACDC_RANGE",
+        "GREEN_AMB_LEAK_STABILITY",
     ],
     "short_window_frequency": [
         "GREEN_BAND_ENERGY_RATIO", "AMB_BAND_ENERGY_RATIO",
@@ -234,22 +236,26 @@ FEATURE_GROUPS = {
         "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
         "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
         "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
+        "G_TOP1_TO_TOP2_AC_RATIO", "G_SPATIAL_VMAG_RANGE",
     ],
     # -- 绿光三通道一致性(3) - limit 1 --
     "green_3ch_consistency": [
         "G_bp_corr_mean", "G_bp_corr_min", "G_bp_corr_std",
         "G_bp_lag_std",
         "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
+        "G_TOP2_RANK_STABILITY", "G_TOP2_SWITCH_RATE",
     ],
     # -- Ambient 交叉泄露(5) - limit 1 --
     "amb_cross": [
         "GREEN_AMB_BP_CORR",
         "GREEN_AMB_ENV_CORR",
         "GREEN_AMB_LEAK",
+        "GREEN_AMB_SEG_CORR_RANGE",
         "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
     ],
     # -- 周期性/频域: FFT + Autocorr + 谐波 (limit 2) --
     "frequency": [
+        "GTOP2_BAND_ENERGY_RATIO", "GTOP2_FFT_PEAK_MEDIAN_RATIO", "GTOP2_DOM_FREQ",
         "GREEN_FFT_PEAK_MEDIAN_RATIO", "GREEN_DOM_FREQ",
         "GREEN_AUTO_CORR_PEAK", "GREEN_AUTO_CORR_LAG_SEC",
         "AMBX_FFT_PEAK_MEDIAN_RATIO", "AMBX_DOM_FREQ",
@@ -270,6 +276,8 @@ FEATURE_GROUPS = {
     ],
     # -- 波形形态: Derivative(10) + Temporal(5) = 15 - limit 2 --
     "waveform_morphology": [
+        "GTOP2_bp_skewness", "GTOP2_bp_kurtosis",
+        "GTOP2_zero_cross_rate", "GTOP2_abs_diff_ratio",
         "Deriv_d1_mean", "Deriv_d1_std", "Deriv_d1_max", "Deriv_d1_min", "Deriv_d1_zcr",
         "Deriv_d2_mean", "Deriv_d2_std", "Deriv_d2_max", "Deriv_d2_min", "Deriv_d2_zcr",
         "Temporal_slope_mean", "Temporal_slope_std",
@@ -286,6 +294,8 @@ FEATURE_GROUPS = {
         "ACC_GREEN_BP_CORR", "ACC_IR_BP_CORR",
         "ACC_PPG_coherence_mean", "ACC_PPG_coherence_max",
         "ACC_ENERGY_TO_GREEN_AC",
+        "ACC_TO_GTOP2_AC_RATIO", "ACC_STILL_X_GREEN_STABILITY",
+        "ACC_DIFF_TO_GTOP2_DIFF_RATIO", "ACC_STILL_GREEN_MISMATCH",
     ],
     # -- ACC 分轴统计 (12) - limit 1 --
     "acc_per_axis": [
@@ -311,14 +321,14 @@ FEATURE_GROUPS = {
 GROUP_LIMITS_DEFAULT = {
     "commercial_baseline": 8,
     "signal_quality": 2,
-    "short_window_stability": 1,
+    "short_window_stability": 2,
     "short_window_frequency": 1,
     "green_stats": 2,
     "ambient_stats": 2,
-    "green_spatial": 2,
-    "green_3ch_consistency": 2,
+    "green_spatial": 3,
+    "green_3ch_consistency": 3,
     "amb_cross": 2,
-    "frequency": 3,
+    "frequency": 4,
     "spatial_coupling": 1,
     "signal_complexity": 2,
     "waveform_morphology": 3,
@@ -354,10 +364,16 @@ DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
     "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
     "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
     "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
+    "G_TOP1_TO_TOP2_AC_RATIO", "G_TOP2_RANK_STABILITY", "G_TOP2_SWITCH_RATE",
+    "G_SPATIAL_VMAG_RANGE", "GREEN_AMB_SEG_CORR_RANGE",
     # Top-2 green non-FFT statistics.
     "GTOP2_ROBUST_RANGE_RATIO", "GTOP2_SEG_ACDC_CV",
     "GTOP2_DC_MEDIAN", "GTOP2_DC_IQR", "GTOP2_AC_RMS", "GTOP2_AC_MAD",
     "GTOP2_AC_DC_RATIO", "GTOP2_DERIV_MAD",
+    "GTOP2_bp_skewness", "GTOP2_bp_kurtosis",
+    "GTOP2_zero_cross_rate", "GTOP2_abs_diff_ratio",
+    "GTOP2_HALF_ACDC_DELTA", "GTOP2_SEG_ACDC_RANGE",
+    "GREEN_AMB_LEAK_STABILITY",
     # ACC features that stay simple for endpoint deployment.
     "ACC_MAG_MEAN", "ACC_MAG_STD", "ACC_MAG_MAD", "ACC_AXIS_STD_SUM",
     "ACC_GRAVITY_DOM_RATIO", "ACC_BP_RMS", "ACC_DIFF_MAD", "ACC_STILL_SCORE",
@@ -368,6 +384,8 @@ DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
     "ACC_AXIS_MEAN_SUM", "ACC_MAG_ENERGY", "ACC_MAG_P2P",
     "ACC_TILT_ANGLE", "ACC_DOM_AXIS", "ACC_GRAVITY_RATIO",
     "ACC_ENERGY_TO_GREEN_AC", "ACC_GREEN_BP_CORR",
+    "ACC_TO_GTOP2_AC_RATIO", "ACC_STILL_X_GREEN_STABILITY",
+    "ACC_DIFF_TO_GTOP2_DIFF_RATIO", "ACC_STILL_GREEN_MISMATCH",
     # Metadata.
     "SIG_LEN", "SIG_SEC", "mode",
     "TOTAL_INVALID_COUNT", "PPG_INVALID_COUNT", "GREEN_INVALID_COUNT",
@@ -1481,6 +1499,38 @@ def generate_feature_subset_candidates(combined_summary, kept_features, max_feat
         "features": balanced_feats,
         "description": "加权: 0.4×accuracy + 0.3×(1-FP) + 0.3×(1-cost/max)",
     }
+
+    focus_groups = [
+        "green_stats", "green_spatial", "green_3ch_consistency",
+        "frequency", "short_window_stability", "amb_cross",
+        "acc_features", "acc_per_axis", "acc_orientation",
+    ]
+    by_group = defaultdict(list)
+    for item in acc_sorted:
+        by_group[item.get("group", feature_to_group(item["feature"]))].append(item)
+    beam_specs = [
+        ("accuracy_beam_green_top2", ["green_stats", "frequency", "green_3ch_consistency", "green_spatial", "acc_features", "amb_cross"]),
+        ("accuracy_beam_stability", ["short_window_stability", "green_spatial", "green_3ch_consistency", "green_stats", "frequency", "acc_features"]),
+        ("accuracy_beam_motion_light", ["acc_features", "acc_per_axis", "acc_orientation", "green_stats", "frequency", "amb_cross"]),
+    ]
+    for name, preferred_groups in beam_specs:
+        ordered = []
+        seen_features = set()
+        for group in preferred_groups + [g for g in focus_groups if g not in preferred_groups]:
+            for item in by_group.get(group, [])[:3]:
+                if item["feature"] not in seen_features:
+                    ordered.append(item)
+                    seen_features.add(item["feature"])
+        for item in acc_sorted:
+            if item["feature"] not in seen_features:
+                ordered.append(item)
+                seen_features.add(item["feature"])
+        feats, _ = _select_top_n_by_group(ordered, max_features)
+        if feats:
+            candidates[name] = {
+                "features": feats,
+                "description": "accuracy-first beam candidate with group-diverse deployment-friendly features",
+            }
 
     # 5. balanced_12: 同 balanced，12 特征
     balanced_12_feats, _ = _select_top_n_by_group(balanced_sorted, 12)

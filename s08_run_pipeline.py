@@ -89,6 +89,7 @@ import joblib
 
 from s03_extract_feature_pool import is_stage2_ir_feature
 from s04_feature_selection import (
+    is_deployment_allowed_feature,
     summarize_deployment_feature_costs,
 )
 import ast
@@ -199,14 +200,14 @@ EXTRA_FEATURE_FORMULAS = {
         },
     },
     "ACC_PPG_coherence_mean": {
-        "formula": "mean(coherence(acc_mag, g_mean_bp, fs=25) over 0.5-3Hz)",
+        "formula": "legacy research feature; excluded from the deployment-friendly Stage2 pool",
         "intermediate_signals": {
             "acc_mag": "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
             "g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3",
         },
     },
     "ACC_PPG_coherence_max": {
-        "formula": "max(coherence(acc_mag, g_mean_bp, fs=25) over 0.5-3Hz)",
+        "formula": "legacy research feature; excluded from the deployment-friendly Stage2 pool",
         "intermediate_signals": {
             "acc_mag": "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
             "g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3",
@@ -318,192 +319,18 @@ def build_selected_feature_formulas(selected_features):
     return recipe
 
 
-def _standalone_feature_engine_source(scripts_dir):
-    """Return the window-level feature engine inlined into the deploy script."""
-    source_path = os.path.join(str(scripts_dir), "s03_extract_feature_pool.py")
-    if not os.path.exists(source_path):
-        raise FileNotFoundError(f"feature engine source not found: {source_path}")
-    with open(source_path, "r", encoding="utf-8") as f:
-        source = f.read()
-
-    redundant_start = source.index("_REDUNDANT_FEATURES = {")
-    redundant_end = source.index("# =========================================================", redundant_start)
-    redundant_source = source[redundant_start:redundant_end].strip()
-
-    engine_start = source.index("def safe_div")
-    engine_end = source.index("def _downsample_ppg", engine_start)
-    engine_source = source[engine_start:engine_end].strip()
-    drop_start = engine_source.find("\ndef extract_window_features")
-    drop_end = engine_source.find("\ndef align_acc_window", drop_start)
-    if drop_start >= 0 and drop_end > drop_start:
-        engine_source = engine_source[:drop_start] + engine_source[drop_end:]
-    engine_source = engine_source.replace(
-        "训练（s03）和部署（s06）都调用此函数，保证一致性。",
-        "Training and deployment use the same exported feature logic.",
-    )
-    return "\n\n".join([
-        "EPS = 1e-12",
-        redundant_source,
-        "_BUTTER_CACHE = {}",
-        engine_source,
-    ])
-
-
-def _render_selected_feature_extractor(selected_features, fill_values, clip_bounds, formulas, scripts_dir,
-                                       window_model_threshold=0.5,
-                                       use_stage2_ir=False,
-                                       default_fs=25.0,
-                                       window_sec=5.0):
-    order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
-    fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
-    clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
-    formulas_json = json.dumps(formulas, ensure_ascii=False, indent=2)
-    threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
-    default_fs_py = repr(float(default_fs))
-    window_sec_py = repr(float(window_sec))
-    feature_engine_source = _standalone_feature_engine_source(scripts_dir)
-
-    return f'''# -*- coding: utf-8 -*-
-"""Auto-generated selected-feature extractor for watch wearing-liveness.
-
-This reference deployment script exports only the selected model features.
-It is self-contained and does not import project training/evaluation scripts.
-"""
-
-from __future__ import annotations
-
-from collections import OrderedDict
-
-import numpy as np
-from scipy.signal import butter, correlate, coherence, filtfilt, find_peaks, medfilt
-
-
-FEATURE_ORDER = {order_json}
-FILL_VALUES = {fill_json}
-CLIP_BOUNDS = {clip_json}
-FEATURE_FORMULAS = {formulas_json}
-WINDOW_MODEL_THRESHOLD = {threshold_json}
-DEFAULT_FS = {default_fs_py}
-DEFAULT_WINDOW_SEC = {window_sec_py}
-
-
-{feature_engine_source}
-
-
-def _clean_value(name, value):
-    if value is None or not np.isfinite(value):
-        return float(FILL_VALUES.get(name, 0.0))
-    v = float(value)
-    # Apply training clip bounds (IQR-based, matches s05 clip_outliers)
-    bound = CLIP_BOUNDS.get(name)
-    if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
-        lo, hi = float(bound[0]), float(bound[1])
-        if v < lo:
-            v = lo
-        elif v > hi:
-            v = hi
-    return v
-
-
-def _add_acc_ppg_coherence(features, acc, g_mean_bp, fs):
-    if acc is None or len(acc) < 16:
-        features["ACC_PPG_coherence_mean"] = 0.0
-        features["ACC_PPG_coherence_max"] = 0.0
-        return
-    try:
-        acc_arr = np.asarray(acc, dtype=float)
-        acc_mag = np.sqrt(np.sum(acc_arr ** 2, axis=1) + 1e-12)
-        n = min(len(acc_mag), len(g_mean_bp))
-        nperseg = min(32, n // 2)
-        if nperseg < 8:
-            features["ACC_PPG_coherence_mean"] = 0.0
-            features["ACC_PPG_coherence_max"] = 0.0
-            return
-        freq, cxy = coherence(acc_mag[:n], g_mean_bp[:n], fs=fs, nperseg=nperseg)
-        mask = (freq >= 0.5) & (freq <= 3.0)
-        if np.any(mask):
-            features["ACC_PPG_coherence_mean"] = float(np.mean(cxy[mask]))
-            features["ACC_PPG_coherence_max"] = float(np.max(cxy[mask]))
-        else:
-            features["ACC_PPG_coherence_mean"] = 0.0
-            features["ACC_PPG_coherence_max"] = 0.0
-    except Exception:
-        features["ACC_PPG_coherence_mean"] = 0.0
-        features["ACC_PPG_coherence_max"] = 0.0
-
-
-def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
-    """Return selected features as a plain dict in model order."""
-    # Stage2 never consumes IR-derived features. IR remains available only to
-    # upstream Stage1 gating; the deployment feature vector is ambient/green/ACC.
-    ir_stage2 = np.zeros_like(np.asarray(ir, dtype=np.float64))
-    features, preprocessed = extract_feature_pool_from_window(
-        ir=ir_stage2,
-        ambient=ambient,
-        g1=g1,
-        g2=g2,
-        g3=g3,
-        fs=fs,
-        return_preprocessed=True,
-    )
-    features.update(extract_acc_features(acc, fs=fs, prefix="ACC"))
-    features.update(extract_acc_tremor_features(acc, fs=fs, prefix="ACC"))
-    features.update(
-        extract_acc_ppg_cross_features(
-            acc,
-            preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"]),
-            fs=fs,
+def _assert_selected_features_deployment_allowed(selected_features):
+    forbidden_features = [
+        name for name in selected_features
+        if not is_deployment_allowed_feature(name)
+    ]
+    if forbidden_features:
+        raise ValueError(
+            "Selected features contain non deployment-friendly operators. "
+            "Deployment export will not silently crop model inputs; rerun s04-s05 so "
+            "feature filtering happens before model training. Offending features: "
+            + ", ".join(forbidden_features)
         )
-    )
-    _add_acc_ppg_coherence(features, acc, preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"]), fs)
-    # ACC energy to green AC ratio (运动能量 vs 脉搏能量)
-    _g_bp = preprocessed.get("g_top2_bp", preprocessed["g_mean_bp"])
-    _g_ac = float(np.sqrt(np.mean(_g_bp ** 2))) if _g_bp is not None else 0.0
-    _acc_energy = float(features.get("ACC_MAG_ENERGY", 0.0))
-    features["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
-    # Ambient Stage1 soft features (环境光软特征)
-    _ir_dc = float(np.median(ir_stage2)) if ir_stage2 is not None and len(ir_stage2) > 0 else 0.0
-    _amb_dc = float(np.median(ambient)) if ambient is not None and len(ambient) > 0 else 0.0
-    _amb_ratio = float(_amb_dc / max(_ir_dc, EPS))
-    features["AMB_STAGE1_RATIO"] = _amb_ratio
-    features["AMB_STAGE1_PASS"] = 1.0 if (_ir_dc >= 1e2 and _amb_ratio < 2.0) else 0.0
-    features["IR_DC_LEVEL"] = _ir_dc
-    features = filter_stage2_ir_features(features)
-    features["mode"] = float(mode)
-
-    missing = [name for name in FEATURE_ORDER if name not in features]
-    if missing:
-        raise KeyError("Selected features missing from standalone deploy extractor: " + ", ".join(missing))
-
-    return {{name: _clean_value(name, features[name]) for name in FEATURE_ORDER}}
-
-
-def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
-    """Return the selected feature vector in model order."""
-    feature_dict = extract_feature_dict(ir, ambient, g1, g2, g3, acc=acc, fs=fs, mode=mode)
-    return [feature_dict[name] for name in FEATURE_ORDER]
-
-
-def classify_probability(probability):
-    """Return the window-level label from a model probability."""
-    return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
-
-
-if __name__ == "__main__":
-    rng = np.random.default_rng(0)
-    n = max(32, int(round(DEFAULT_FS * DEFAULT_WINDOW_SEC)))
-    t = np.arange(n, dtype=float) / DEFAULT_FS
-    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
-    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
-    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
-    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
-    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
-    acc = rng.normal(0, 0.01, (n, 3))
-    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=DEFAULT_FS)
-    print(f"Feature vector: {{len(vec)}} values")
-    for i, (name, value) in enumerate(zip(FEATURE_ORDER, vec)):
-        print(f"{{i:02d}} {{name}} = {{value:.8g}}")
-'''
 
 
 def _render_deployment_feature_extractor(selected_features, fill_values, clip_bounds, formulas,
@@ -695,6 +522,100 @@ def _seg_acdc_cv(raw):
     return _safe_div(float(np.std(vals)), abs(float(np.mean(vals))) + EPS)
 
 
+def _seg_acdc_values(raw, n_segments=3):
+    raw = _finite(raw)
+    if raw.size < 12:
+        return []
+    seg_len = max(1, raw.size // int(n_segments))
+    vals = []
+    for i in range(int(n_segments)):
+        seg = raw[i * seg_len:(i + 1) * seg_len] if i < int(n_segments) - 1 else raw[i * seg_len:]
+        if seg.size >= 4:
+            ac = _mad(np.diff(seg)) if seg.size > 1 else 0.0
+            vals.append(_safe_div(ac, abs(float(np.median(seg))) + EPS))
+    return vals
+
+
+def _zero_cross_rate(x):
+    x = _finite(x)
+    if x.size < 2:
+        return 0.0
+    centered = x - float(np.mean(x))
+    signs = np.sign(centered)
+    return float(np.mean(signs[1:] * signs[:-1] < 0.0))
+
+
+def _bp_shape_features(features, prefix, bp):
+    bp = _finite(bp)
+    if bp.size < 4:
+        features[f"{{prefix}}_bp_skewness"] = 0.0
+        features[f"{{prefix}}_bp_kurtosis"] = 0.0
+        features[f"{{prefix}}_zero_cross_rate"] = 0.0
+        features[f"{{prefix}}_abs_diff_ratio"] = 0.0
+        return
+    centered = bp - float(np.mean(bp))
+    std = float(np.std(centered))
+    if std < EPS:
+        skew = 0.0
+        kurt = 0.0
+    else:
+        z = centered / (std + EPS)
+        skew = float(np.mean(z ** 3))
+        kurt = float(np.mean(z ** 4))
+    features[f"{{prefix}}_bp_skewness"] = skew
+    features[f"{{prefix}}_bp_kurtosis"] = kurt
+    features[f"{{prefix}}_zero_cross_rate"] = _zero_cross_rate(centered)
+    features[f"{{prefix}}_abs_diff_ratio"] = _safe_div(_mad(np.diff(bp)) if bp.size > 1 else 0.0, float(np.mean(np.abs(bp))) + EPS)
+
+
+def _segment_stability_features(features, prefix, raw):
+    vals = _seg_acdc_values(raw, 3)
+    if len(vals) < 2:
+        features[f"{{prefix}}_HALF_ACDC_DELTA"] = 0.0
+        features[f"{{prefix}}_SEG_ACDC_RANGE"] = 0.0
+        return
+    arr = np.asarray(vals, dtype=float)
+    mid = len(arr) // 2
+    first = float(np.mean(arr[:mid])) if mid > 0 else float(arr[0])
+    second = float(np.mean(arr[mid:])) if mid < len(arr) else float(arr[-1])
+    features[f"{{prefix}}_HALF_ACDC_DELTA"] = abs(second - first)
+    features[f"{{prefix}}_SEG_ACDC_RANGE"] = float(np.max(arr) - np.min(arr))
+
+
+def _ambient_green_leak_stability(amb_raw, green_raw):
+    amb_vals = _seg_acdc_values(amb_raw, 3)
+    green_vals = _seg_acdc_values(green_raw, 3)
+    n = min(len(amb_vals), len(green_vals))
+    if n < 2:
+        return 0.0
+    ratios = np.asarray([
+        _safe_div(float(amb_vals[i]), abs(float(green_vals[i])) + EPS)
+        for i in range(n)
+    ], dtype=float)
+    return _safe_div(float(np.std(ratios)), abs(float(np.mean(ratios))) + EPS)
+
+
+def _segment_corr_range(x, y, n_segments=3):
+    x = _finite(x)
+    y = _finite(y)
+    n = min(x.size, y.size)
+    if n < int(n_segments) * 4:
+        return 0.0
+    x = x[:n]
+    y = y[:n]
+    seg_len = max(1, n // int(n_segments))
+    vals = []
+    for i in range(int(n_segments)):
+        xs = x[i * seg_len:(i + 1) * seg_len] if i < int(n_segments) - 1 else x[i * seg_len:]
+        ys = y[i * seg_len:(i + 1) * seg_len] if i < int(n_segments) - 1 else y[i * seg_len:]
+        if xs.size >= 4 and ys.size >= 4:
+            vals.append(_corr(xs, ys))
+    if len(vals) < 2:
+        return 0.0
+    vals = np.asarray(vals, dtype=float)
+    return float(np.max(vals) - np.min(vals))
+
+
 def _acc_features(features, acc):
     keys = [
         "MAG_MEAN", "MAG_STD", "MAG_MAD", "AXIS_STD_SUM", "GRAVITY_DOM_RATIO",
@@ -740,154 +661,6 @@ def _acc_features(features, acc):
     features["ACC_TILT_ANGLE"] = float(np.degrees(np.arccos(np.clip(mean_axis[2] / (norm + EPS), -1.0, 1.0)))) if norm > EPS else 0.0
     features["ACC_DOM_AXIS"] = float(np.argmax(np.abs(mean_axis)))
     features["ACC_GRAVITY_RATIO"] = _safe_div(norm, float(np.mean(mag)) + EPS)
-
-
-def _derivative_features(features, x, fs, prefix):
-    x = _finite(x)
-    if len(x) < 4:
-        for k in ["Deriv_d1_mean","Deriv_d1_std","Deriv_d1_max","Deriv_d1_min","Deriv_d1_zcr"]:
-            features[f"{{prefix}}_{{k}}"] = 0.0
-        return
-    d1 = np.diff(x)
-    features[f"{{prefix}}_Deriv_d1_mean"] = float(np.mean(d1))
-    features[f"{{prefix}}_Deriv_d1_std"] = float(np.std(d1))
-    features[f"{{prefix}}_Deriv_d1_max"] = float(np.max(d1))
-    features[f"{{prefix}}_Deriv_d1_min"] = float(np.min(d1))
-    n = len(d1)
-    features[f"{{prefix}}_Deriv_d1_zcr"] = float(np.sum(np.abs(np.diff(np.sign(d1)))) / (2.0 * n)) if n > 1 else 0.0
-
-
-def _temporal_features(features, x, fs, prefix):
-    x = _finite(x); n = len(x)
-    if n < 4:
-        for k in ["Temporal_slope_mean","Temporal_slope_std","Temporal_peak_prominence","Temporal_peak_ratio"]:
-            features[f"{{prefix}}_{{k}}"] = 0.0
-        return
-    t = np.arange(n, dtype=float)
-    slope = np.polyfit(t, x, 1)[0] if n > 1 else 0.0
-    features[f"{{prefix}}_Temporal_slope_mean"] = float(slope)
-    features[f"{{prefix}}_Temporal_slope_std"] = float(np.std(x - np.polyval([slope, np.mean(x) - slope * np.mean(t)], t)))
-    threshold = float(np.mean(x)) + 0.5 * float(np.std(x))
-    above = x > threshold
-    peaks = 0
-    for i in range(1, n - 1):
-        if above[i] and x[i] > x[i - 1] and x[i] > x[i + 1]:
-            peaks += 1
-    features[f"{{prefix}}_Temporal_peak_ratio"] = float(peaks / n)
-    features[f"{{prefix}}_Temporal_peak_prominence"] = float(np.max(x) - np.median(x)) if peaks else 0.0
-
-
-def _hjorth(features, x, prefix):
-    x = _finite(x)
-    if len(x) < 2:
-        features[f"{{prefix}}_Hjorth_Activity"] = 0.0
-        features[f"{{prefix}}_Hjorth_Mobility"] = 0.0
-        return
-    activity = float(np.var(x))
-    d1 = np.diff(x)
-    var_d1 = float(np.var(d1)) if len(d1) > 1 else 0.0
-    features[f"{{prefix}}_Hjorth_Activity"] = activity
-    features[f"{{prefix}}_Hjorth_Mobility"] = float(np.sqrt(var_d1 / activity)) if activity > EPS else 0.0
-
-
-def _entropy_sampen(features, x, prefix):
-    x = _finite(x); n = len(x)
-    if n < 10:
-        features[f"{{prefix}}_Entropy_SampEn"] = 0.0; return
-    r_val = 0.2 * float(np.std(x))
-    if r_val < EPS:
-        features[f"{{prefix}}_Entropy_SampEn"] = 0.0; return
-    def _count(m):
-        c = 0
-        for i in range(n - m):
-            xi = x[i:i + m]
-            for j in range(i + 1, n - m):
-                if np.max(np.abs(xi - x[j:j + m])) <= r_val:
-                    c += 1
-        return c
-    b2 = _count(2); b3 = _count(3)
-    features[f"{{prefix}}_Entropy_SampEn"] = float(-np.log((b3 + EPS) / (b2 + EPS))) if b2 > 0 and b3 > 0 else 0.0
-
-
-def _bp_skew_kurt(features, bp, prefix):
-    bp = _finite(bp); m = float(np.mean(bp)); s = float(np.std(bp))
-    if s > EPS:
-        features[f"{{prefix}}_bp_skewness"] = float(np.mean((bp - m) ** 3) / (s ** 3))
-        features[f"{{prefix}}_bp_kurtosis"] = float(np.mean((bp - m) ** 4) / (s ** 4))
-    else:
-        features[f"{{prefix}}_bp_skewness"] = 0.0
-        features[f"{{prefix}}_bp_kurtosis"] = 0.0
-
-
-def _fft_extras(features, bp, fs, prefix):
-    bp = _finite(bp); n = len(bp)
-    if n < 16:
-        for k in ["FFT_SNR","FFT_harmonic_ratio","FFT_harmonic_present","FFT_peak_width_Hz"]:
-            features[f"{{prefix}}_{{k}}"] = 0.0
-        return
-    x = bp - np.mean(bp); nfft = 1
-    while nfft < n: nfft <<= 1
-    nfft = max(nfft, 256)
-    spec = np.abs(np.fft.rfft(x * np.hamming(n), nfft))
-    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
-    band = (freqs >= 0.5) & (freqs <= 5.0)
-    bs = spec[band]; bf = freqs[band]
-    in_pow = float(np.sum(bs ** 2))
-    out_pow = float(np.sum(spec ** 2)) - in_pow
-    features[f"{{prefix}}_FFT_SNR"] = _safe_div(in_pow, out_pow + EPS)
-    if len(bs) < 2:
-        features[f"{{prefix}}_FFT_harmonic_ratio"] = 0.0
-        features[f"{{prefix}}_FFT_harmonic_present"] = 0.0
-        features[f"{{prefix}}_FFT_peak_width_Hz"] = 0.0
-    else:
-        f0_idx = int(np.argmax(bs)); f0 = bf[f0_idx]; f0_pow = float(bs[f0_idx] ** 2)
-        h2_mask = (bf >= f0 * 2 - 0.3) & (bf <= f0 * 2 + 0.3)
-        if np.any(h2_mask):
-            h2_pow = float(np.max(bs[h2_mask] ** 2))
-            features[f"{{prefix}}_FFT_harmonic_ratio"] = _safe_div(h2_pow, f0_pow + EPS)
-            features[f"{{prefix}}_FFT_harmonic_present"] = 1.0 if h2_pow > f0_pow * 0.1 else 0.0
-        else:
-            features[f"{{prefix}}_FFT_harmonic_ratio"] = 0.0
-            features[f"{{prefix}}_FFT_harmonic_present"] = 0.0
-        peak_val = np.max(bs); above_half = bs > peak_val * 0.5
-        features[f"{{prefix}}_FFT_peak_width_Hz"] = float(bf[above_half][-1] - bf[above_half][0]) if np.any(above_half) else 0.0
-
-
-def _consensus_stats(features, prefix, base_names):
-    for base in base_names:
-        vals = np.asarray([features.get(f"{{p}}_{{base}}", 0.0) for p in ["G1","G2","G3"]], dtype=float)
-        features[f"G_consensus_{{base}}_min"] = float(np.min(vals))
-        features[f"G_consensus_{{base}}_max"] = float(np.max(vals))
-        features[f"G_consensus_{{base}}_range"] = float(np.max(vals) - np.min(vals))
-        m = np.mean(np.abs(vals))
-        features[f"G_consensus_{{base}}_cv"] = float(np.std(vals) / (m + EPS))
-        sv = np.sort(vals)
-        features[f"G_consensus_{{base}}_top2_mean"] = float(np.mean(sv[-2:]))
-
-
-def _dropout_and_spatial(features, g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp, g_imbalance, vmag):
-    ch_ac = np.asarray([features.get(f"G{{i}}_AC_RMS", 0.0) for i in [1,2,3]])
-    max_ac = float(np.max(ch_ac)) if ch_ac.size else 0.0
-    features["G_DROPOUT_COUNT"] = float(np.sum(ch_ac < 0.05 * max_ac)) if max_ac > EPS else 3.0
-    features["G_MIN_CHANNEL_ID"] = float(np.argmin(ch_ac))
-    vx_d = ch_ac[0] - 0.5 * ch_ac[1] - 0.5 * ch_ac[2]
-    vy_d = (np.sqrt(3.0) / 2.0) * (ch_ac[1] - ch_ac[2])
-    features["G_DROPOUT_ANGLE"] = float(np.degrees(np.arctan2(vy_d, vx_d + EPS)))
-    features["G_TOP2_CHANNEL_COUNT"] = 2.0
-    features["G_TOP2_WORST_IDX"] = features["G_MIN_CHANNEL_ID"]
-    features["corr_Ambient_vmag"] = 0.0
-    features["corr_Gmean_G_imbalance"] = _corr(g1_raw + g2_raw + g3_raw, g_imbalance) if len(g_imbalance) else 0.0
-    features["corr_Gmean_vmag"] = _corr(g1_raw + g2_raw + g3_raw, vmag) if len(vmag) else 0.0
-    c12 = _corr(g1_bp, g2_bp); c23 = _corr(g2_bp, g3_bp); c31 = _corr(g3_bp, g1_bp)
-    cp = np.array([c12, c23, c31])
-    features["G_bp_corr_mean"] = float(np.mean(cp))
-    features["G_bp_corr_min"] = float(np.min(cp))
-    features["G_bp_corr_std"] = float(np.std(cp))
-    l12 = np.correlate(g1_bp - np.mean(g1_bp), g2_bp - np.mean(g2_bp), mode="same")
-    l23 = np.correlate(g2_bp - np.mean(g2_bp), g3_bp - np.mean(g3_bp), mode="same")
-    lag12 = int(np.argmax(np.abs(l12)) - len(l12) // 2) if len(l12) else 0
-    lag23 = int(np.argmax(np.abs(l23)) - len(l23) // 2) if len(l23) else 0
-    features["G_bp_lag_std"] = float(np.std([lag12, lag23]))
 
 
 def _clean_value(name, value):
@@ -947,6 +720,8 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     _single_channel(features, "GREEN", g_mean_raw, g_mean_bp, g_mean_dc)
     _single_channel(features, "AMBX", amb_raw, amb_bp, amb_dc)
     _single_channel(features, "GTOP2", g_top2_raw, g_top2_bp, g_top2_dc)
+    _bp_shape_features(features, "GTOP2", g_top2_bp)
+    _segment_stability_features(features, "GTOP2", g_top2_raw)
     features["GTOP2_ROBUST_RANGE_RATIO"] = _robust_range_ratio(g_top2_raw)
     features["GTOP2_SEG_ACDC_CV"] = _seg_acdc_cv(g_top2_raw)
     features["GREEN_AC"] = 0.5 * g_ac_rms + 0.5 * _mad(g_mean_bp) * 1.4826
@@ -957,6 +732,8 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     features["GREEN_AMB_BP_CORR"] = _corr(g_mean_bp, amb_bp)
     features["GREEN_AMB_ENV_CORR"] = _corr(np.abs(g_mean_bp), np.abs(amb_bp))
     features["GREEN_AMB_LEAK"] = abs(features["GREEN_AMB_BP_CORR"]) * _safe_div(float(np.sqrt(np.mean(amb_bp ** 2))), g_ac_rms + EPS)
+    features["GREEN_AMB_LEAK_STABILITY"] = _ambient_green_leak_stability(amb_raw, g_top2_raw)
+    features["GREEN_AMB_SEG_CORR_RANGE"] = _segment_corr_range(amb_raw, g_top2_raw)
     features["AMB_AC_TO_GREEN_AC"] = _safe_div(float(np.sqrt(np.mean(amb_bp ** 2))), g_ac_rms + EPS)
     features["AMB_DC_TO_GREEN_DC"] = _safe_div(float(np.median(amb_raw)), abs(g_mean_dc) + EPS)
 
@@ -976,6 +753,7 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     features["G_spatial_vmag_p90"] = float(np.percentile(vmag, 90))
     features["G_spatial_vmag_iqr"] = _iqr(vmag)
     features["G_spatial_vmag_std"] = float(np.std(vmag))
+    features["G_SPATIAL_VMAG_RANGE"] = float(np.percentile(vmag, 90) - np.percentile(vmag, 10))
     dc_vals = np.asarray([g1_dc, g2_dc, g3_dc], dtype=float)
     features["G_ch_dc_cv"] = _safe_div(float(np.std(dc_vals)), abs(float(np.mean(dc_vals))) + EPS)
     features["G_ch_dc_max_min_ratio"] = _safe_div(float(np.max(np.abs(dc_vals))), float(np.min(np.abs(dc_vals))) + EPS)
@@ -988,6 +766,9 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
         features["G_TOP2_CORR_MIN"] = 0.0
         features["G_WEAK_CHANNEL_GAP"] = 0.0
         features["G_SPATIAL_STABILITY_SCORE"] = 0.0
+        features["G_TOP1_TO_TOP2_AC_RATIO"] = 0.0
+        features["G_TOP2_RANK_STABILITY"] = 0.0
+        features["G_TOP2_SWITCH_RATE"] = 0.0
     else:
         top2_ac = ch_ac[top2_idx]
         top2_corr = _corr(ch_bp[int(top2_idx[0])], ch_bp[int(top2_idx[1])])
@@ -997,53 +778,60 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
         features["G_TOP2_CORR_MIN"] = float(top2_corr)
         features["G_WEAK_CHANNEL_GAP"] = max(0.0, _safe_div(top2_mean - float(np.min(ch_ac)), top2_mean + EPS))
         features["G_SPATIAL_STABILITY_SCORE"] = features["G_2OF3_AC_SUPPORT"] * max(0.0, top2_corr) / (1.0 + float(np.mean(vmag)))
+        features["G_TOP1_TO_TOP2_AC_RATIO"] = _safe_div(max_ac, top2_mean + EPS)
+        global_top2 = set(int(i) for i in top2_idx)
+        seg_len = max(1, n // 3)
+        switches = []
+        for i in range(3):
+            lo = i * seg_len
+            hi = (i + 1) * seg_len if i < 2 else n
+            if hi - lo < 4:
+                continue
+            seg_ac = np.asarray([
+                float(np.sqrt(np.mean((ch_raw[j][lo:hi] - np.median(ch_raw[j][lo:hi])) ** 2)))
+                for j in range(3)
+            ], dtype=float)
+            switches.append(0.0 if set(int(j) for j in np.argsort(seg_ac)[-2:]) == global_top2 else 1.0)
+        switch_rate = float(np.mean(switches)) if switches else 0.0
+        features["G_TOP2_SWITCH_RATE"] = switch_rate
+        features["G_TOP2_RANK_STABILITY"] = float(1.0 - switch_rate)
 
     band, peak, dom = _fft_metrics(g_top2_bp, fs)
     features["GTOP2_BAND_ENERGY_RATIO"] = band
     features["GTOP2_FFT_PEAK_MEDIAN_RATIO"] = peak
     features["GTOP2_DOM_FREQ"] = dom
 
-    # Waveform features: derivative, temporal, Hjorth, entropy
-    for _pfx, _sig in [("GREEN", g_mean_bp), ("GTOP2", g_top2_bp), ("AMBX", amb_bp)]:
-        _derivative_features(features, _sig, fs, _pfx)
-        _temporal_features(features, _sig, fs, _pfx)
-    for _pfx, _sig in [("GREEN", g_mean_bp), ("GTOP2", g_top2_bp)]:
-        _hjorth(features, _sig, _pfx)
-    _entropy_sampen(features, g_mean_bp, "GREEN")
-    _bp_skew_kurt(features, g_mean_bp, "GREEN")
-    _bp_skew_kurt(features, amb_bp, "AMBX")
-    _fft_extras(features, g_mean_bp, fs, "GREEN")
-    band_a, peak_a, dom_a = _fft_metrics(amb_bp, fs)
-    features["AMB_BAND_ENERGY_RATIO"] = band_a
-    features["AMB_FFT_PEAK_MEDIAN_RATIO"] = peak_a
-    features["AMB_DOM_FREQ"] = dom_a
-    band_g, peak_g, dom_g = _fft_metrics(g_mean_bp, fs)
-    features["GREEN_BAND_ENERGY_RATIO"] = band_g
-    features["FFT_PEAK_MEDIAN_RATIO"] = peak_g
-    features["GREEN_XCORR"] = _corr(g_mean_bp, np.roll(g_mean_bp, 1))
-    features["GREEN_SAT_FRAC"] = float(np.mean(g_mean_raw >= 0.98 * np.max(g_mean_raw))) if len(g_mean_raw) else 0.0
-    features["GREEN_CLIP_RATE"] = float(np.mean(np.abs(np.diff(g_mean_raw)) < 1e-10)) if len(g_mean_raw) > 1 else 0.0
-
-    # Per-channel single features for G1/G2/G3
-    for _i, (_pfx, _r, _b, _d) in enumerate([
-        ("G1", g1_raw, g1_bp, g1_dc), ("G2", g2_raw, g2_bp, g2_dc), ("G3", g3_raw, g3_bp, g3_dc)]):
-        _single_channel(features, _pfx, _r, _b, _d)
-
-    # Consensus statistics across G1/G2/G3
-    _consensus_stats(features, "G", [
-        "DC_MEDIAN","AC_RMS","AC_MAD","AC_DC_RATIO","DERIV_MAD",
-        "FFT_PEAK_MEDIAN_RATIO","AUTO_CORR_PEAK",
-    ])
-
-    # Dropout + spatial correlation features
-    _dropout_and_spatial(features, g1_raw, g2_raw, g3_raw, g1_bp, g2_bp, g3_bp, g_imbalance, vmag)
-
     _acc_features(features, acc)
-    features["ACC_GREEN_BP_CORR"] = _corr(
-        np.sqrt(np.sum(np.asarray(acc, dtype=float)[:, :3] ** 2, axis=1)) if acc is not None and len(acc) else [],
-        g_top2_bp,
-    )
+    acc_mag = np.asarray([], dtype=float)
+    if acc is not None and len(acc):
+        acc_arr = np.asarray(acc, dtype=float)
+        if acc_arr.ndim == 1:
+            acc_arr = acc_arr.reshape(-1, 1)
+        if acc_arr.shape[1] < 3:
+            pad = np.zeros((acc_arr.shape[0], 3 - acc_arr.shape[1]))
+            acc_arr = np.hstack([acc_arr, pad])
+        acc_mag = np.sqrt(np.sum(acc_arr[:, :3] ** 2, axis=1) + EPS)
+    features["ACC_GREEN_BP_CORR"] = _corr(acc_mag, g_top2_bp)
     features["ACC_ENERGY_TO_GREEN_AC"] = _safe_div(features.get("ACC_MAG_ENERGY", 0.0), float(np.sqrt(np.mean(g_top2_bp ** 2))) + EPS)
+    n_acc = min(acc_mag.size, g_top2_raw.size, g_top2_bp.size)
+    if n_acc >= 4:
+        mag = acc_mag[:n_acc]
+        green_raw_acc = g_top2_raw[:n_acc]
+        green_bp_acc = g_top2_bp[:n_acc]
+        acc_diff_mad = _mad(np.diff(mag)) if mag.size > 1 else 0.0
+        green_diff_mad = _mad(np.diff(green_raw_acc)) if green_raw_acc.size > 1 else 0.0
+        green_ac = float(np.sqrt(np.mean(green_bp_acc ** 2)))
+        green_stability = 1.0 / (1.0 + _seg_acdc_cv(green_raw_acc))
+        still_score = 1.0 / (1.0 + float(np.std(mag)) + acc_diff_mad)
+        features["ACC_TO_GTOP2_AC_RATIO"] = _safe_div(acc_diff_mad, green_ac + EPS)
+        features["ACC_STILL_X_GREEN_STABILITY"] = float(still_score * green_stability)
+        features["ACC_DIFF_TO_GTOP2_DIFF_RATIO"] = _safe_div(acc_diff_mad, green_diff_mad + EPS)
+        features["ACC_STILL_GREEN_MISMATCH"] = float(still_score * _safe_div(green_ac, acc_diff_mad + EPS))
+    else:
+        features["ACC_TO_GTOP2_AC_RATIO"] = 0.0
+        features["ACC_STILL_X_GREEN_STABILITY"] = 0.0
+        features["ACC_DIFF_TO_GTOP2_DIFF_RATIO"] = 0.0
+        features["ACC_STILL_GREEN_MISMATCH"] = 0.0
     features["SIG_LEN"] = float(n)
     features["SIG_SEC"] = float(n / fs) if fs else 0.0
     features["mode"] = float(mode)
@@ -1064,7 +852,40 @@ def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
 
 def classify_probability(probability):
     return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
+
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    n = max(32, int(round(DEFAULT_FS * DEFAULT_WINDOW_SEC)))
+    t = np.arange(n, dtype=float) / DEFAULT_FS
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+    acc = rng.normal(0, 0.01, (n, 3))
+    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=DEFAULT_FS)
+    print(f"Feature vector: {{len(vec)}} values")
+    for i, (name, value) in enumerate(zip(FEATURE_ORDER, vec)):
+        print(f"{{i:02d}} {{name}} = {{value:.8g}}")
 '''
+
+
+def _render_selected_feature_extractor(selected_features, fill_values, clip_bounds, formulas, scripts_dir=None,
+                                       window_model_threshold=0.5,
+                                       use_stage2_ir=False,
+                                       default_fs=25.0,
+                                       window_sec=5.0):
+    """Backward-compatible wrapper around the self-contained deploy extractor."""
+    return _render_deployment_feature_extractor(
+        selected_features,
+        fill_values,
+        clip_bounds,
+        formulas,
+        window_model_threshold=window_model_threshold,
+        default_fs=default_fs,
+        window_sec=window_sec,
+    )
 
 
 def export_feature_extractor_script(artifact_dir):
@@ -1085,6 +906,7 @@ def export_feature_extractor_script(artifact_dir):
             "so the model is trained with ambient/green/ACC features only. Offending features: "
             + ", ".join(ir_features)
         )
+    _assert_selected_features_deployment_allowed(selected)
 
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
@@ -1610,6 +1432,8 @@ def _build_full_feature_recipe(selected_features):
         "GREEN_AMB_ENV_CORR": {"depends": ["g_mean_bp", "amb_bp"], "formula": "safe_corr(smooth_envelope(g_mean_bp,25), smooth_envelope(amb_bp,25))"},
         "IR_AMB_ENV_CORR":    {"depends": ["ir_bp", "amb_bp"], "formula": "safe_corr(smooth_envelope(ir_bp,25), smooth_envelope(amb_bp,25))"},
         "GREEN_AMB_LEAK":     {"depends": ["g_mean_bp", "amb_bp"], "formula": "|GREEN_AMB_BP_CORR| * sqrt(mean(amb_bp^2)) / (sqrt(mean(g_mean_bp^2))+1e-12)"},
+        "GREEN_AMB_LEAK_STABILITY": {"depends": ["amb_raw", "g_top2_raw"], "formula": "CV over three segment ratios: AMB segment ACDC / GTOP2 segment ACDC"},
+        "GREEN_AMB_SEG_CORR_RANGE": {"depends": ["amb_raw", "g_top2_raw"], "formula": "max(segment_corr(amb_raw,g_top2_raw)) - min(segment_corr(...)) over three segments"},
         "IR_AMB_LEAK":        {"depends": ["ir_bp", "amb_bp"], "formula": "|IR_AMB_BP_CORR| * sqrt(mean(amb_bp^2)) / (sqrt(mean(ir_bp^2))+1e-12)"},
         "AMB_AC_TO_GREEN_AC":  {"depends": ["amb_bp", "g_mean_bp"], "formula": "safe_div(sqrt(mean(amb_bp^2)), sqrt(mean(g_mean_bp^2)))"},
         "AMB_DC_TO_GREEN_DC":  {"depends": ["amb_raw", "g_mean_raw"], "formula": "safe_div(median(amb_raw), |median(g_mean_raw)|)"},
@@ -1680,16 +1504,16 @@ def _build_full_feature_recipe(selected_features):
         # == Temporal ==
         "GREEN_Temporal_slope_mean":      {"depends": ["g_mean_bp"], "formula": "linear_regression(bp~arange(N)): slope=cov(t,bp)/var(t)"},
         "GREEN_Temporal_slope_std":       {"depends": ["g_mean_bp"], "formula": "std(residuals after detrend)"},
-        "GREEN_Temporal_peak_prominence": {"depends": ["g_mean_bp"], "formula": "find_peaks(bp,prominence>0); return mean(prominences)"},
+        "GREEN_Temporal_peak_prominence": {"depends": ["g_mean_bp"], "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool"},
         "GREEN_Temporal_peak_ratio":      {"depends": ["g_mean_bp"], "formula": "len(peaks)/len(bp)"},
         "GREEN_Temporal_valley_ratio":    {"depends": ["g_mean_bp"], "formula": "len(valleys)/len(bp)"},
         "IRX_Temporal_slope_mean":      {"depends": ["ir_bp"], "formula": "linear_regression(bp~arange(N)): slope=cov(t,bp)/var(t)"},
         "IRX_Temporal_slope_std":       {"depends": ["ir_bp"], "formula": "std(residuals after detrend)"},
-        "IRX_Temporal_peak_prominence": {"depends": ["ir_bp"], "formula": "find_peaks(bp,prominence>0); return mean(prominences)"},
+        "IRX_Temporal_peak_prominence": {"depends": ["ir_bp"], "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool"},
         "IRX_Temporal_peak_ratio":      {"depends": ["ir_bp"], "formula": "len(peaks)/len(bp)"},
         "AMBX_Temporal_slope_mean":      {"depends": ["amb_bp"], "formula": "linear_regression(bp~arange(N)): slope=cov(t,bp)/var(t)"},
         "AMBX_Temporal_slope_std":       {"depends": ["amb_bp"], "formula": "std(residuals after detrend)"},
-        "AMBX_Temporal_peak_prominence": {"depends": ["amb_bp"], "formula": "find_peaks(bp,prominence>0); return mean(prominences)"},
+        "AMBX_Temporal_peak_prominence": {"depends": ["amb_bp"], "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool"},
         "AMBX_Temporal_peak_ratio":      {"depends": ["amb_bp"], "formula": "len(peaks)/len(bp)"},
 
         # == Waveform shape ==
@@ -1714,6 +1538,10 @@ def _build_full_feature_recipe(selected_features):
         "ACC_GREEN_BP_CORR":{"depends": ["acc_mag_bp", "g_mean_bp"], "formula": "|safe_corr(acc_mag_bp, g_mean_bp)|"},
         "ACC_IR_BP_CORR":   {"depends": ["acc_mag_bp", "ir_bp"], "formula": "|safe_corr(acc_mag_bp, ir_bp)|"},
         "ACC_ENERGY_TO_GREEN_AC":{"depends": ["acc_mag", "g_mean_bp"], "formula": "safe_div(sum(acc_mag^2), sqrt(mean(g_mean_bp^2)))"},
+        "ACC_TO_GTOP2_AC_RATIO":{"depends": ["acc_mag", "g_top2_bp"], "formula": "safe_div(robust_mad(diff(acc_mag)), sqrt(mean(g_top2_bp^2)))"},
+        "ACC_STILL_X_GREEN_STABILITY":{"depends": ["acc_mag", "g_top2_raw"], "formula": "(1/(1+std(acc_mag)+mad(diff(acc_mag)))) * (1/(1+GTOP2_SEG_ACDC_CV))"},
+        "ACC_DIFF_TO_GTOP2_DIFF_RATIO":{"depends": ["acc_mag", "g_top2_raw"], "formula": "safe_div(robust_mad(diff(acc_mag)), robust_mad(diff(g_top2_raw)))"},
+        "ACC_STILL_GREEN_MISMATCH":{"depends": ["acc_mag", "g_top2_bp"], "formula": "still_score(acc_mag) * safe_div(sqrt(mean(g_top2_bp^2)), robust_mad(diff(acc_mag)))"},
         "ACC_SAT_FRAC":      {"depends": ["acc"], "formula": "mean(|acc| >= 0.98*max(|acc|))"},
         "ACC_CLIP_RATE":     {"depends": ["acc"], "formula": "mean(|diff(acc)| < 1e-10)"},
 
@@ -1835,6 +1663,22 @@ def _build_full_feature_recipe(selected_features):
                 "depends": ["g1_raw", "g2_raw", "g3_raw", "g1_bp", "g2_bp", "g3_bp"],
                 "formula": "G_2OF3_AC_SUPPORT * max(0, G_TOP2_CORR_MIN) / (1 + mean(spatial_vmag))",
             },
+            "G_TOP1_TO_TOP2_AC_RATIO": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "max(raw_centered_ac_rms) / (mean(largest_two(raw_centered_ac_rms)) + 1e-12)",
+            },
+            "G_TOP2_RANK_STABILITY": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "1 - fraction of three temporal segments whose top-2 green channels differ from global top-2",
+            },
+            "G_TOP2_SWITCH_RATE": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "fraction of three temporal segments whose top-2 green channels differ from global top-2",
+            },
+            "G_SPATIAL_VMAG_RANGE": {
+                "depends": ["g1_raw", "g2_raw", "g3_raw"],
+                "formula": "P90(spatial_vmag) - P10(spatial_vmag)",
+            },
             "GREEN_SAT_FRAC": {
                 "depends": ["g_mean_raw"],
                 "formula": "mean(g_mean_raw >= 0.98 * max(g_mean_raw))",
@@ -1871,9 +1715,33 @@ def _build_full_feature_recipe(selected_features):
                 "depends": ["g_top2_raw"],
                 "formula": "CV of AC/DC ratios over three 1s segments of g_top2_raw",
             },
+            "GTOP2_HALF_ACDC_DELTA": {
+                "depends": ["g_top2_raw"],
+                "formula": "absolute difference between first-half and second-half segment AC/DC means",
+            },
+            "GTOP2_SEG_ACDC_RANGE": {
+                "depends": ["g_top2_raw"],
+                "formula": "max(segment AC/DC) - min(segment AC/DC) over three segments",
+            },
             "GTOP2_BAND_ENERGY_RATIO": {
                 "depends": ["g_top2_bp"],
                 "formula": "sum(FFT(g_top2_bp)^2 0.7-3Hz) / sum(FFT(g_top2_bp)^2 0.5-5Hz)",
+            },
+            "GTOP2_bp_skewness": {
+                "depends": ["g_top2_bp"],
+                "formula": "mean(zscore(g_top2_bp)^3)",
+            },
+            "GTOP2_bp_kurtosis": {
+                "depends": ["g_top2_bp"],
+                "formula": "mean(zscore(g_top2_bp)^4)",
+            },
+            "GTOP2_zero_cross_rate": {
+                "depends": ["g_top2_bp"],
+                "formula": "fraction of adjacent centered g_top2_bp samples crossing zero",
+            },
+            "GTOP2_abs_diff_ratio": {
+                "depends": ["g_top2_bp"],
+                "formula": "robust_mad(diff(g_top2_bp)) / (mean(abs(g_top2_bp)) + 1e-12)",
             },
             "GTOP2_Hjorth_Activity": {
                 "depends": ["g_top2_bp"],
@@ -1905,7 +1773,7 @@ def _build_full_feature_recipe(selected_features):
             },
             "GTOP2_Temporal_peak_prominence": {
                 "depends": ["g_top2_bp"],
-                "formula": "mean(find_peaks(g_top2_bp, prominence>0).prominences)",
+                "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool",
             },
             "GTOP2_Temporal_peak_ratio": {
                 "depends": ["g_top2_bp"],
@@ -2283,7 +2151,7 @@ def main():
     p.add_argument("--fp_proxy_state_k_on", type=int, default=3,
                    help="s04 FP proxy consecutive windows for state trigger")
     p.add_argument("--threshold_objective", default="fbeta",
-                   choices=["f1", "precision", "recall", "fbeta", "precision_constrained"])
+                   choices=["f1", "precision", "recall", "fbeta", "precision_constrained", "accuracy"])
     p.add_argument("--threshold_beta", type=float, default=0.5,
                    help="F-beta 参数 (<1 偏precision)")
 

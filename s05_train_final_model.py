@@ -413,6 +413,63 @@ def _fbeta(precision, recall, beta):
     return (1 + b2) * precision * recall / denom
 
 
+def select_threshold_from_probs(y_true, probs, objective="f1", beta=0.5, min_precision=None):
+    """Select a window threshold from probabilities using the same policy as s05."""
+    y_true = np.asarray(y_true, dtype=int)
+    probs = np.asarray(probs, dtype=float)
+    best = None
+    best_key = None
+    if objective == "precision_constrained" and min_precision is None:
+        min_precision = 0.95
+    for th in np.linspace(0.05, 0.95, 181):
+        pred = (probs >= th).astype(int)
+        precision = float(precision_score(y_true, pred, zero_division=0))
+        recall = float(recall_score(y_true, pred, zero_division=0))
+        f1 = float(f1_score(y_true, pred, zero_division=0))
+        accuracy = float(accuracy_score(y_true, pred))
+        tn, fp, fn, tp = confusion_matrix(y_true, pred, labels=[0, 1]).ravel()
+        fp_rate = float(fp) / float(max(tn + fp, 1))
+        if objective == "accuracy":
+            score = accuracy
+            key = (accuracy, -fp_rate, f1, precision, recall)
+        elif objective == "precision":
+            score = precision
+            key = (score, accuracy, recall, -fp_rate)
+        elif objective == "recall":
+            score = recall
+            key = (score, accuracy, -fp_rate, precision)
+        elif objective == "fbeta":
+            score = _fbeta(precision, recall, beta)
+            key = (score, accuracy, -fp_rate, precision, recall)
+        elif objective == "precision_constrained":
+            score = recall if precision >= float(min_precision) else -1.0 + precision
+            key = (score, accuracy, -fp_rate, precision, recall)
+        else:
+            score = f1
+            key = (score, accuracy, -fp_rate, precision, recall)
+        item = {
+            "threshold": float(th),
+            "score": float(score),
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "fbeta": float(_fbeta(precision, recall, beta)),
+            "fp_rate": fp_rate,
+            "confusion_matrix": {"TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp)},
+        }
+        if best_key is None or key > best_key:
+            best = item
+            best_key = key
+    if best is not None:
+        best["objective"] = objective
+        if objective == "fbeta":
+            best["beta"] = float(beta)
+        if objective == "precision_constrained":
+            best["min_precision"] = float(min_precision)
+    return best
+
+
 def search_threshold_by_valid(model, X_valid, y_valid, objective="f1",
                                beta=0.5, min_precision=None):
     """
@@ -428,6 +485,10 @@ def search_threshold_by_valid(model, X_valid, y_valid, objective="f1",
     本项目背景：FP（非佩戴误判为佩戴）代价更高，建议 fbeta(beta=0.5) 或 precision_constrained。
     """
     probs = model.predict_proba(X_valid)[:, 1]
+    if objective == "accuracy":
+        return select_threshold_from_probs(
+            y_valid, probs, objective=objective, beta=beta, min_precision=min_precision
+        )
     best = None
     best_score = -np.inf
 
@@ -877,8 +938,13 @@ def build_hard_negative_training_weights_from_oof(
     neg_mask = targets == 0
     finite_neg = neg_mask & np.isfinite(probs)
     weights = np.ones(n_rows, dtype=float)
+    context_cols = [
+        "negative_type", "scene_type", "subject_type", "record",
+        "device_id", "session_id", "subject_id",
+    ]
     report_cols = [
         "sample_name", "h5_file", "window_index", "target", "mode", "quality_bin",
+        *[c for c in context_cols if c in df_train.columns],
         "prob_oof", "selected_reason",
     ]
 
@@ -890,6 +956,8 @@ def build_hard_negative_training_weights_from_oof(
             "n_train_rows": int(n_rows),
             "n_negative_rows": int(np.sum(neg_mask)),
             "n_hard_negatives": 0,
+            "object_worn_hard_negatives": 0,
+            "object_worn_fraction": 0.0,
             "hard_negative_weight": float(hard_negative_weight),
             "min_probability": float(min_probability),
             "top_percentile": float(top_percentile),
@@ -923,6 +991,12 @@ def build_hard_negative_training_weights_from_oof(
         if col not in report.columns:
             report[col] = None
     report = report[report_cols].sort_values("prob_oof", ascending=False).reset_index(drop=True)
+    context_text = pd.Series("", index=report.index, dtype=object)
+    for col in ["negative_type", "scene_type", "subject_type", "sample_name", "h5_file"]:
+        if col in report.columns:
+            context_text = context_text + " " + report[col].fillna("").astype(str).str.lower()
+    object_mask = context_text.str.contains("object_worn|object-worn|non_human|non-human|reflective|物体|非人体", regex=True)
+    object_count = int(object_mask.sum())
 
     return weights, report, {
         "enabled": True,
@@ -930,6 +1004,8 @@ def build_hard_negative_training_weights_from_oof(
         "n_train_rows": int(n_rows),
         "n_negative_rows": int(np.sum(neg_mask)),
         "n_hard_negatives": int(np.sum(selected_mask)),
+        "object_worn_hard_negatives": object_count,
+        "object_worn_fraction": float(object_count / max(1, int(np.sum(selected_mask)))),
         "hard_negative_weight": float(hard_negative_weight),
         "min_probability": float(min_probability),
         "top_percentile": float(top_percentile),
@@ -1812,7 +1888,7 @@ def main(args=None):
                         help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。留空则使用 --max_features 固定值")
     parser.add_argument(
         "--threshold_objective", type=str, default="fbeta",
-        choices=["f1", "precision", "recall", "fbeta", "precision_constrained"],
+        choices=["f1", "precision", "recall", "fbeta", "precision_constrained", "accuracy"],
         help="阈值搜索目标。默认 fbeta（偏 precision，因为 FP 代价更高）。"
     )
     parser.add_argument("--threshold_beta", type=float, default=0.5,

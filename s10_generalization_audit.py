@@ -436,6 +436,17 @@ def _hard_negative_count(hard_payload):
     return len(fps), fps
 
 
+def _is_object_worn_fp(row):
+    text = " ".join(
+        str(row.get(col, ""))
+        for col in ["negative_type", "scene_type", "subject_type", "sample_name", "h5_file", "record"]
+        if isinstance(row, dict)
+    ).lower()
+    return any(token in text for token in [
+        "object_worn", "object-worn", "non_human", "non-human", "reflective", "物体", "非人体"
+    ])
+
+
 def _top_rows(df, condition, limit=5):
     if df.empty:
         return []
@@ -519,6 +530,17 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
     items = []
     hard_count, hard_fps = _hard_negative_count(hard_payload)
     if hard_count > 0:
+        object_fps = [row for row in hard_fps if _is_object_worn_fp(row)]
+        if object_fps:
+            _add_action(
+                items,
+                "P0",
+                "object_worn_false_positive_cluster",
+                "object_worn/non_human hard negatives",
+                f"object_worn_false_positives={len(object_fps)}",
+                len(object_fps),
+                "Prioritize object-worn/non-human negatives in data collection, hard-negative weighting, and acceptance checks before tuning state-machine latency.",
+            )
         _add_action(
             items,
             "P0",

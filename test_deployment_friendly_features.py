@@ -140,6 +140,114 @@ def test_model_search_rows_include_deployment_cost_metadata():
     assert rows[0]["deployment_forbidden_selected_count"] == 0
 
 
+def test_s04_generates_accuracy_beam_subset_candidates():
+    summary = []
+    for i, feature in enumerate([
+        "GREEN_AC_MAD",
+        "GTOP2_BAND_ENERGY_RATIO",
+        "G_TOP2_CORR_MIN",
+        "G_SPATIAL_STABILITY_SCORE",
+        "ACC_GREEN_BP_CORR",
+        "ACC_TO_GTOP2_AC_RATIO",
+        "AMBX_AC_MAD",
+        "GREEN_AMB_BP_CORR",
+    ]):
+        summary.append({
+            "feature": feature,
+            "combined_score": 1.0 - i * 0.03,
+            "deployment_score": 1.0 - i * 0.02,
+            "group": s04.feature_to_group(feature),
+            "deployment_cost": 1.0,
+            "fp_proxy_sample_fp_rate": 0.1 + i * 0.01,
+        })
+
+    candidates = s04.generate_feature_subset_candidates(
+        summary,
+        [item["feature"] for item in summary],
+        max_features=6,
+    )
+
+    beam_names = [name for name in candidates if name.startswith("accuracy_beam_")]
+    assert beam_names
+    for name in beam_names:
+        assert len(candidates[name]["features"]) <= 6
+        assert "accuracy-first beam" in candidates[name]["description"]
+
+
+def test_s05_threshold_objective_accuracy_prefers_max_window_accuracy():
+    import s05_train_final_model as s05
+
+    y_true = np.array([0, 0, 0, 1, 1, 1])
+    probs = np.array([0.10, 0.40, 0.60, 0.55, 0.58, 0.90])
+
+    best = s05.select_threshold_from_probs(
+        y_true,
+        probs,
+        objective="accuracy",
+        beta=0.5,
+        min_precision=0.95,
+    )
+
+    assert best["objective"] == "accuracy"
+    assert best["accuracy"] >= 5 / 6
+    assert "fp_rate" in best
+
+
+def test_hard_negative_mining_preserves_object_worn_context():
+    import pandas as pd
+    import s05_train_final_model as s05
+
+    df = pd.DataFrame({
+        "sample_name": ["n_obj", "n_skin", "p1", "n_obj2"],
+        "h5_file": ["a.h5", "b.h5", "c.h5", "d.h5"],
+        "window_index": [4, 5, 6, 7],
+        "target": [0, 0, 1, 0],
+        "mode": [1, 1, 1, 1],
+        "negative_type": ["object_worn", "skin_off", None, "object_worn"],
+        "scene_type": ["object_worn", "off_wrist", None, "object_worn_reflective"],
+        "subject_type": ["non_human", "human", "human", "non_human"],
+    })
+    probs = np.array([0.92, 0.20, 0.80, 0.88])
+
+    weights, report, summary = s05.build_hard_negative_training_weights_from_oof(
+        df,
+        probs,
+        min_probability=0.8,
+        top_percentile=0.5,
+        hard_negative_weight=4.0,
+    )
+
+    assert weights[0] == 4.0
+    assert "negative_type" in report.columns
+    assert "object_worn" in set(report["negative_type"])
+    assert summary["object_worn_hard_negatives"] == 2
+    assert summary["object_worn_fraction"] == 1.0
+
+
+def test_s10_action_items_prioritize_object_worn_false_positives():
+    import pandas as pd
+    import s10_generalization_audit as s10
+
+    action_items = s10.build_action_items(
+        window_strata=pd.DataFrame(),
+        sample_strata=pd.DataFrame(),
+        hard_payload={
+            "false_positives": [
+                {"sample_name": "obj1", "negative_type": "object_worn", "subject_type": "non_human"},
+                {"sample_name": "obj2", "scene_type": "object_worn_reflective"},
+            ]
+        },
+        model_search_df=pd.DataFrame(),
+        window_metrics={"accuracy": 0.95, "n": 2},
+        min_support=1,
+    )
+
+    assert "object_worn_false_positive_cluster" in set(action_items["issue_type"])
+    row = action_items[action_items["issue_type"] == "object_worn_false_positive_cluster"].iloc[0]
+    assert row["priority"] == "P0"
+    assert "object_worn" in row["stratum"]
+
+
 def test_deploy_extractor_import_and_feature_vector_are_finite(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()

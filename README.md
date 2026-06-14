@@ -325,6 +325,45 @@ python s08_run_pipeline.py \
 
 完整候选结果写入 `artifacts/model_search_results.csv`。最佳参数、特征数、valid calibration/threshold split 和搜索稳定性摘要写入 `artifacts/final_model_config.json` 和 `artifacts/model_bundle.pkl`。
 
+### 窗口准确率优先优化命令
+
+如果当前目标是先提升 Stage2 单窗口 window accuracy，而不是优先压低误报或自动做 hard-negative 回流，推荐使用下面这条命令：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --threshold_objective accuracy \
+  --model_search \
+  --model_search_strategy staged_group_cv \
+  --model_search_feature_counts "8,10,12,15,18" \
+  --stop_after s05
+```
+
+这条命令会在部署友好的 Stage2 特征池内做特征数量搜索、候选子集搜索和 XGBoost 参数搜索。特征数量仍限制在 `8,10,12,15,18`，排序以 group-aware CV 的窗口准确率为第一目标，CV 方差、FP rate、特征数和节点数只作为后续 tie-breaker。新增的 top2 绿光形态、5s 分段稳定度、环境光/绿光泄漏稳定度和 ACC×绿光耦合特征都是普通标量特征，端侧只需要按最终 `FEATURE_ORDER` 计算入选项。
+
+它和 `--hard_negative_optimize` 的区别是：`--threshold_objective accuracy` 聚焦窗口准确率，不自动导出 NPZ、不跑 s07 后处理搜参、不跑 s10 审计，也不自动提高 hard negative 权重；`--hard_negative_optimize` 面向非人体佩戴/物体佩戴误报风险，会自动启用 train-only OOF hard negative mining、严格 precision/FP 约束、窗口缓存、后处理搜参和泛化审计。
+
+### P0/P1 准确率提升闭环
+
+当前 Stage2 特征池采用“候选变丰富、最终仍少特征”的策略：s03 会生成更多部署友好的三绿光、环境光泄漏和 ACC×绿光标量特征，s04/s05 再通过候选子集搜索、特征数量搜索和 XGBoost group-CV 决定最终保留哪些特征。最终部署仍只计算 `model_bundle.pkl["feature_names"]` 里入选的少数特征，不会在部署阶段临时裁剪。
+
+新增候选重点包括：
+- 三绿光空间/排名稳定：`G_TOP1_TO_TOP2_AC_RATIO`、`G_TOP2_RANK_STABILITY`、`G_TOP2_SWITCH_RATE`、`G_SPATIAL_VMAG_RANGE`。
+- 环境光泄漏稳定：`GREEN_AMB_SEG_CORR_RANGE`、`GREEN_AMB_LEAK_STABILITY`。
+- ACC 与绿光低成本耦合：`ACC_STILL_GREEN_MISMATCH`、`ACC_TO_GTOP2_AC_RATIO`、`ACC_STILL_X_GREEN_STABILITY`、`ACC_DIFF_TO_GTOP2_DIFF_RATIO`。
+
+如果你的主要风险是“物体佩戴/非人体佩戴被识别为佩戴”，优先运行：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --hard_negative_optimize
+```
+
+这条命令会在 train split 内用 group-aware OOF 预测挖 hard negatives，并对这些负窗口加权重训；valid/test 只用于阈值、后处理和评估，不会回流训练。若数据或文件名中包含 `negative_type=object_worn`、`scene_type=object_worn*`、`subject_type=non_human` 等字段或标记，`hard_negative_mining_train.csv` 会保留这些上下文，`final_model_config.json` 会记录 `object_worn_hard_negatives` 和 `object_worn_fraction`，s10 审计会给出 `object_worn_false_positive_cluster` 的 P0 动作项。
+
 ## 分步运行
 
 ### 1. 数据切分
@@ -1049,6 +1088,8 @@ python s08_run_pipeline.py --dataset_dir D:\path\to\dataset --artifact_dir artif
 python s06_deploy_eval.py --artifact_dir artifacts --split valid --export_window_cache
 ```
 
+如果后处理搜参阶段出现 `worker caches not initialized`，说明运行的 `s07_postprocess_optimize.py` 不是当前修复后的版本，或旧进程/旧代码仍在执行。当前版本会通过 `ProcessPoolExecutor` initializer 显式把 NPZ caches 注入每个 worker；并且只有成功评估的候选才会写入 `postprocess_search_results.csv`，不会再因为全部 worker 失败触发 `UnboundLocalError: metrics`。
+
 ### Stage2 IR 策略不一致
 
 Stage2 现在固定不使用 IR 派生特征。`--use_stage2_ir` 仅为兼容旧命令保留，不建议使用，也不会把 IR 特征带入最终模型；如 `model_bundle.pkl` 中仍有 IR 特征，部署导出会报错并要求重新生成。
@@ -1195,7 +1236,7 @@ s03 extract_feature_pool_from_window 末尾：
    - FILL_VALUES = {...}            ← 硬编码字典
    - CLIP_BOUNDS = {...}            ← 硬编码字典
    - _clean_value() 先 fill 再 clip
-   - 零外部依赖（仅 numpy + scipy）
+   - 零训练脚本依赖（仅 numpy）
 ```
 
 ### 状态机后处理参数

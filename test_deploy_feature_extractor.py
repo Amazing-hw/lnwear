@@ -43,7 +43,9 @@ def test_all_s03_window_features_have_deploy_formulas():
     formulas = s08.build_selected_feature_formulas(features)
 
     assert not [name for name in features if s03.is_stage2_ir_feature(name)]
-    assert "G_consensus_AC_MAD_range" in formulas
+    assert "GTOP2_BAND_ENERGY_RATIO" in formulas
+    assert "G_TOP2_CORR_MIN" in formulas
+    assert "G_consensus_AC_MAD_range" not in formulas
     assert len(formulas) == len(features)
     forbidden_dep_tokens = ("ir_raw", "ir_bp", "ir_dc")
     for name, info in formulas.items():
@@ -129,6 +131,92 @@ def test_green_reliability_features_have_deploy_formulas():
         text = json.dumps(info, ensure_ascii=False)
         assert "ir_" not in text
         assert "IR_" not in text
+
+
+def test_accuracy_friendly_lightweight_features_are_source_and_deploy_ready():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+    acc = np.column_stack([
+        0.01 * np.sin(2 * np.pi * 1.0 * t),
+        0.02 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
+    ])
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+
+    pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
+    with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
+    expected_ppg = [
+        "GTOP2_bp_skewness",
+        "GTOP2_bp_kurtosis",
+        "GTOP2_zero_cross_rate",
+        "GTOP2_abs_diff_ratio",
+        "GTOP2_HALF_ACDC_DELTA",
+        "GTOP2_SEG_ACDC_RANGE",
+        "GREEN_AMB_LEAK_STABILITY",
+    ]
+    expected_acc = [
+        "ACC_TO_GTOP2_AC_RATIO",
+        "ACC_STILL_X_GREEN_STABILITY",
+        "ACC_DIFF_TO_GTOP2_DIFF_RATIO",
+    ]
+
+    for name in expected_ppg:
+        assert name in pool
+        assert np.isfinite(pool[name]), name
+    for name in expected_acc:
+        assert name in with_acc
+        assert np.isfinite(with_acc[name]), name
+
+    formulas = s08.build_selected_feature_formulas(expected_ppg + expected_acc)
+    assert set(formulas) == set(expected_ppg + expected_acc)
+    for name in expected_ppg + expected_acc:
+        assert s04.is_deployment_allowed_feature(name), name
+
+
+def test_object_worn_friendly_feature_pool_expansion_is_deployable():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.1 * t)
+    ambient = 1.0e5 + 700.0 * np.sin(2 * np.pi * 0.25 * t)
+    g1 = 2.0e6 + 9.0e3 * np.sin(2 * np.pi * 1.1 * t + 0.02)
+    g2 = 2.1e6 + 8.0e3 * np.sin(2 * np.pi * 1.1 * t + 0.04)
+    g3 = 1.9e6 + 4.0e3 * np.sin(2 * np.pi * 1.1 * t - 0.08)
+    acc = np.column_stack([
+        0.001 * np.sin(2 * np.pi * 0.2 * t),
+        0.001 * np.cos(2 * np.pi * 0.3 * t),
+        1.0 + 0.001 * np.sin(2 * np.pi * 0.4 * t),
+    ])
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+
+    pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
+    with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
+    expected_ppg = [
+        "G_TOP1_TO_TOP2_AC_RATIO",
+        "G_TOP2_RANK_STABILITY",
+        "G_TOP2_SWITCH_RATE",
+        "G_SPATIAL_VMAG_RANGE",
+        "GREEN_AMB_SEG_CORR_RANGE",
+    ]
+    expected_acc = ["ACC_STILL_GREEN_MISMATCH"]
+
+    for name in expected_ppg:
+        assert name in pool
+        assert np.isfinite(pool[name]), name
+    for name in expected_acc:
+        assert name in with_acc
+        assert np.isfinite(with_acc[name]), name
+
+    formulas = s08.build_selected_feature_formulas(expected_ppg + expected_acc)
+    assert set(formulas) == set(expected_ppg + expected_acc)
+    for name in expected_ppg + expected_acc:
+        assert s04.is_deployment_allowed_feature(name), name
 
 
 def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
@@ -354,7 +442,9 @@ def test_s03_feature_pool_source_keys_are_stage2_ir_free_even_with_acc():
     assert not [name for name in window_features if s03.is_stage2_ir_feature(name)]
     assert not any("IR" in name for name in window_features)
     assert "GREEN_SEG_ACDC_CV" in pool
-    assert "GREEN_FFT_harmonic_ratio" in pool
+    assert "GTOP2_BAND_ENERGY_RATIO" in pool
+    assert "G_TOP2_CORR_MIN" in pool
+    assert "GREEN_FFT_harmonic_ratio" not in pool
     assert "ACC_GREEN_BP_CORR" in window_features
 
 

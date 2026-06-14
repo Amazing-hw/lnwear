@@ -53,8 +53,8 @@ from s03_extract_feature_pool import (
     extract_feature_pool_from_window,
     align_acc_window,
     extract_acc_features,
-    extract_acc_tremor_features,
     extract_acc_ppg_cross_features,
+    extract_acc_green_coupling_features,
     validate_h5_file,
     load_grouped_window_metadata,
 )
@@ -496,10 +496,12 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
                     acc_seg = None
             if acc_seg is not None and len(acc_seg) > 0:
                 feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
                 green_bp = preprocessed.get("g_top2_bp")
                 if green_bp is not None:
                     feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, fs=FEATURE_FS))
+                    green_raw = preprocessed.get("g_top2_raw")
+                    if green_raw is not None:
+                        feat.update(extract_acc_green_coupling_features(acc_seg, green_raw, green_bp))
 
             feats_list.append(feat)
             quality_metas.append({
@@ -675,25 +677,14 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
                     acc_seg = align_acc_window(acc_25, len(ppg_25), s2_start, win_25,
                                                fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
                     feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                    feat.update(extract_acc_tremor_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
                     green_bp = preprocessed.get("g_top2_bp")
                     if green_bp is not None:
                         feat.update(extract_acc_ppg_cross_features(
                             acc_seg, green_bp, fs=FEATURE_FS))
-                        # ACC-PPG coherence
-                        if acc_seg is not None and len(acc_seg) >= 16:
-                            try:
-                                from scipy.signal import coherence as _coh
-                                _acc_mag = np.sqrt(np.sum(acc_seg.astype(float)**2, axis=1) + 1e-12)
-                                _npseg = min(32, len(_acc_mag) // 2)
-                                if _npseg >= 8:
-                                    _f, _cxy = _coh(_acc_mag, green_bp, fs=FEATURE_FS, nperseg=_npseg)
-                                    _cm = (_f >= 0.5) & (_f <= 3.0)
-                                    if np.any(_cm):
-                                        feat["ACC_PPG_coherence_mean"] = float(np.mean(_cxy[_cm]))
-                                        feat["ACC_PPG_coherence_max"] = float(np.max(_cxy[_cm]))
-                            except Exception:
-                                pass
+                        green_raw = preprocessed.get("g_top2_raw")
+                        if green_raw is not None:
+                            feat.update(extract_acc_green_coupling_features(
+                                acc_seg, green_raw, green_bp))
                 feats_list.append(feat)
                 quality_metas.append({
                     "Ambient_std": feat.get("Ambient_std"),
@@ -2105,13 +2096,7 @@ def build_feature_formula_map(selected_features):
     ])
 
     # 时序动态特征 (计算自 bp 信号)
-    TEMPORAL_TEMPLATES = OrderedDict([
-        ("Temporal_slope_mean",      "linear regression slope of bp vs time"),
-        ("Temporal_slope_std",       "std(residuals after linear detrend)"),
-        ("Temporal_peak_prominence", "mean peak prominence from scipy.signal.find_peaks(bp)"),
-        ("Temporal_peak_ratio",      "len(peaks) / len(bp)"),
-        ("Temporal_valley_ratio",    "len(valleys) / len(bp)"),
-    ])
+    TEMPORAL_TEMPLATES = OrderedDict()
 
     # ACC 特征
     ACC_TEMPLATES = OrderedDict([
@@ -2127,15 +2112,9 @@ def build_feature_formula_map(selected_features):
 
     ACC_CROSS_TEMPLATES = OrderedDict([
         ("ACC_GREEN_BP_CORR",   "|safe_corr(bandpass(acc_mag), g_mean_bp)|"),
-        ("ACC_IR_BP_CORR",      "|safe_corr(bandpass(acc_mag), ir_bp)|"),
-        ("ACC_PPG_coherence_mean", "mean magnitude-squared coherence(acc_mag, g_mean_bp) over 0.5-3Hz"),
-        ("ACC_PPG_coherence_max", "max magnitude-squared coherence(acc_mag, g_mean_bp) over 0.5-3Hz"),
     ])
 
-    EXTRA_GREEN_TEMPLATES = OrderedDict([
-        ("GREEN_FFT_harmonic_ratio", "2nd-harmonic FFT magnitude near 2*dom_freq divided by fundamental magnitude near dom_freq"),
-        ("GREEN_FFT_harmonic_present", "1.0 if GREEN_FFT_harmonic_ratio > 0.2 else 0.0"),
-    ])
+    EXTRA_GREEN_TEMPLATES = OrderedDict()
 
     SHORT_WINDOW_TEMPLATES = OrderedDict([
         ("SQI_FLAT_RATIO", "mean(diff-flat-ratio over IR, Ambient, GreenMean before artifact removal)"),
