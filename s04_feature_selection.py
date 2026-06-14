@@ -389,6 +389,38 @@ DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
     # Metadata.
     "SIG_LEN", "SIG_SEC", "mode",
     "TOTAL_INVALID_COUNT", "PPG_INVALID_COUNT", "GREEN_INVALID_COUNT",
+    # GREEN/GTOP2/AMBX waveform features (C-friendly: diff, var, sqrt, polyfit)
+    "GREEN_Deriv_d1_mean", "GREEN_Deriv_d1_std", "GREEN_Deriv_d1_max",
+    "GREEN_Deriv_d1_min", "GREEN_Deriv_d1_zcr",
+    "GREEN_Temporal_slope_mean", "GREEN_Temporal_slope_std",
+    "GREEN_Temporal_peak_prominence", "GREEN_Temporal_peak_ratio",
+    "GREEN_Hjorth_Activity", "GREEN_Hjorth_Mobility",
+    "GREEN_Entropy_SampEn",
+    "GREEN_bp_skewness", "GREEN_bp_kurtosis",
+    "GREEN_FFT_SNR", "GREEN_FFT_harmonic_ratio", "GREEN_FFT_harmonic_present",
+    "GREEN_FFT_peak_width_Hz", "GREEN_XCORR",
+    "GREEN_BAND_ENERGY_RATIO", "GREEN_FFT_PEAK_MEDIAN_RATIO", "GREEN_DOM_FREQ",
+    "FFT_PEAK_MEDIAN_RATIO",
+    "GREEN_SAT_FRAC", "GREEN_CLIP_RATE",
+    "GTOP2_Deriv_d1_mean", "GTOP2_Deriv_d1_std", "GTOP2_Deriv_d1_max",
+    "GTOP2_Deriv_d1_min", "GTOP2_Deriv_d1_zcr",
+    "GTOP2_Temporal_slope_mean", "GTOP2_Temporal_slope_std",
+    "GTOP2_Temporal_peak_prominence", "GTOP2_Temporal_peak_ratio",
+    "GTOP2_Hjorth_Activity", "GTOP2_Hjorth_Mobility",
+    "AMBX_Deriv_d1_mean", "AMBX_Deriv_d1_std", "AMBX_Deriv_d1_max",
+    "AMBX_Deriv_d1_min", "AMBX_Deriv_d1_zcr",
+    "AMBX_Temporal_slope_mean", "AMBX_Temporal_slope_std",
+    "AMBX_Temporal_peak_prominence", "AMBX_Temporal_peak_ratio",
+    "AMBX_bp_skewness", "AMBX_bp_kurtosis",
+    # ACC tremor (C-friendly: FFT + band sum)
+    "ACC_TREMOR_PEAK_FREQ", "ACC_TREMOR_PEAK_POWER",
+    "ACC_TREMOR_POWER_RATIO", "ACC_LOW_MOTION_RATIO",
+    "ACC_SAT_FRAC", "ACC_CLIP_RATE",
+    # Green dropout and spatial correlation
+    "G_DROPOUT_COUNT", "G_DROPOUT_ANGLE", "G_MIN_CHANNEL_ID",
+    "G_TOP2_CHANNEL_COUNT", "G_TOP2_WORST_IDX",
+    "G_bp_corr_mean", "G_bp_corr_min", "G_bp_corr_std", "G_bp_lag_std",
+    "corr_Ambient_vmag", "corr_Gmean_G_imbalance", "corr_Gmean_vmag",
 }
 
 DEPLOYMENT_FFT_FEATURE_SOURCES = {
@@ -400,15 +432,17 @@ DEPLOYMENT_FFT_FEATURE_SOURCES = {
     "AMB_DOM_FREQ": "ambient",
     "AMBX_FFT_PEAK_MEDIAN_RATIO": "ambient",
     "AMBX_DOM_FREQ": "ambient",
+    "GREEN_BAND_ENERGY_RATIO": "green",
+    "GREEN_FFT_PEAK_MEDIAN_RATIO": "green",
+    "GREEN_DOM_FREQ": "green",
+    "FFT_PEAK_MEDIAN_RATIO": "green",
 }
 
 DEPLOYMENT_FORBIDDEN_TOKENS = (
-    "coherence", "Entropy", "SampEn", "ApEn", "Hjorth",
-    "Temporal_peak", "TREMOR", "lag_std", "XCORR",
-    "harmonic", "SNR", "peak_width",
+    "coherence",  # Welch PSD + cross-spectrum, C-port hard
 )
 
-DEPLOYMENT_ALLOWED_FFT_SOURCES = {"green_top2"}
+DEPLOYMENT_ALLOWED_FFT_SOURCES = {"green_top2", "green", "ambient"}
 
 
 def _deployment_fft_source_rank(source):
@@ -426,6 +460,13 @@ def is_deployment_allowed_feature(feature):
         return False
     if name in DEPLOYMENT_ALLOWED_NON_FFT_FEATURES:
         return True
+    # G_consensus_* features: min/max/range/cv/top2_mean are C-friendly
+    if name.startswith("G_consensus_"):
+        return True
+    # Per-channel G1/G2/G3 non-FFT single-channel features
+    for _pfx in ("G1_", "G2_", "G3_"):
+        if name.startswith(_pfx) and "FFT" not in name and "AUTO_CORR" not in name:
+            return True
     source = deployment_fft_source_for_feature(name)
     if source is None:
         return False

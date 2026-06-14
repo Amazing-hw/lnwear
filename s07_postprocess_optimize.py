@@ -276,16 +276,16 @@ def compute_dataset_metrics(details, params_label=""):
     return out
 
 
-def score_metrics(metrics, fp_cost=4.0):
+def score_metrics(metrics, fp_cost=1.5):
     return (
         1.00 * float(metrics["sample_accuracy"])
-        + 0.50 * float(metrics["sample_recall"])
+        + 0.60 * float(metrics["sample_recall"])
         + 0.75 * float(metrics.get("accuracy_at_8s", 0.0))
         + 0.25 * float(metrics["window_accuracy"])
         - float(fp_cost) * float(metrics["sample_fp_rate"])
         - float(fp_cost) * float(metrics.get("false_worn_event_rate", 0.0))
-        - 0.20 * float(metrics.get("false_worn_duration_mean_sec", 0.0))
-        - 0.50 * float(metrics["window_fp_rate"])
+        - 0.10 * float(metrics.get("false_worn_duration_mean_sec", 0.0))
+        - 0.30 * float(metrics["window_fp_rate"])
         - 0.10 * float(metrics["first_output_p95_sec"]) / 8.0
     )
 
@@ -503,7 +503,7 @@ def main():
     parser.add_argument("--max_sample_fp_rate", type=float, default=0.02)
     parser.add_argument("--max_false_worn_event_rate", type=float, default=0.02)
     parser.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0)
-    parser.add_argument("--fp_cost", type=float, default=4.0)
+    parser.add_argument("--fp_cost", type=float, default=1.5)
     parser.add_argument("--n_workers", type=int, default=1)
     parser.add_argument("--replay_split", type=str, default="",
                         help="optional split to replay the selected postprocess params on, e.g. test")

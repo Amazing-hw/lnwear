@@ -15,7 +15,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 Stage2 默认只有一套部署友好特征池；不再提供研究型/部署型模式开关。限制发生在 `s04` 特征筛选和 `s05` 训练之前，不是在部署导出阶段裁剪，因此最终 `model_bundle.pkl`、`deploy_xgboost.json`、`deploy_feature_extractor.py` 的特征顺序和维度保持一致。
 
-当前部署友好特征池只允许统计量、MAD/IQR、ratio、三绿光一致性、少量相关性和固定的绿光 top2 FFT source。它会从候选池源头排除 `coherence`、`find_peaks`、entropy/SampEn/ApEn、Hjorth、复杂 temporal peak、ACC tremor FFT、per-channel G1/G2/G3 全量 FFT、cross-correlation lag、harmonic/SNR/peak width 等不利于端侧维护的算子。`final_model_config.json`、`model_search_results.csv` 和 `deploy_cookbook.json` 会记录最终入选特征的部署算子成本摘要。
+当前部署友好特征池允许统计量、MAD/IQR、ratio、三绿光一致性、相关性、SampEn、Hjorth、Derivative、Temporal、TREMOR、harmonic/SNR/peak width 和 green/green_top2/ambient FFT source。仅从候选池源头排除 `coherence`（Welch PSD + 交叉谱，C 移植困难）。`final_model_config.json`、`model_search_results.csv` 和 `deploy_cookbook.json` 会记录最终入选特征的部署算子成本摘要。
 
 - 只跑到模型搜参 + train-only hard negative 回流训练，不导出 NPZ、不跑后处理：
 
@@ -765,7 +765,7 @@ python s07_postprocess_optimize.py \
   --max_sample_fp_rate 0.02 \
   --max_false_worn_event_rate 0.02 \
   --max_first_worn_output_p95_sec 6.0 \
-  --fp_cost 4.0
+  --fp_cost 1.5
 ```
 
 输出：

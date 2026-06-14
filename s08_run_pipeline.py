@@ -2227,7 +2227,7 @@ def main():
                    help="enable FP-sensitive train-only hard-negative mining, cache export, s07 postprocess search, and s10 audit")
     p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
                    help="split used by s07 postprocess optimization")
-    p.add_argument("--postprocess_fp_cost", type=float, default=4.0,
+    p.add_argument("--postprocess_fp_cost", type=float, default=1.5,
                    help="s07 sample false-positive cost")
     p.add_argument("--max_sample_fp_rate", type=float, default=0.02,
                    help="s07 maximum FP / true-negative-sample rate")

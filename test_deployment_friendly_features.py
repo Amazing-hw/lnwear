@@ -33,12 +33,12 @@ def test_deployment_feature_filter_removes_complex_operators():
     assert "G_TOP2_CORR_MIN" in filtered
     assert "GTOP2_BAND_ENERGY_RATIO" in filtered
     assert "GTOP2_DOM_FREQ" in filtered
-    assert "AMB_BAND_ENERGY_RATIO" not in filtered
-    assert "ACC_PPG_coherence_mean" not in filtered
-    assert "GREEN_Entropy_SampEn" not in filtered
-    assert "GREEN_Temporal_peak_prominence" not in filtered
-    assert "ACC_TREMOR_PEAK_FREQ" not in filtered
-    assert "G_bp_lag_std" not in filtered
+    assert "AMB_BAND_ENERGY_RATIO" in filtered  # amb FFT now allowed
+    assert "GREEN_Entropy_SampEn" in filtered    # SampEn is C-friendly
+    assert "GREEN_Temporal_peak_prominence" in filtered  # temporal is C-friendly
+    assert "ACC_TREMOR_PEAK_FREQ" in filtered    # tremor FFT is C-friendly
+    assert "G_bp_lag_std" in filtered            # lag is C-friendly
+    assert "ACC_PPG_coherence_mean" not in filtered  # coherence still blocked
 
 
 def test_deployment_feature_cost_summary_counts_green_top2_fft_only():
@@ -49,7 +49,7 @@ def test_deployment_feature_cost_summary_counts_green_top2_fft_only():
     assert summary["feature_set"] == "deployment_friendly"
     assert summary["fft_source_count"] == 2
     assert summary["fft_sources"] == ["green_top2", "ambient"]
-    assert summary["forbidden_selected"] == ["AMB_BAND_ENERGY_RATIO"]
+    assert summary["forbidden_selected"] == []  # AMB_BAND_ENERGY_RATIO now allowed
 
 
 def test_s08_dry_run_does_not_expose_feature_pool_switches():
