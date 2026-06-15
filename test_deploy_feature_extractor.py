@@ -756,3 +756,46 @@ def test_export_golden_vectors_and_validate_feature_order(tmp_path):
     Path(golden_path).write_text(json.dumps(golden), encoding="utf-8")
     with pytest.raises(ValueError, match="golden_vectors.json feature_order"):
         s08.validate_deploy_artifact_consistency(str(tmp_path))
+
+
+def test_deploy_extractor_supports_green_and_ambient_fft_features(tmp_path):
+    selected = [
+        "GREEN_BAND_ENERGY_RATIO",
+        "GREEN_FFT_PEAK_MEDIAN_RATIO",
+        "GREEN_DOM_FREQ",
+        "AMB_BAND_ENERGY_RATIO",
+        "AMB_FFT_PEAK_MEDIAN_RATIO",
+        "AMB_DOM_FREQ",
+    ]
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "clip_bounds": {},
+            "threshold": 0.5,
+            "meta": {"fs_ppg": 25.0, "win_sec": 5.0, "use_stage2_ir": False},
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+
+    out_path = s08.export_feature_extractor_script(str(tmp_path))
+    spec = importlib.util.spec_from_file_location("deploy_feature_extractor_fft_sources", out_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    fs = 25.0
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.0 * t)
+    ambient = 1.0e5 + 1.0e3 * np.sin(2 * np.pi * 1.5 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.02)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+
+    vec = module.extract_features(ir, ambient, g1, g2, g3, fs=fs)
+
+    assert list(module.FEATURE_ORDER) == selected
+    assert len(vec) == len(selected)
+    assert np.all(np.isfinite(vec))
+    assert vec[0] > 0.0
+    assert vec[3] > 0.0

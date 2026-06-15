@@ -289,7 +289,11 @@ def stage1_ambient_check(ppg, ambient_ratio_threshold=0.8):
     # 只过滤极端无效情况（IR 完全无信号，或环境光绝对淹没了IR）
     if ir_dc < 1e2:
         return False
-    return (amb_dc / ir_dc) < 2.0
+    try:
+        ambient_ratio_threshold = float(ambient_ratio_threshold)
+    except (TypeError, ValueError):
+        ambient_ratio_threshold = 0.8
+    return (amb_dc / ir_dc) < ambient_ratio_threshold
 
 def compute_ambient_stage1_features(raw_window):
     """计算环境光 Stage1 软特征（供模型学习，不硬过滤）。
@@ -610,6 +614,15 @@ DEPLOYMENT_ALLOWED_FFT_FEATURES = {
     "GTOP2_BAND_ENERGY_RATIO",
     "GTOP2_FFT_PEAK_MEDIAN_RATIO",
     "GTOP2_DOM_FREQ",
+    "GREEN_BAND_ENERGY_RATIO",
+    "GREEN_FFT_PEAK_MEDIAN_RATIO",
+    "GREEN_DOM_FREQ",
+    "FFT_PEAK_MEDIAN_RATIO",
+    "AMB_BAND_ENERGY_RATIO",
+    "AMB_FFT_PEAK_MEDIAN_RATIO",
+    "AMB_DOM_FREQ",
+    "AMBX_FFT_PEAK_MEDIAN_RATIO",
+    "AMBX_DOM_FREQ",
 }
 
 

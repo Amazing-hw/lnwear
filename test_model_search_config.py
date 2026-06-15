@@ -192,6 +192,123 @@ def test_s08_staged_e2e_optimize_dry_run_runs_separate_objectives():
     assert "artifacts_staged\\staged_e2e\\03_e2e_postprocess" in output
 
 
+def test_s08_staged_e2e_optimize_forwards_custom_search_and_postprocess_params():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_staged",
+            "--staged_e2e_optimize",
+            "--min_fold_auc",
+            "0.61",
+            "--skip_vif",
+            "--deployment_score_weight",
+            "0.4",
+            "--fp_cost_weight",
+            "0.35",
+            "--fp_proxy_recall_floor",
+            "0.97",
+            "--fp_proxy_state_k_on",
+            "4",
+            "--threshold_beta",
+            "0.35",
+            "--postprocess_fp_cost",
+            "9.0",
+            "--max_sample_fp_rate",
+            "0.004",
+            "--max_false_worn_event_rate",
+            "0.003",
+            "--max_first_worn_output_p95_sec",
+            "5.0",
+            "--postprocess_search_budget",
+            "120",
+            "--hard_negative_weight",
+            "4.0",
+            "--hard_negative_top_percentile",
+            "0.2",
+            "--hard_negative_min_probability",
+            "0.7",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "--min_fold_auc 0.61" in output
+    assert "--skip_vif" in output
+    assert "--deployment_score_weight 0.4" in output
+    assert "--fp_cost_weight 0.35" in output
+    assert "--fp_proxy_recall_floor 0.97" in output
+    assert "--fp_proxy_state_k_on 4" in output
+    assert "--threshold_beta 0.35" in output
+    assert "--postprocess_fp_cost 9.0" in output
+    assert "--max_sample_fp_rate 0.004" in output
+    assert "--max_false_worn_event_rate 0.003" in output
+    assert "--max_first_worn_output_p95_sec 5.0" in output
+    assert "--postprocess_search_budget 120" in output
+    assert "--hard_negative_weight 4.0" in output
+    assert "--hard_negative_top_percentile 0.2" in output
+    assert "--hard_negative_min_probability 0.7" in output
+
+
+def test_s08_hard_negative_dry_run_searches_at_least_two_feature_counts_by_default():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_hn",
+            "--hard_negative_optimize",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "representative hard-negative search #1/2" in output
+    assert "representative hard-negative search #2/2" in output
+
+
+def test_s08_postprocess_dry_run_forwards_search_budget():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_post",
+            "--optimize_postprocess",
+            "--stop_after",
+            "s07_post",
+            "--postprocess_search_budget",
+            "96",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "s07_postprocess_optimize.py" in output
+    assert "--search_budget 96" in output
+
+
 def test_prepare_valid_calibration_threshold_data_keeps_disjoint_groups_for_multi_k():
     df_valid = _grouped_valid_frame()
 
@@ -283,6 +400,95 @@ def test_default_model_search_axes_have_fine_n_estimators():
     n_estimators = set(axes["n_estimators"])
 
     assert {25, 35, 45, 55}.issubset(n_estimators)
+
+
+def test_default_pipeline_search_budget_stays_deployable_and_runtime_bounded():
+    assert s05.DEFAULT_MODEL_SEARCH_SPACE["max_depth"] == [2, 3, 4]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "--max_model_nodes 500" in output
+    assert "[8, 10, 12, 15, 18]" in output
+    assert '--model_search_feature_counts "18"' in output
+    assert "--model_search_max_candidates 360" in output
+    assert "--model_search_stage2_top_k 48" in output
+    assert '--model_search_max_depth "2,3,4"' in output
+    assert "--feature_search_local_swap" in output
+    assert "--search_budget 240" not in output
+
+
+def test_local_swap_feature_sets_keep_feature_count_and_use_ranked_tail_pool():
+    ranked = [{"feature": f"f{i}"} for i in range(1, 13)]
+    base = [f"f{i}" for i in range(1, 9)]
+
+    candidates = s05.build_local_swap_feature_sets(
+        ranked,
+        base,
+        tail_size=3,
+        pool_size=4,
+        max_candidates=6,
+    )
+
+    assert candidates
+    assert len(candidates) <= 6
+    assert all(len(c) == len(base) for c in candidates)
+    assert all(len(set(c)) == len(c) for c in candidates)
+    assert any("f9" in c or "f10" in c or "f11" in c or "f12" in c for c in candidates)
+    assert base not in candidates
+
+
+def test_s05_local_swap_search_uses_quick_scoring_before_single_full_search(monkeypatch):
+    calls = []
+
+    args = argparse.Namespace(
+        model_search=True,
+        feature_search_local_swap=True,
+        feature_search_swap_tail_size=1,
+        feature_search_swap_pool_size=2,
+        feature_search_swap_max_candidates=2,
+    )
+
+    def fake_train_for_k(args, k, features, *_rest):
+        calls.append((bool(args.model_search), tuple(features)))
+        score = 0.9 + (0.01 if "f9" in features else 0.0)
+        return {
+            "k": k,
+            "features": list(features),
+            "search_summary": {"best": {"score": score}, "feature_set_source": ""},
+            "search_records": [],
+            "valid_acc": score,
+            "search_score": score,
+        }
+
+    ranked = [{"feature": f"f{i}"} for i in range(1, 11)]
+    base = [f"f{i}" for i in range(1, 9)]
+    monkeypatch.setattr(s05, "_train_for_k", fake_train_for_k)
+
+    final = s05.train_best_local_feature_set_for_k(
+        args, 8, ranked, base, None, None, None, None, 1.0
+    )
+
+    assert sum(1 for is_full, _features in calls if is_full) == 1
+    assert sum(1 for is_full, _features in calls if not is_full) == 3
+    assert "f9" in final["features"]
+    assert final["search_summary"]["local_swap_search"]["best_source"] == "local_swap_1"
 
 
 def test_model_search_grid_force_includes_default_params_when_custom_grid_excludes_it():
@@ -572,8 +778,8 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
     assert "--no-model_search" in output
     assert "--max_model_nodes 260" in output
     assert "--model_search_strategy staged_group_cv" in output
-    assert "--model_search_max_candidates 600" in output
-    assert "--model_search_stage2_top_k 80" in output
+    assert "--model_search_max_candidates 360" in output
+    assert "--model_search_stage2_top_k 48" in output
     assert "--model_search_cv_folds 3" in output
     assert "--model_search_cv_repeats 2" in output
     assert "--model_search_random_state 42" in output
@@ -677,7 +883,9 @@ def test_s08_hard_negative_optimize_enables_full_fp_sensitive_loop():
     assert "--threshold_min_precision 0.995" in output
     assert "--model_search_fp_cost 4.0" in output
     assert "--mine_hard_negatives" in output
-    assert output.count("--mine_hard_negatives") == 1
+    assert output.count("--mine_hard_negatives") == 2
+    assert "representative hard-negative search #1/2" in output
+    assert "representative hard-negative search #2/2" in output
     assert "--hard_negative_weight 3.0" in output
     assert "--export_window_cache" in output
     assert "s07_postprocess_optimize.py" in output
@@ -705,8 +913,9 @@ def test_s08_hard_negative_optimize_can_stop_after_s05_before_cache_and_postproc
 
     output = result.stdout + result.stderr
     assert "--mine_hard_negatives" in output
-    assert output.count("--mine_hard_negatives") == 1
-    assert "representative hard-negative search" in output
+    assert output.count("--mine_hard_negatives") == 2
+    assert "representative hard-negative search #1/2" in output
+    assert "representative hard-negative search #2/2" in output
     assert "--export_window_cache" not in output
     assert "s07_postprocess_optimize.py" not in output
     assert "s10_generalization_audit.py" not in output

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
+import s07_postprocess_optimize as s07
+
 
 ROOT = Path(__file__).resolve().parent
 
@@ -69,3 +71,20 @@ def test_s07_parallel_grid_search_initializes_worker_caches(tmp_path):
     assert "worker caches not initialized" not in output
     assert "UnboundLocalError" not in output
     assert (artifact_dir / "postprocess_opt" / "postprocess_optimized.json").exists()
+
+
+def test_s07_budgeted_grid_keeps_representative_candidates_and_caps_runtime():
+    full_grid = list(s07.iter_param_grid())
+
+    budgeted = s07.select_postprocess_search_grid(full_grid, search_budget=48)
+
+    assert len(budgeted) == 48
+    assert full_grid[0] in budgeted
+    assert any(p["T_on"] >= 0.70 and p["K_on"] >= 5 for p in budgeted)
+    assert any(p["median_k"] == 3 for p in budgeted)
+
+
+def test_s07_zero_budget_keeps_full_grid():
+    full_grid = list(s07.iter_param_grid())
+
+    assert s07.select_postprocess_search_grid(full_grid, search_budget=0) == full_grid

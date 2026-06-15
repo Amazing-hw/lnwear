@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 import s02_ir_dc_threshold as s02
+import s03_extract_feature_pool as s03
 import s04_feature_selection as s04
 import s06_deploy_eval as s06
 
@@ -53,6 +54,15 @@ def test_s02_default_min_duration_matches_3s_decision_window(monkeypatch):
 
     assert len(df) == 3
     assert df["decision_sec"].unique().tolist() == [3.0]
+
+
+def test_stage1_ambient_check_uses_configured_ratio_threshold():
+    ppg = np.zeros((300, 6), dtype=float)
+    ppg[:, 0] = 1000.0
+    ppg[:, 1] = 900.0
+
+    assert s03.stage1_ambient_check(ppg, ambient_ratio_threshold=0.8) is False
+    assert s03.stage1_ambient_check(ppg, ambient_ratio_threshold=1.0) is True
 
 
 def test_process_pool_worker_hooks_are_pickleable():

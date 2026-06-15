@@ -84,7 +84,7 @@ MODEL_SEARCH_PARAM_KEYS = [
 
 DEFAULT_MODEL_SEARCH_SPACE = {
     "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60],
-    "max_depth": [2, 3, 4, 5],
+    "max_depth": [2, 3, 4],
     "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
     "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
     "reg_lambda": [5, 8, 10, 12, 16, 20, 30],
@@ -1879,13 +1879,121 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
     }
 
 
+def build_local_swap_feature_sets(ranked_features, base_features, tail_size=3, pool_size=8, max_candidates=12):
+    """Generate fixed-size local swaps from ranked candidates after the current top-k set."""
+    base = [str(f) for f in base_features]
+    base_set = set(base)
+    ranked_names = []
+    for item in ranked_features:
+        name = item.get("feature") if isinstance(item, dict) else item
+        if name is None:
+            continue
+        name = str(name)
+        if name and name not in ranked_names:
+            ranked_names.append(name)
+
+    tail_size = max(0, min(int(tail_size or 0), len(base)))
+    pool_size = max(0, int(pool_size or 0))
+    max_candidates = max(0, int(max_candidates or 0))
+    if tail_size <= 0 or pool_size <= 0 or max_candidates <= 0:
+        return []
+
+    replace_positions = list(range(len(base) - tail_size, len(base)))
+    pool = [name for name in ranked_names if name not in base_set][:pool_size]
+    candidates = []
+    seen = {tuple(base)}
+    for pos in replace_positions:
+        for incoming in pool:
+            candidate = list(base)
+            candidate[pos] = incoming
+            if len(set(candidate)) != len(candidate):
+                continue
+            key = tuple(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+            if len(candidates) >= max_candidates:
+                return candidates
+    return candidates
+
+
+def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
+                                       df_train_raw, df_valid_raw, train_groups,
+                                       calibration_threshold_split, scale_pos_weight):
+    """Quick-score local swaps, then run full model search once on the best fixed-size set."""
+    candidate_feature_sets = [(list(base_features), "ranked_top_k")]
+    if args.feature_search_local_swap:
+        swap_sets = build_local_swap_feature_sets(
+            ranked_features,
+            base_features,
+            tail_size=args.feature_search_swap_tail_size,
+            pool_size=args.feature_search_swap_pool_size,
+            max_candidates=args.feature_search_swap_max_candidates,
+        )
+        candidate_feature_sets.extend(
+            (swap_feats, f"local_swap_{idx}")
+            for idx, swap_feats in enumerate(swap_sets, start=1)
+        )
+
+    original_model_search = bool(args.model_search)
+    best_quick_result = None
+    best_quick_score = float("-inf")
+    for candidate_features, candidate_source in candidate_feature_sets:
+        args.model_search = False
+        try:
+            result = _train_for_k(
+                args, k, candidate_features, df_train_raw, df_valid_raw,
+                train_groups, calibration_threshold_split, scale_pos_weight,
+            )
+        finally:
+            args.model_search = original_model_search
+        result["search_summary"]["scale_pos_weight"] = scale_pos_weight
+        result["search_summary"]["feature_set_source"] = candidate_source
+        result["_combined_score"] = float(result["valid_acc"])
+        if result["_combined_score"] > best_quick_score:
+            best_quick_score = result["_combined_score"]
+            best_quick_result = result
+
+    if original_model_search:
+        result = _train_for_k(
+            args, k, best_quick_result["features"], df_train_raw, df_valid_raw,
+            train_groups, calibration_threshold_split, scale_pos_weight,
+        )
+        result["search_summary"]["scale_pos_weight"] = scale_pos_weight
+        result["search_summary"]["feature_set_source"] = (
+            best_quick_result["search_summary"].get("feature_set_source")
+        )
+        result["_combined_score"] = float(result["search_score"])
+    else:
+        result = best_quick_result
+
+    result["search_summary"]["local_swap_search"] = {
+        "enabled": bool(args.feature_search_local_swap),
+        "candidates_tested": int(len(candidate_feature_sets)),
+        "best_source": result["search_summary"].get("feature_set_source"),
+        "tail_size": int(args.feature_search_swap_tail_size),
+        "pool_size": int(args.feature_search_swap_pool_size),
+        "max_candidates": int(args.feature_search_swap_max_candidates),
+    }
+    return result
+
+
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument("--max_features", type=int, default=None,
                         help="从 ranked_features.json 取 top-k 特征；默认 None 时回退到 selected_features.json")
     parser.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
-                        help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。留空则使用 --max_features 固定值")
+                        help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15,18)。留空则使用 --max_features 固定值")
+    parser.add_argument("--feature_search_local_swap", action=argparse.BooleanOptionalAction, default=True,
+                        help="try fixed-size local swaps around the ranked top-k feature set")
+    parser.add_argument("--feature_search_swap_tail_size", type=int, default=3,
+                        help="number of lowest-ranked selected features eligible for local swaps")
+    parser.add_argument("--feature_search_swap_pool_size", type=int, default=8,
+                        help="number of next-ranked candidate features considered for local swaps")
+    parser.add_argument("--feature_search_swap_max_candidates", type=int, default=12,
+                        help="maximum local-swap feature sets evaluated per k")
     parser.add_argument(
         "--threshold_objective", type=str, default="fbeta",
         choices=["f1", "precision", "recall", "fbeta", "precision_constrained", "accuracy"],
@@ -1923,11 +2031,11 @@ def main(args=None):
                         help="accuracy gap allowed when preferring a smaller model in --model_search; default 0.0 means accuracy strictly wins under the node budget")
     parser.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                         help="fraction of the valid calibration pool reserved for single_split model-search selection")
-    parser.add_argument("--model_search_max_candidates", type=int, default=600,
+    parser.add_argument("--model_search_max_candidates", type=int, default=360,
                         help="maximum sampled candidates from the search grid; <=0 disables sampling")
     parser.add_argument("--model_search_stage1_top_k", type=int, default=4,
                         help="number of stage-1 structure candidates advanced to stage-2 refine")
-    parser.add_argument("--model_search_stage2_top_k", type=int, default=80,
+    parser.add_argument("--model_search_stage2_top_k", type=int, default=48,
                         help="number of stage-A candidates kept for staged_group_cv")
     parser.add_argument("--model_search_cv_folds", type=int, default=3,
                         help="group-CV folds for staged_group_cv")
@@ -2079,13 +2187,18 @@ def main(args=None):
         _best_score = float("-inf")
         for _k in _ks:
             _feats = [r["feature"] for r in _ranked[:_k]]
-            _result = _train_for_k(
-                args, _k, _feats, df_train_raw, df_valid_raw,
-                _train_groups, None, _sw,
+            _result = train_best_local_feature_set_for_k(
+                args,
+                _k,
+                _ranked,
+                _feats,
+                df_train_raw,
+                df_valid_raw,
+                _train_groups,
+                None,
+                _sw,
             )
-            _result["search_summary"]["scale_pos_weight"] = _sw
-            _score = _result["search_score"] if args.model_search else _result["valid_acc"]
-            _result["_combined_score"] = _score
+            _score = _result["_combined_score"]
             if _score > _best_score:
                 _best_score = _score
                 _best_result = _result

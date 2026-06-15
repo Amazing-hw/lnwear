@@ -329,6 +329,46 @@ def iter_param_grid():
                                 }
 
 
+def _postprocess_grid_priority(params):
+    """Prefer deploy-stable, FP-safe candidates when a runtime budget is used."""
+    return (
+        -float(params["T_on"]),
+        -int(params["K_on"]),
+        int(params["K_off"]),
+        abs(float(params["ema_alpha"]) - 0.4),
+        -int(params["median_k"]),
+        float(params.get("cooldown_sec", 0.0)),
+        -float(params["T_off"]),
+    )
+
+
+def select_postprocess_search_grid(grid, search_budget=240):
+    """Return a deterministic, representative subset of the postprocess grid."""
+    grid = list(grid)
+    budget = int(search_budget or 0)
+    if budget <= 0 or budget >= len(grid):
+        return grid
+    anchors = [grid[0], grid[len(grid) // 2], grid[-1]]
+    selected = []
+    seen = set()
+
+    def add(params):
+        key = tuple(sorted(params.items()))
+        if key in seen:
+            return False
+        seen.add(key)
+        selected.append(params)
+        return True
+
+    for params in anchors:
+        add(params)
+    for params in sorted(grid, key=_postprocess_grid_priority):
+        if len(selected) >= budget:
+            break
+        add(params)
+    return selected[:budget]
+
+
 def _params_label(p):
     return (f"a={p['ema_alpha']:.2f}_mk={p['median_k']}_"
             f"Ton={p['T_on']:.2f}_Toff={p['T_off']:.2f}_"
@@ -505,6 +545,8 @@ def main():
     parser.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0)
     parser.add_argument("--fp_cost", type=float, default=1.5)
     parser.add_argument("--n_workers", type=int, default=1)
+    parser.add_argument("--search_budget", type=int, default=240,
+                        help="maximum postprocess candidates to evaluate; <=0 keeps the full grid")
     parser.add_argument("--replay_split", type=str, default="",
                         help="optional split to replay the selected postprocess params on, e.g. test")
     args = parser.parse_args()
@@ -537,8 +579,12 @@ def main():
         )
 
     # Grid search (parallel)
-    grid = list(iter_param_grid())
-    print(f"Searching {len(grid)} parameter combinations...")
+    full_grid = list(iter_param_grid())
+    grid = select_postprocess_search_grid(full_grid, search_budget=args.search_budget)
+    print(
+        f"Searching {len(grid)} parameter combinations "
+        f"(full_grid={len(full_grid)}, search_budget={args.search_budget})..."
+    )
     n_workers = max(1, int(args.n_workers))
     t0 = time.time()
 

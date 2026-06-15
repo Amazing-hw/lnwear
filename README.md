@@ -271,8 +271,12 @@ s06_feat/s06_cb     导出部署特征脚本和部署配方
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --max_features 20 \
+  --max_features 18 \
   --model_search_feature_counts "8,10,12,15,18" \
+  --feature_search_local_swap \
+  --feature_search_swap_tail_size 3 \
+  --feature_search_swap_pool_size 8 \
+  --feature_search_swap_max_candidates 12 \
   --max_model_nodes 500 \
   --split test
 ```
@@ -283,7 +287,7 @@ python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
   --window_sec 3 \
-  --max_features 20 \
+  --max_features 18 \
   --model_search_feature_counts "8,10,12,15,18"
 ```
 
@@ -297,7 +301,7 @@ python s08_run_pipeline.py \
 |---|---|---|
 | 特征数量 k | 8, 10, 12, 15, 18 | 5 |
 | n_estimators | 20, 25, 30, 35, 40, 45, 50, 55, 60 | 9 |
-| max_depth | 2, 3, 4, 5 | 4 |
+| max_depth | 2, 3, 4 | 3 |
 | learning_rate | 0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10 | 7 |
 | min_child_weight | 10, 15, 20, 25, 30, 40, 50 | 7 |
 | reg_lambda | 5, 8, 10, 12, 16, 20, 30 | 7 |
@@ -314,12 +318,12 @@ python s08_run_pipeline.py \
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --max_features 20 \
+  --max_features 18 \
   --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
-  --model_search_max_candidates 600 \
-  --model_search_stage2_top_k 80 \
+  --model_search_max_candidates 360 \
+  --model_search_stage2_top_k 48 \
   --model_search_cv_folds 3 \
   --model_search_cv_repeats 2 \
   --model_search_random_state 42 \
@@ -337,8 +341,8 @@ python s08_run_pipeline.py \
 
 ```text
 1. 对每个 k ∈ {8,10,12,15,18}，从 ranked_features.json 取 top-k 特征。
-2. 每个 k 内，从参数空间按固定 random_state 抽样最多 600 个 XGBoost 候选。
-3. Stage A 在 train 内部 group split 上预筛，保留 top 80。
+2. 每个 k 内，从参数空间按固定 random_state 抽样最多 360 个 XGBoost 候选。
+3. Stage A 在 train 内部 group split 上预筛，保留 top 48。
 4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
 5. 在 max_model_nodes 预算内，选最优 (k × params) 组合。
 6. 最优特征集 + 最优模型 → model_bundle.pkl → 自动传递到所有部署产物。
@@ -787,7 +791,8 @@ python s07_postprocess_optimize.py \
   --max_sample_fp_rate 0.02 \
   --max_false_worn_event_rate 0.02 \
   --max_first_worn_output_p95_sec 6.0 \
-  --fp_cost 1.5
+  --fp_cost 1.5 \
+  --search_budget 240
 ```
 
 输出：

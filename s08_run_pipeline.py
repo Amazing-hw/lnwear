@@ -713,10 +713,21 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     features["G_mean_diff_std"] = float(np.std(np.diff(g_mean_raw))) if len(g_mean_raw) > 1 else 0.0
     g_ac_rms = float(np.sqrt(np.mean(g_mean_bp ** 2))) if len(g_mean_bp) else 0.0
     features["G_mean_acdc"] = _safe_div(g_ac_rms, abs(g_mean_dc) + EPS)
+    green_band, green_peak, green_dom = _fft_metrics(g_mean_bp, fs)
+    features["GREEN_BAND_ENERGY_RATIO"] = green_band
+    features["GREEN_FFT_PEAK_MEDIAN_RATIO"] = green_peak
+    features["GREEN_DOM_FREQ"] = green_dom
+    features["FFT_PEAK_MEDIAN_RATIO"] = green_peak
     features["Ambient_mean"] = float(np.mean(amb_raw))
     features["Ambient_std"] = float(np.std(amb_raw))
     features["Ambient_p95"] = float(np.percentile(amb_raw, 95))
     features["corr_Ambient_Gmean"] = _corr(amb_raw, g_mean_raw)
+    amb_band, amb_peak, amb_dom = _fft_metrics(amb_bp, fs)
+    features["AMB_BAND_ENERGY_RATIO"] = amb_band
+    features["AMB_FFT_PEAK_MEDIAN_RATIO"] = amb_peak
+    features["AMB_DOM_FREQ"] = amb_dom
+    features["AMBX_FFT_PEAK_MEDIAN_RATIO"] = amb_peak
+    features["AMBX_DOM_FREQ"] = amb_dom
     _single_channel(features, "GREEN", g_mean_raw, g_mean_bp, g_mean_dc)
     _single_channel(features, "AMBX", amb_raw, amb_bp, amb_dc)
     _single_channel(features, "GTOP2", g_top2_raw, g_top2_bp, g_top2_dc)
@@ -1264,11 +1275,24 @@ def _build_staged_e2e_child_command(args, artifact_dir, stage_flag):
         f'--skip_initial_windows {args.skip_initial_windows}',
         f'--n_workers {args.n_workers}',
         f'--max_features {args.max_features}',
+        f'--min_fold_auc {args.min_fold_auc}',
+        f'--deployment_score_weight {args.deployment_score_weight}',
+        f'--fp_cost_weight {args.fp_cost_weight}',
+        f'--fp_proxy_recall_floor {args.fp_proxy_recall_floor}',
+        f'--fp_proxy_state_k_on {args.fp_proxy_state_k_on}',
+        f'--threshold_beta {args.threshold_beta}',
         f'--threshold_valid_fraction {args.threshold_valid_fraction}',
         f'--calibration_method {args.calibration_method}',
         f'--calibration_random_state {args.calibration_random_state}',
         f'--split {args.split}',
         f'--postprocess_split {args.postprocess_split}',
+        f'--postprocess_fp_cost {args.postprocess_fp_cost}',
+        f'--max_sample_fp_rate {args.max_sample_fp_rate}',
+        f'--max_false_worn_event_rate {args.max_false_worn_event_rate}',
+        f'--max_first_worn_output_p95_sec {args.max_first_worn_output_p95_sec}',
+        f'--postprocess_search_budget {args.postprocess_search_budget}',
+        f'--hard_negative_weight {args.hard_negative_weight}',
+        f'--hard_negative_top_percentile {args.hard_negative_top_percentile}',
         f'--model_search_strategy {args.model_search_strategy}',
         f'--max_model_nodes {args.max_model_nodes}',
         f'--model_search_fp_cost {args.model_search_fp_cost}',
@@ -1280,6 +1304,9 @@ def _build_staged_e2e_child_command(args, artifact_dir, stage_flag):
         f'--model_search_stage2_top_k {args.model_search_stage2_top_k}',
         f'--model_search_feature_counts "{args.model_search_feature_counts}"',
         f'--model_search_full_top_k {args.model_search_full_top_k}',
+        f'--feature_search_swap_tail_size {args.feature_search_swap_tail_size}',
+        f'--feature_search_swap_pool_size {args.feature_search_swap_pool_size}',
+        f'--feature_search_swap_max_candidates {args.feature_search_swap_max_candidates}',
         f'--model_search_cv_folds {args.model_search_cv_folds}',
         f'--model_search_cv_repeats {args.model_search_cv_repeats}',
         f'--model_search_random_state {args.model_search_random_state}',
@@ -1294,12 +1321,20 @@ def _build_staged_e2e_child_command(args, artifact_dir, stage_flag):
     ]
     if args.use_stage2_ir:
         parts.append("--use_stage2_ir")
+    if args.skip_vif:
+        parts.append("--skip_vif")
+    if args.feature_search_local_swap:
+        parts.append("--feature_search_local_swap")
+    else:
+        parts.append("--no-feature_search_local_swap")
     if not args.export_deploy:
         parts.append("--no-export_deploy")
     if not args.export_deploy_cookbook:
         parts.append("--no-export_deploy_cookbook")
     if not args.plot_errors:
         parts.append("--no-plot_errors")
+    if args.hard_negative_min_probability is not None:
+        parts.append(f"--hard_negative_min_probability {args.hard_negative_min_probability}")
     parts.append(stage_flag)
     return " ".join(parts)
 
@@ -2331,16 +2366,24 @@ def main():
                    help="s05 accuracy gap allowed when preferring a smaller model; default 0.0 means accuracy strictly wins under the node budget")
     p.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                    help="fraction of valid calibration pool used for model search")
-    p.add_argument("--model_search_max_candidates", type=int, default=600,
+    p.add_argument("--model_search_max_candidates", type=int, default=360,
                    help="maximum sampled s05 model-search candidates")
     p.add_argument("--model_search_stage1_top_k", type=int, default=4,
                    help="number of stage-1 structure candidates advanced to stage-2 refine")
-    p.add_argument("--model_search_stage2_top_k", type=int, default=80,
+    p.add_argument("--model_search_stage2_top_k", type=int, default=48,
                    help="number of stage-A candidates kept for s05 staged_group_cv")
     p.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
-                   help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。固定特征数时传单个值，如 --max_features 15 --model_search_feature_counts 15")
+                   help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15,18)。固定特征数时传单个值，如 --max_features 15 --model_search_feature_counts 15")
     p.add_argument("--model_search_full_top_k", type=int, default=1,
                    help="特征数量 quick 评估后，对得分前 N 个 k 做完整模型搜参；quick 最优 k 最后运行，保证最终产物保留最佳候选")
+    p.add_argument("--feature_search_local_swap", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable fixed-size local feature swaps in s05 feature-count search")
+    p.add_argument("--feature_search_swap_tail_size", type=int, default=3,
+                   help="number of lowest-ranked selected features eligible for local swaps")
+    p.add_argument("--feature_search_swap_pool_size", type=int, default=8,
+                   help="number of next-ranked candidate features considered for local swaps")
+    p.add_argument("--feature_search_swap_max_candidates", type=int, default=12,
+                   help="maximum local-swap feature sets evaluated per k")
     p.add_argument("--model_search_cv_folds", type=int, default=3,
                    help="s05 staged_group_cv folds")
     p.add_argument("--model_search_cv_repeats", type=int, default=2,
@@ -2349,7 +2392,7 @@ def main():
                    help="s05 model-search sampling/CV seed")
     p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60",
                    help="comma-separated s05 n_estimators candidates")
-    p.add_argument("--model_search_max_depth", default="2,3,4,5",
+    p.add_argument("--model_search_max_depth", default="2,3,4",
                    help="comma-separated s05 max_depth candidates")
     p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10",
                    help="comma-separated s05 learning_rate candidates")
@@ -2397,6 +2440,8 @@ def main():
                    help="s07 maximum negative-sample false-worn event rate")
     p.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0,
                    help="s07 maximum P95 first worn output latency for positive samples")
+    p.add_argument("--postprocess_search_budget", type=int, default=240,
+                   help="maximum s07 postprocess candidates to evaluate; <=0 keeps full grid")
     p.add_argument("--commercial_compare", action=argparse.BooleanOptionalAction, default=False,
                    help="run optional s09 commercial-vs-project comparison")
     p.add_argument("--commercial_split", default="test", choices=["train", "valid", "test"],
@@ -2418,6 +2463,7 @@ def main():
     p.add_argument("--export_deploy_cookbook", action=argparse.BooleanOptionalAction, default=True,
                    help="导出部署配方给嵌入式同事 (--no-export_deploy_cookbook 跳过)")
 
+    _raw_argv = sys.argv[1:]
     args = p.parse_args()
     if args.staged_e2e_optimize:
         if args.accuracy_first_optimize or args.hard_negative_optimize or args.full_optimize:
@@ -2437,6 +2483,8 @@ def main():
         args.threshold_objective = "precision_constrained"
         args.threshold_min_precision = 0.995
         args.model_search_fp_cost = 4.0
+        if "--model_search_full_top_k" not in _raw_argv:
+            args.model_search_full_top_k = max(2, int(args.model_search_full_top_k))
         args.export_window_cache = True
         args.optimize_postprocess = True
         args.postprocess_fp_cost = 8.0
@@ -2605,6 +2653,10 @@ def main():
             f'--model_search_stage1_top_k {args.model_search_stage1_top_k} '
             f'--model_search_stage2_top_k {args.model_search_stage2_top_k} '
             f'--model_search_feature_counts "{args.model_search_feature_counts}" '
+            f'{"--feature_search_local_swap" if args.feature_search_local_swap else "--no-feature_search_local_swap"} '
+            f'--feature_search_swap_tail_size {args.feature_search_swap_tail_size} '
+            f'--feature_search_swap_pool_size {args.feature_search_swap_pool_size} '
+            f'--feature_search_swap_max_candidates {args.feature_search_swap_max_candidates} '
             f'--model_search_cv_folds {args.model_search_cv_folds} '
             f'--model_search_cv_repeats {args.model_search_cv_repeats} '
             f'--model_search_random_state {args.model_search_random_state} '
@@ -2709,6 +2761,7 @@ def main():
             f'--max_sample_fp_rate {args.max_sample_fp_rate} '
             f'--max_false_worn_event_rate {args.max_false_worn_event_rate} '
             f'--max_first_worn_output_p95_sec {args.max_first_worn_output_p95_sec} '
+            f'--search_budget {args.postprocess_search_budget} '
             f'--replay_split {args.split}'
         )
     elif "s07_post" not in skip_set:

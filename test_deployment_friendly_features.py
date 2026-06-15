@@ -6,6 +6,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 
+import s03_extract_feature_pool as s03
 import s04_feature_selection as s04
 import s08_run_pipeline as s08
 
@@ -50,6 +51,28 @@ def test_deployment_feature_cost_summary_counts_green_top2_fft_only():
     assert summary["fft_source_count"] == 2
     assert summary["fft_sources"] == ["green_top2", "ambient"]
     assert summary["forbidden_selected"] == []  # AMB_BAND_ENERGY_RATIO now allowed
+
+
+def test_s03_and_s04_deployment_fft_allow_lists_match():
+    features = [
+        "GTOP2_BAND_ENERGY_RATIO",
+        "GTOP2_FFT_PEAK_MEDIAN_RATIO",
+        "GTOP2_DOM_FREQ",
+        "GREEN_BAND_ENERGY_RATIO",
+        "GREEN_FFT_PEAK_MEDIAN_RATIO",
+        "GREEN_DOM_FREQ",
+        "FFT_PEAK_MEDIAN_RATIO",
+        "AMB_BAND_ENERGY_RATIO",
+        "AMB_FFT_PEAK_MEDIAN_RATIO",
+        "AMB_DOM_FREQ",
+        "AMBX_FFT_PEAK_MEDIAN_RATIO",
+        "AMBX_DOM_FREQ",
+    ]
+
+    s03_allowed = s03.filter_deployment_friendly_stage2_features(features)
+    s04_allowed = s04.filter_features_for_deployment(features)
+
+    assert s03_allowed == s04_allowed
 
 
 def test_s08_dry_run_does_not_expose_feature_pool_switches():
