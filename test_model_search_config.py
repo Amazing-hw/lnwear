@@ -100,6 +100,98 @@ def test_s08_default_pipeline_uses_5s_windows():
     assert "--window_sec 3" not in output
 
 
+def test_s08_accuracy_first_shortcut_keeps_postprocess_disabled():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_acc_first",
+            "--accuracy_first_optimize",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "--threshold_objective accuracy" in output
+    assert "--mine_hard_negatives" not in output
+    assert "--export_window_cache" not in output
+    assert "s07_postprocess_optimize.py" not in output
+    assert "--stop_after=s05" in output
+
+
+def test_s08_dry_run_can_full_search_top_feature_counts():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts",
+            "--stop_after",
+            "s05",
+            "--model_search_feature_counts",
+            "8,10,12",
+            "--model_search_full_top_k",
+            "2",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "representative model search #1/2" in output
+    assert "representative model search #2/2" in output
+    assert '--model_search_feature_counts "10"' in output
+    assert '--model_search_feature_counts "12"' in output
+
+
+def test_s08_staged_e2e_optimize_dry_run_runs_separate_objectives():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_staged",
+            "--staged_e2e_optimize",
+            "--model_search_feature_counts",
+            "8,10",
+            "--model_search_full_top_k",
+            "2",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "[STAGED_E2E] 01_accuracy_first" in output
+    assert "[STAGED_E2E] 02_fp_safe_hard_negative" in output
+    assert "[STAGED_E2E] 03_e2e_postprocess" in output
+    assert "--accuracy_first_optimize" in output
+    assert "--hard_negative_optimize" in output
+    assert "--stop_after s05" in output
+    assert "s07_postprocess_optimize.py" not in output
+    assert "artifacts_staged\\staged_e2e\\01_accuracy_first" in output
+    assert "artifacts_staged\\staged_e2e\\03_e2e_postprocess" in output
+
+
 def test_prepare_valid_calibration_threshold_data_keeps_disjoint_groups_for_multi_k():
     df_valid = _grouped_valid_frame()
 

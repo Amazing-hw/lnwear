@@ -1,5 +1,27 @@
 # Wearing Liveness Detection Pipeline
 
+## Staged E2E 自动优化
+
+用于把“窗口准确率”“FP/hard-negative 风险”和“端到端后处理”拆成三个互不覆盖的自动化阶段：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --staged_e2e_optimize \
+  --model_search_full_top_k 2
+```
+
+产物会分别写入：
+
+```text
+artifacts/staged_e2e/01_accuracy_first
+artifacts/staged_e2e/02_fp_safe_hard_negative
+artifacts/staged_e2e/03_e2e_postprocess
+```
+
+部署配方导出会额外生成 `deploy_performance_profile.json`，记录最终 `FEATURE_ORDER`、FFT source 数量、可靠性特征使用情况、XGBoost 树/节点数和端侧中间量复用建议。
+
 ## 当前默认流程准则
 
 - 默认 Stage2 窗长是 `5s`、stride 是 `1s`；如需兼容旧 3s 窗口，显式传 `--window_sec 3`。
@@ -333,16 +355,16 @@ python s08_run_pipeline.py \
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --threshold_objective accuracy \
-  --model_search \
+  --accuracy_first_optimize \
   --model_search_strategy staged_group_cv \
   --model_search_feature_counts "8,10,12,15,18" \
+  --model_search_full_top_k 2 \
   --stop_after s05
 ```
 
-这条命令会在部署友好的 Stage2 特征池内做特征数量搜索、候选子集搜索和 XGBoost 参数搜索。特征数量仍限制在 `8,10,12,15,18`，排序以 group-aware CV 的窗口准确率为第一目标，CV 方差、FP rate、特征数和节点数只作为后续 tie-breaker。新增的 top2 绿光形态、5s 分段稳定度、环境光/绿光泄漏稳定度和 ACC×绿光耦合特征都是普通标量特征，端侧只需要按最终 `FEATURE_ORDER` 计算入选项。
+这条命令会在部署友好的 Stage2 特征池内做特征数量搜索、候选子集搜索和 XGBoost 参数搜索。特征数量仍限制在 `8,10,12,15,18`，排序以 group-aware CV 的窗口准确率为第一目标，CV 方差、FP rate、特征数和节点数只作为后续 tie-breaker。`--model_search_full_top_k 2` 会对 quick 评估前 2 个特征数做完整搜参，降低 quick 阶段误选 k 的风险；最终仍以最后一次完整搜参产物作为部署候选。新增的 top2 绿光形态、5s 分段稳定度、环境光/绿光泄漏稳定度和 ACC×绿光耦合特征都是普通标量特征，端侧只需要按最终 `FEATURE_ORDER` 计算入选项。
 
-它和 `--hard_negative_optimize` 的区别是：`--threshold_objective accuracy` 聚焦窗口准确率，不自动导出 NPZ、不跑 s07 后处理搜参、不跑 s10 审计，也不自动提高 hard negative 权重；`--hard_negative_optimize` 面向非人体佩戴/物体佩戴误报风险，会自动启用 train-only OOF hard negative mining、严格 precision/FP 约束、窗口缓存、后处理搜参和泛化审计。
+它和 `--hard_negative_optimize` 的区别是：`--accuracy_first_optimize` 会把阈值目标切到 `accuracy`，聚焦窗口准确率，不自动导出 NPZ、不跑 s07 后处理搜参、不跑 s10 审计，也不自动提高 hard negative 权重；`--hard_negative_optimize` 面向非人体佩戴/物体佩戴误报风险，会自动启用 train-only OOF hard negative mining、严格 precision/FP 约束、窗口缓存、后处理搜参和泛化审计。
 
 ### P0/P1 准确率提升闭环
 
@@ -1044,24 +1066,24 @@ clean_features_by_train（缺失/低方差/高相关/VIF）
 语法检查：
 
 ```bash
-python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py s10_generalization_audit.py
+python -c "import ast, pathlib; [ast.parse(p.read_text(encoding='utf-8'), filename=str(p)) for p in pathlib.Path('.').glob('*.py')]; print('ast parse ok')"
 ```
 
 运行测试：
 
 ```bash
-python -m pytest -q --basetemp .pytest_tmp_all
+python -m pytest -q --basetemp "%TEMP%\wearing_liveness_pytest_all"
 ```
 
 部署公式和端到端烟测门禁：
 
 ```bash
-python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp .pytest_tmp_deploy_guard
+python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp "%TEMP%\wearing_liveness_pytest_deploy_guard"
 ```
 
 这组测试会检查所有 `s03` 可导出的窗口特征都有部署公式，并用合成 grouped H5 跑到 `s08 -> s06_cb`，确认部署脚本、XGBoost JSON、部署配方、golden vectors 和一致性校验都能通过。以后如果再次出现 `No deploy formula registered for selected features: ...`，应先在这组测试里失败，而不是等真实数据跑到导出阶段才发现。
 
-如果直接从上级目录跑 pytest，在某些 Windows 权限环境里可能会因为默认 Temp 或 `.pytest_cache` 权限导致退出阶段异常。上面的命令把 basetemp 固定到当前项目目录，比较稳。
+如果在某些 Windows 权限环境里遇到项目目录 `.pytest_tmp_*` 或 `__pycache__` 无法写入，优先使用上面的 `%TEMP%` basetemp 和 `ast.parse` 语法检查命令；它们不会依赖项目目录下新建测试临时目录或写 `.pyc` 文件。
 
 真实数据最终验收仍需要在数据机上运行完整默认流程并保存日志：
 

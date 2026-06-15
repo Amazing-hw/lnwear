@@ -140,6 +140,65 @@ def test_model_search_rows_include_deployment_cost_metadata():
     assert rows[0]["deployment_forbidden_selected_count"] == 0
 
 
+def test_export_deploy_cookbook_writes_performance_profile(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    selected = [
+        "GREEN_AC_RMS",
+        "GREEN_SEG_ACDC_CV",
+        "G_2OF3_AC_SUPPORT",
+        "G_TOP2_CORR_MIN",
+        "GTOP2_BAND_ENERGY_RATIO",
+        "ACC_TO_GTOP2_AC_RATIO",
+    ]
+    model = __import__("xgboost").XGBClassifier(
+        n_estimators=4,
+        max_depth=2,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=0,
+    )
+    model.fit(np.asarray([[0.0] * len(selected), [1.0] * len(selected)], dtype=float), np.asarray([0, 1]))
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "clip_bounds": {name: [-1.0, 1.0] for name in selected},
+            "threshold": 0.37,
+            "model": model,
+            "raw_model": model,
+            "meta": {
+                "fs_ppg": 25.0,
+                "win_sec": 5.0,
+                "step_sec": 1.0,
+                "use_stage2_ir": False,
+            },
+        },
+        artifact_dir / "model_bundle.pkl",
+    )
+    (artifact_dir / "stage1_threshold.json").write_text(
+        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":0.35}}',
+        encoding="utf-8",
+    )
+
+    s08.export_feature_extractor_script(str(artifact_dir))
+    s08.export_deploy_cookbook(str(artifact_dir))
+
+    profile_path = artifact_dir / "deploy_performance_profile.json"
+    assert profile_path.exists()
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+
+    assert profile["feature_names"] == selected
+    assert profile["feature_cost_summary"]["feature_count"] == len(selected)
+    assert profile["feature_cost_summary"]["fft_source_count"] >= 1
+    assert profile["model_summary"]["n_estimators"] == 4
+    assert profile["model_summary"]["total_nodes"] >= 1
+    assert profile["model_summary"]["avg_nodes_per_tree"] > 0
+    assert profile["reliability_feature_summary"]["selected_count"] >= 3
+    assert "GREEN_SEG_ACDC_CV" in profile["reliability_feature_summary"]["selected_features"]
+    assert profile["deployment_targets"]["window_model_threshold"] == 0.37
+
+
 def test_s04_generates_accuracy_beam_subset_candidates():
     summary = []
     for i, feature in enumerate([

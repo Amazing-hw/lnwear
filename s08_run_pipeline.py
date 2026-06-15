@@ -1212,6 +1212,119 @@ def _run(name, cmd, dry_run=False):
         return False
 
 
+RELIABILITY_FEATURE_HINTS = (
+    "GREEN_SEG_ACDC_CV",
+    "AMB_SEG_ACDC_CV",
+    "GREEN_AMB_LEAK_STABILITY",
+    "GREEN_AMB_SEG_CORR_RANGE",
+    "G_2OF3_AC_SUPPORT",
+    "G_TOP2_TO_ALL_AC_RATIO",
+    "G_TOP2_CORR_MIN",
+    "G_WEAK_CHANNEL_GAP",
+    "G_SPATIAL_STABILITY_SCORE",
+    "G_SPATIAL_VMAG_RANGE",
+    "ACC_TO_GTOP2_AC_RATIO",
+    "ACC_STILL_X_GREEN_STABILITY",
+    "ACC_STILL_GREEN_MISMATCH",
+    "ACC_GREEN_BP_CORR",
+    "GREEN_AMB_BP_CORR",
+    "GREEN_AMB_ENV_CORR",
+    "GREEN_AMB_LEAK",
+)
+
+
+def _count_xgb_nodes(raw_model):
+    try:
+        booster = raw_model.get_booster()
+        dump = booster.get_dump(with_stats=True)
+    except Exception:
+        return 0
+    return int(sum(1 for tree in dump for line in tree.splitlines() if line.strip()))
+
+
+def _summarize_reliability_features(selected):
+    features = [
+        name for name in selected
+        if any(hint in str(name) for hint in RELIABILITY_FEATURE_HINTS)
+    ]
+    return {
+        "selected_count": int(len(features)),
+        "selected_features": features,
+        "feature_cost_summary": summarize_deployment_feature_costs(features),
+    }
+
+
+def _build_staged_e2e_child_command(args, artifact_dir, stage_flag):
+    parts = [
+        f'"{PYTHON}" "{_script_path("s08_run_pipeline")}"',
+        f'--dataset_dir "{args.dataset_dir}"',
+        f'--artifact_dir "{artifact_dir}"',
+        f'--window_sec {args.window_sec}',
+        f'--stride_sec {args.stride_sec}',
+        f'--skip_initial_windows {args.skip_initial_windows}',
+        f'--n_workers {args.n_workers}',
+        f'--max_features {args.max_features}',
+        f'--threshold_valid_fraction {args.threshold_valid_fraction}',
+        f'--calibration_method {args.calibration_method}',
+        f'--calibration_random_state {args.calibration_random_state}',
+        f'--split {args.split}',
+        f'--postprocess_split {args.postprocess_split}',
+        f'--model_search_strategy {args.model_search_strategy}',
+        f'--max_model_nodes {args.max_model_nodes}',
+        f'--model_search_fp_cost {args.model_search_fp_cost}',
+        f'--model_search_size_cost {args.model_search_size_cost}',
+        f'--model_search_accuracy_tolerance {args.model_search_accuracy_tolerance}',
+        f'--model_search_valid_fraction {args.model_search_valid_fraction}',
+        f'--model_search_max_candidates {args.model_search_max_candidates}',
+        f'--model_search_stage1_top_k {args.model_search_stage1_top_k}',
+        f'--model_search_stage2_top_k {args.model_search_stage2_top_k}',
+        f'--model_search_feature_counts "{args.model_search_feature_counts}"',
+        f'--model_search_full_top_k {args.model_search_full_top_k}',
+        f'--model_search_cv_folds {args.model_search_cv_folds}',
+        f'--model_search_cv_repeats {args.model_search_cv_repeats}',
+        f'--model_search_random_state {args.model_search_random_state}',
+        f'--model_search_n_estimators "{args.model_search_n_estimators}"',
+        f'--model_search_max_depth "{args.model_search_max_depth}"',
+        f'--model_search_learning_rate "{args.model_search_learning_rate}"',
+        f'--model_search_min_child_weight "{args.model_search_min_child_weight}"',
+        f'--model_search_reg_lambda "{args.model_search_reg_lambda}"',
+        f'--model_search_reg_alpha "{args.model_search_reg_alpha}"',
+        f'--model_search_subsample "{args.model_search_subsample}"',
+        f'--model_search_colsample_bytree "{args.model_search_colsample_bytree}"',
+    ]
+    if args.use_stage2_ir:
+        parts.append("--use_stage2_ir")
+    if not args.export_deploy:
+        parts.append("--no-export_deploy")
+    if not args.export_deploy_cookbook:
+        parts.append("--no-export_deploy_cookbook")
+    if not args.plot_errors:
+        parts.append("--no-plot_errors")
+    parts.append(stage_flag)
+    return " ".join(parts)
+
+
+def _run_staged_e2e_optimization(args):
+    base_dir = os.path.join(args.artifact_dir, "staged_e2e")
+    stages = [
+        ("01_accuracy_first", "--accuracy_first_optimize --stop_after s05"),
+        ("02_fp_safe_hard_negative", "--hard_negative_optimize --stop_after s05"),
+        ("03_e2e_postprocess", "--hard_negative_optimize"),
+    ]
+    print("=" * 70)
+    print("[STAGED_E2E] staged objective optimization")
+    print(f"[STAGED_E2E] base_artifact_dir = {base_dir}")
+    print("=" * 70)
+    for stage_name, stage_flag in stages:
+        stage_artifact_dir = os.path.join(base_dir, stage_name)
+        cmd = _build_staged_e2e_child_command(args, stage_artifact_dir, stage_flag)
+        print(f"[STAGED_E2E] {stage_name} -> {stage_artifact_dir}")
+        if not _run(f"staged_e2e::{stage_name}", cmd, dry_run=args.dry_run):
+            return False
+    print("[STAGED_E2E] staged objective optimization completed")
+    return True
+
+
 def _load_eval_details(artifact_dir, split="test", method="state_machine"):
     import json as _json
     import os as _os
@@ -1850,6 +1963,10 @@ def export_deploy_cookbook(artifact_dir):
     raw = bundle.get("raw_model", model)
     booster = raw.get_booster()
     n_estimators = raw.n_estimators
+    total_nodes = _count_xgb_nodes(raw)
+    feature_cost_summary = summarize_deployment_feature_costs(selected)
+    reliability_feature_summary = _summarize_reliability_features(selected)
+    avg_nodes_per_tree = float(total_nodes) / float(max(int(n_estimators), 1))
 
     # 生成完整特征配方
     recipe, ch_extract, mode_detect, preproc_steps, preproc_out, composite, utils = _build_full_feature_recipe(selected)
@@ -1861,7 +1978,13 @@ def export_deploy_cookbook(artifact_dir):
         "_input": "25Hz PPG窗口 (125 samples x N_ch) + ACC窗口 (125 samples x 3)",
         "A_deployment_operator_budget": {
             "feature_set": "deployment_friendly",
-            "selected_feature_cost_summary": summarize_deployment_feature_costs(selected),
+            "selected_feature_cost_summary": feature_cost_summary,
+            "reliability_feature_summary": reliability_feature_summary,
+            "model_node_summary": {
+                "n_estimators": int(n_estimators),
+                "total_nodes": int(total_nodes),
+                "avg_nodes_per_tree": avg_nodes_per_tree,
+            },
             "operator_notes": (
                 "Stage2 uses scalar statistics, ratio/MAD/IQR features, simple correlations, "
                 "and a fixed green-top2 FFT source for deployment-friendly implementation."
@@ -1976,8 +2099,41 @@ def export_deploy_cookbook(artifact_dir):
             "model": _json.loads(booster.save_config()),
         }, f, indent=2, ensure_ascii=False)
 
+    profile = {
+        "_title": "Deployment performance profile",
+        "feature_names": selected,
+        "feature_cost_summary": feature_cost_summary,
+        "reliability_feature_summary": reliability_feature_summary,
+        "model_summary": {
+            "n_estimators": int(n_estimators),
+            "total_nodes": int(total_nodes),
+            "avg_nodes_per_tree": avg_nodes_per_tree,
+            "max_model_nodes": int(meta.get("max_model_nodes", 0) or 0),
+        },
+        "operator_reuse_plan": {
+            "shared_preprocessing": [
+                "one preprocessing pass per raw channel",
+                "reuse g_top2_raw/g_top2_bp for green reliability, FFT, and ACC coupling features",
+                "reuse one FFT result per source listed in feature_cost_summary.fft_sources",
+            ],
+            "fft_sources": feature_cost_summary.get("fft_sources", []),
+            "fft_source_count": feature_cost_summary.get("fft_source_count", 0),
+        },
+        "deployment_targets": {
+            "window_model_threshold": threshold,
+            "fs_ppg": float(meta.get("fs_ppg", 25.0)),
+            "window_sec": float(meta.get("win_sec", 5.0)),
+            "step_sec": float(meta.get("step_sec", 1.0)),
+            "use_stage2_ir": bool(meta.get("use_stage2_ir", False)),
+        },
+    }
+    profile_path = _os.path.join(artifact_dir, "deploy_performance_profile.json")
+    with open(profile_path, "w", encoding="utf-8") as f:
+        _json.dump(profile, f, indent=2, ensure_ascii=False)
+
     print(f"[OK] deploy_cookbook.json -> {out_path}")
     print(f"[OK] deploy_xgboost.json  -> {xgb_path}")
+    print(f"[OK] deploy_performance_profile.json -> {profile_path}")
 
 def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
     """生成逐样本 CSV: info, target, total_windows, correct_windows。"""
@@ -2183,6 +2339,8 @@ def main():
                    help="number of stage-A candidates kept for s05 staged_group_cv")
     p.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
                    help="搜参时测试的特征数量，逗号分隔 (如 10,12,15,18,20)。固定特征数时传单个值，如 --max_features 15 --model_search_feature_counts 15")
+    p.add_argument("--model_search_full_top_k", type=int, default=1,
+                   help="特征数量 quick 评估后，对得分前 N 个 k 做完整模型搜参；quick 最优 k 最后运行，保证最终产物保留最佳候选")
     p.add_argument("--model_search_cv_folds", type=int, default=3,
                    help="s05 staged_group_cv folds")
     p.add_argument("--model_search_cv_repeats", type=int, default=2,
@@ -2223,8 +2381,12 @@ def main():
                    help="run s07 FP-sensitive postprocess optimization on cached windows")
     p.add_argument("--full_optimize", action="store_true",
                    help="enable full search loop: model/feature-count search, window cache export, and s07 postprocess optimization")
+    p.add_argument("--accuracy_first_optimize", action="store_true",
+                   help="只优化 Stage2 raw window accuracy；除非显式指定，否则不自动打开 hard-negative、s07 后处理或 s10 审计")
     p.add_argument("--hard_negative_optimize", action="store_true",
                    help="enable FP-sensitive train-only hard-negative mining, cache export, s07 postprocess search, and s10 audit")
+    p.add_argument("--staged_e2e_optimize", action="store_true",
+                   help="run three objective-separated child pipelines: accuracy-first, FP-safe hard-negative, then end-to-end postprocess")
     p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
                    help="split used by s07 postprocess optimization")
     p.add_argument("--postprocess_fp_cost", type=float, default=1.5,
@@ -2257,6 +2419,19 @@ def main():
                    help="导出部署配方给嵌入式同事 (--no-export_deploy_cookbook 跳过)")
 
     args = p.parse_args()
+    if args.staged_e2e_optimize:
+        if args.accuracy_first_optimize or args.hard_negative_optimize or args.full_optimize:
+            print("[ERROR] --staged_e2e_optimize already expands to separate objective stages; do not combine it with shortcut flags.")
+            sys.exit(2)
+    if args.accuracy_first_optimize and args.hard_negative_optimize:
+        print("[ERROR] --accuracy_first_optimize and --hard_negative_optimize target different objectives; run them separately.")
+        sys.exit(2)
+    if args.model_search_full_top_k < 1:
+        print("[ERROR] --model_search_full_top_k must be >= 1")
+        sys.exit(2)
+    if args.accuracy_first_optimize:
+        args.model_search = True
+        args.threshold_objective = "accuracy"
     if args.hard_negative_optimize:
         args.model_search = True
         args.threshold_objective = "precision_constrained"
@@ -2275,6 +2450,9 @@ def main():
     thread_env = configure_thread_env()
     print("[parallel] thread caps inherited by child steps: " +
           ", ".join(f"{k}={v}" for k, v in thread_env.items()))
+    if args.staged_e2e_optimize:
+        ok = _run_staged_e2e_optimization(args)
+        sys.exit(0 if ok else 1)
 
     # 步骤定义: (key, display_name, 是否默认启用)
     all_steps = [
@@ -2667,13 +2845,14 @@ def main():
                 break
             continue
 
-        # 特征数量搜参：先快速评估各 k（无 model_search），再对最优 k 做完整搜参
+        # 特征数量搜参：先快速评估各 k（无 model_search），再对 top-N k 做完整搜参
         if key == "s05" and args.model_search_feature_counts:
             _counts = [int(x.strip()) for x in args.model_search_feature_counts.split(",") if x.strip()]
             _counts = sorted(set(_counts))
             if len(_counts) > 1:
                 print(f"\n[特征数量搜参] 快速评估 k = {_counts}（使用默认参数，无 model_search）")
                 _best_k, _best_acc = None, -1.0
+                _quick_scores = []
                 # 构建无 model_search 的命令模板
                 _cmd_no_search = cmd.replace(" --model_search ", " --no-model_search ")
                 _cmd_quick_template = _cmd_no_search
@@ -2695,25 +2874,49 @@ def main():
                         _acc = _read_s05_quick_k_score(args.artifact_dir)
                         if _acc is not None:
                             print(f"  [k={_k}] quick valid accuracy={_acc:.6f}")
+                            _quick_scores.append((_k, _acc))
                             if _acc > _best_acc:
                                 _best_k, _best_acc = _k, _acc
                 if _best_k is not None:
-                    print(f"\n[特征数量搜参] 最优 k={_best_k} (acc={_best_acc:.4f})，完整搜参")
-                    _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_best_k}', cmd)
-                    _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
-                                       f'--model_search_feature_counts "{_best_k}"', _cmd_best)
-                    ok = _run(f'{display_name} (k={_best_k}, full search)', _cmd_best, dry_run=args.dry_run)
-                elif args.dry_run:
-                    _dry_k = _counts[-1]
-                    _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_dry_k}', cmd)
-                    _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
-                                       f'--model_search_feature_counts "{_dry_k}"', _cmd_best)
-                    _label = (
-                        f'{display_name} (representative hard-negative search)'
-                        if args.hard_negative_optimize
-                        else f'{display_name} (representative model search)'
+                    _top_n = max(1, min(int(args.model_search_full_top_k), len(_quick_scores)))
+                    _selected_scores = sorted(
+                        _quick_scores,
+                        key=lambda item: (item[1], -item[0]),
+                        reverse=True,
+                    )[:_top_n]
+                    _selected_scores = sorted(_selected_scores, key=lambda item: (item[1], -item[0]))
+                    print(
+                        f"\n[feature-count search] full search top {_top_n}: "
+                        + ", ".join(f"k={_k} acc={_acc:.4f}" for _k, _acc in _selected_scores)
                     )
-                    ok = _run(_label, _cmd_best, dry_run=True)
+                    ok = True
+                    for _idx, (_full_k, _full_acc) in enumerate(_selected_scores, start=1):
+                        _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_full_k}', cmd)
+                        _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
+                                           f'--model_search_feature_counts "{_full_k}"', _cmd_best)
+                        ok = _run(
+                            f'{display_name} (k={_full_k}, full search #{_idx}/{_top_n})',
+                            _cmd_best,
+                            dry_run=args.dry_run,
+                        )
+                        if not ok:
+                            break
+                elif args.dry_run:
+                    _top_n = max(1, min(int(args.model_search_full_top_k), len(_counts)))
+                    _dry_counts = _counts[-_top_n:]
+                    ok = True
+                    for _idx, _dry_k in enumerate(_dry_counts, start=1):
+                        _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_dry_k}', cmd)
+                        _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
+                                           f'--model_search_feature_counts "{_dry_k}"', _cmd_best)
+                        _label = (
+                            f'{display_name} (representative hard-negative search #{_idx}/{_top_n})'
+                            if args.hard_negative_optimize
+                            else f'{display_name} (representative model search #{_idx}/{_top_n})'
+                        )
+                        ok = _run(_label, _cmd_best, dry_run=True)
+                        if not ok:
+                            break
                 else:
                     print(
                         "\n[FAIL] feature-count quick search finished, but no quick "
