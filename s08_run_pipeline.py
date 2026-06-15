@@ -887,16 +887,89 @@ def _render_selected_feature_extractor(selected_features, fill_values, clip_boun
                                        use_stage2_ir=False,
                                        default_fs=25.0,
                                        window_sec=5.0):
-    """Backward-compatible wrapper around the self-contained deploy extractor."""
-    return _render_deployment_feature_extractor(
-        selected_features,
-        fill_values,
-        clip_bounds,
-        formulas,
-        window_model_threshold=window_model_threshold,
-        default_fs=default_fs,
-        window_sec=window_sec,
-    )
+    """Generate a deployment script that imports from s03 for 100% feature consistency."""
+    order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
+    fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
+    clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
+    threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
+    scripts_dir_json = json.dumps(str(scripts_dir) if scripts_dir else os.path.dirname(__file__),
+                                  ensure_ascii=False)
+
+    return f'''# -*- coding: utf-8 -*-
+"""Auto-generated deployment feature extractor for watch wearing-liveness.
+
+Imports s03_extract_feature_pool to guarantee feature values are identical
+to training. The engineer ports individual selected features to C from s03 source.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+
+
+FEATURE_ORDER = {order_json}
+FILL_VALUES = {fill_json}
+CLIP_BOUNDS = {clip_json}
+WINDOW_MODEL_THRESHOLD = {threshold_json}
+
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_CANDIDATE_DIRS = [
+    _SCRIPT_DIR,
+    _SCRIPT_DIR.parent,
+    Path({scripts_dir_json}),
+]
+for _d in _CANDIDATE_DIRS:
+    if (_d / "s03_extract_feature_pool.py").exists():
+        sys.path.insert(0, str(_d))
+        break
+
+from s03_extract_feature_pool import extract_window_features  # noqa: E402
+
+
+def _clean_value(name, value):
+    if value is None or not np.isfinite(value):
+        return float(FILL_VALUES.get(name, 0.0))
+    v = float(value)
+    bound = CLIP_BOUNDS.get(name)
+    if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
+        lo, hi = float(bound[0]), float(bound[1])
+        v = min(max(v, lo), hi)
+    return v
+
+
+def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros_like(ir)])
+    feat = extract_window_features(ppg, fs=fs, acc_window=acc)
+    vec = []
+    for name in FEATURE_ORDER:
+        v = feat.get(name, 0.0)
+        vec.append(_clean_value(name, v))
+    return vec
+
+
+def classify_probability(probability):
+    return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
+
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    n = max(32, int(round({float(default_fs)} * {float(window_sec)})))
+    t = np.arange(n, dtype=float) / {float(default_fs)}
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t)
+    acc = rng.normal(0, 0.01, (n, 3))
+    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs={float(default_fs)})
+    print(f"Feature vector: {{len(vec)}} values")
+    for i, (name, value) in enumerate(zip(FEATURE_ORDER, vec)):
+        print(f"{{i:02d}} {{name}} = {{value:.8g}}")
+'''
 
 
 def export_feature_extractor_script(artifact_dir):
@@ -922,12 +995,14 @@ def export_feature_extractor_script(artifact_dir):
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
     clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
     formulas = build_selected_feature_formulas(selected)
-    script_text = _render_deployment_feature_extractor(
+    script_text = _render_selected_feature_extractor(
         selected,
         fill_values,
         clip_bounds,
         formulas,
+        scripts_dir=SCRIPTS_DIR,
         window_model_threshold=float(bundle.get("threshold", 0.5)),
+        use_stage2_ir=bool(meta.get("use_stage2_ir", False)),
         default_fs=float(meta.get("fs_ppg", 25.0)),
         window_sec=float(meta.get("win_sec", 5.0)),
     )
@@ -1289,6 +1364,24 @@ def _run(name, cmd, dry_run=False, runtime_events=None):
     else:
         print(f"[FAIL] {name}  FAILED (exit={rc})")
         return False
+
+
+def run_embedded_commercial_compare(args):
+    import s09_commercial_compare as commercial_compare
+
+    argv = [
+        "--artifact_dir", str(args.artifact_dir),
+        "--split", str(args.commercial_split),
+        "--fp_cost", str(args.commercial_fp_cost),
+        "--method", "state_machine",
+        "--window_sec", str(args.window_sec),
+        "--stride_sec", str(args.stride_sec),
+        "--skip_initial_windows", str(args.skip_initial_windows),
+        "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir",
+    ]
+    if args.keep_window_probs:
+        argv.append("--keep_window_probs")
+    commercial_compare.main(argv)
 
 
 RELIABILITY_FEATURE_HINTS = (
@@ -2593,22 +2686,23 @@ def main():
         ("s06_feat",  "导出特征提取脚本"),
         ("s06_plot",  "画错误样本图"),
         ("s06_cb",    "导出部署配方"),
-        ("s09_cmp",   "商用方案对比"),
+        ("s09_cmp",   "商业窗口级对比"),
     ]
 
     skip_set = {s.strip() for s in args.skip.split(",") if s.strip()}
-    stop_after = args.stop_after
+    raw_stop_after = args.stop_after
+    stop_after = "s09_cmp" if raw_stop_after == "commercial_compare" else raw_stop_after
     step_keys = [key for key, _ in all_steps]
     if stop_after not in step_keys:
-        print(f"[ERROR] unknown --stop_after={stop_after!r}; choose one of: {','.join(step_keys)}")
+        print(f"[ERROR] unknown --stop_after={raw_stop_after!r}; choose one of: {','.join(step_keys + ['commercial_compare'])}")
         sys.exit(2)
 
     auto_enabled = []
-    if stop_after in {"s06_cache", "s06_replay_cache", "s07_post", "s09_cmp"}:
+    if stop_after in {"s06_cache", "s06_replay_cache", "s07_post"}:
         if "s06_cache" not in skip_set and not args.export_window_cache:
             args.export_window_cache = True
             auto_enabled.append("--export_window_cache")
-    if (stop_after in {"s07_post", "s09_cmp"} or args.optimize_postprocess):
+    if (stop_after in {"s07_post"} or args.optimize_postprocess):
         if "s07_post" not in skip_set and not args.optimize_postprocess:
             args.optimize_postprocess = True
             auto_enabled.append("--optimize_postprocess")
@@ -2858,21 +2952,9 @@ def main():
 
     # s09_cmp
     if "s09_cmp" not in skip_set and args.commercial_compare:
-        keep_probs = " --keep_window_probs" if args.keep_window_probs else ""
-        commands["s09_cmp"] = (
-            f'"{PYTHON}" "{_script_path("s09_commercial_compare")}" '
-            f'--artifact_dir "{args.artifact_dir}" '
-            f'--split {args.commercial_split} '
-            f'--fp_cost {args.commercial_fp_cost} '
-            f'--method state_machine '
-            f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag}'
-            f'{keep_probs}'
-        )
+        commands["s09_cmp"] = "__commercial_compare__"
     elif "s09_cmp" not in skip_set:
-        print("(s09_cmp: --no-commercial_compare skipped)")
+        print("(商业窗口级对比: --no-commercial_compare skipped; output window_level_compare.csv when enabled)")
 
     # s06_plot (纯 Python 调用，非子进程)
     if "s06_plot" not in skip_set and args.plot_errors:
@@ -2921,7 +3003,7 @@ def main():
         if cmd is None:
             continue  # optional step not requested
 
-        if args.dry_run and cmd in {"__plot__", "__extractor__", "__cookbook__"}:
+        if args.dry_run and cmd in {"__plot__", "__extractor__", "__cookbook__", "__commercial_compare__"}:
             print(f"\n[RUN] {display_name}")
             print(f"  {cmd}")
             print("  (dry-run, skipped)")
@@ -2974,6 +3056,19 @@ def main():
             if key == stop_after:
                 stopped_at = key
                 print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
+                break
+            continue
+
+        if cmd == "__commercial_compare__":
+            t0 = time.time()
+            run_embedded_commercial_compare(args)
+            dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
+            completed_keys.add(key)
+            print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
+            if key == stop_after:
+                stopped_at = key
+                print(f"\n[STOP] 宸茶揪鍒?--stop_after={stop_after}锛屽仠姝?")
                 break
             continue
 

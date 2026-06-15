@@ -41,7 +41,7 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from scipy.signal import resample_poly, butter, filtfilt, medfilt, correlate
+from scipy.signal import resample_poly  # only for polyphase downsampling (C has equivalent)
 
 # =========================================================
 # 基本配置
@@ -748,55 +748,56 @@ def remove_step(x, step_k=10.0):
 
     return x
 
-# 全局缓存 butter 滤波器系数，避免每窗重算
-_BUTTER_CACHE = {}
+# 全局缓存 FIR bandpass 核，避免每窗重算。C 可直译：sinc + Hamming 窗 + 卷积。
+_FIR_BANDPASS_CACHE = {}
 
 
-def _get_butter_coeffs(fs, lowcut, highcut, order):
-    key = (float(fs), float(lowcut), float(highcut), int(order))
-    if key in _BUTTER_CACHE:
-        return _BUTTER_CACHE[key]
+def _get_fir_bandpass_kernel(fs, lowcut, highcut, numtaps=65):
+    """Windowed-sinc FIR bandpass kernel. Zero-phase via forward-backward convolve."""
+    key = (float(fs), float(lowcut), float(highcut), int(numtaps))
+    if key in _FIR_BANDPASS_CACHE:
+        return _FIR_BANDPASS_CACHE[key]
     nyq = 0.5 * fs
-    low = max(lowcut / nyq, 1e-6)
-    high = min(highcut / nyq, 0.999)
-    if low >= high:
-        _BUTTER_CACHE[key] = None
-        return None
-    try:
-        b, a = butter(order, [low, high], btype="band")
-        _BUTTER_CACHE[key] = (b, a)
-        return _BUTTER_CACHE[key]
-    except Exception:
-        _BUTTER_CACHE[key] = None
-        return None
+    lo = lowcut / nyq
+    hi = highcut / nyq
+    # Ideal bandpass = lowpass(hi) - lowpass(lo)
+    t = np.arange(numtaps, dtype=np.float64) - (numtaps - 1) / 2.0
+    h = np.sinc(hi * t) * hi - np.sinc(lo * t) * lo
+    h *= np.hamming(numtaps)
+    h /= np.sum(np.abs(h)) + 1e-12
+    _FIR_BANDPASS_CACHE[key] = h
+    return h
 
 
-def bandpass_filter(x, fs, lowcut=0.4, highcut=6.0, order=2):
-    """
-    宽松 PPG 带通：0.4 ~ 6 Hz
+def bandpass_filter(x, fs, lowcut=0.4, highcut=6.0, order=None, numtaps=65):
+    """Windowed-sinc FIR bandpass (zero-phase via forward-backward convolve).
 
-    对佩戴/活体判断：
-    - 不建议太窄；
-    - 0.4~6Hz 能覆盖较宽心率、运动伪影和弱周期性。
-
-    注：butter 滤波器系数全局缓存（同一 (fs, lowcut, highcut, order) 不重算）。
+    Equivalent C pattern:
+      - Design kernel once (sinc + Hamming window).
+      - Convolve forward, then convolve reversed for zero-phase.
     """
     x = np.asarray(x, dtype=np.float64)
-
-    if len(x) < 16:
+    if len(x) < numtaps:
         return x.copy()
+    h = _get_fir_bandpass_kernel(fs, lowcut, highcut, numtaps)
+    # Forward-backward convolve for zero-phase (like filtfilt)
+    forward = np.convolve(x, h, mode='same')
+    return np.convolve(forward[::-1], h, mode='same')[::-1]
 
-    coeffs = _get_butter_coeffs(fs, lowcut, highcut, order)
-    if coeffs is None:
-        return x.copy()
 
-    b, a = coeffs
-    try:
-        y = filtfilt(b, a, x)
-    except Exception:
-        y = x - np.median(x)
-
-    return y
+def _median_filter_np(x, kernel_size):
+    """Numpy median filter - directly portable to C (rolling window median)."""
+    k = max(3, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    half = k // 2
+    n = len(x)
+    out = np.empty(n, dtype=x.dtype)
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out[i] = np.median(x[lo:hi])
+    return out
 
 def preprocess_signal(x, fs):
     """
@@ -819,7 +820,7 @@ def preprocess_signal(x, fs):
         mf_kernel += 1
     if len(x) >= mf_kernel:
         try:
-            x = medfilt(x, kernel_size=mf_kernel)
+            x = _median_filter_np(x, kernel_size=mf_kernel)
         except Exception:
             pass
 
@@ -1009,7 +1010,7 @@ def max_norm_xcorr(x, y, max_lag_samples):
     if sx < EPS or sy < EPS:
         return 0.0
 
-    corr = correlate(x, y, mode="full")
+    corr = np.correlate(x, y, mode="full")
     lags = np.arange(-n + 1, n)
 
     mask = np.abs(lags) <= max_lag_samples

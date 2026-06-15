@@ -14,6 +14,7 @@ Project pipeline:
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import json
 import time
@@ -758,6 +759,39 @@ def build_comparison_report(commercial_eval, project_eval, metadata):
     }
 
 
+def build_window_metric_comparison_rows(report):
+    commercial = report["commercial"]["window_metrics"]
+    project = report["project"]["window_metrics"]
+    deltas = report["metric_deltas_project_minus_commercial"]["window_metrics"]
+    metrics = ["accuracy", "precision", "recall", "f1", "total_windows"]
+    rows = []
+    for metric in metrics:
+        if metric == "total_windows":
+            delta = float(project.get(metric, 0.0) - commercial.get(metric, 0.0))
+        else:
+            delta = float(deltas.get(metric, project.get(metric, 0.0) - commercial.get(metric, 0.0)))
+        rows.append({
+            "metric": metric,
+            "commercial": float(commercial.get(metric, 0.0)),
+            "project": float(project.get(metric, 0.0)),
+            "delta_project_minus_commercial": delta,
+        })
+    return rows
+
+
+def export_window_metric_comparison_csv(report, out_dir: Path):
+    out_path = Path(out_dir) / "window_level_compare.csv"
+    rows = build_window_metric_comparison_rows(report)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["metric", "commercial", "project", "delta_project_minus_commercial"],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(out_path)
+
+
 def _draw_confusion(ax, cm, title):
     matrix = np.array([[cm["TN"], cm["FP"]], [cm["FN"], cm["TP"]]], dtype=float)
     ax.imshow(matrix, cmap="Blues", vmin=0)
@@ -986,7 +1020,9 @@ def main(argv=None):
     }
     report = build_comparison_report(commercial_eval, project_eval, metadata)
     plot_paths = export_comparison_plots(report, out_dir)
+    window_compare_path = export_window_metric_comparison_csv(report, out_dir)
     report["metadata"]["plot_paths"] = plot_paths
+    report["metadata"]["window_level_compare_csv"] = window_compare_path
     report["metadata"]["elapsed_sec"] = float(time.time() - t0)
 
     if not args.keep_window_probs:
@@ -1002,6 +1038,7 @@ def main(argv=None):
     print("[Project sample]   ", project_eval["sample_metrics"])
     print("[Delta sample]     ", report["metric_deltas_project_minus_commercial"]["sample_metrics"])
     print(f"\n[OK] report: {report_path}")
+    print(f"[OK] window_level_compare.csv: {window_compare_path}")
     for name, path in plot_paths.items():
         print(f"[OK] {name}: {path}")
 

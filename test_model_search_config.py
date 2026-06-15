@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import s05_train_final_model as s05
+import s09_commercial_compare as s09
 
 
 ROOT = Path(__file__).resolve().parent
@@ -986,6 +987,8 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
     assert "s07_postprocess_optimize.py" not in output
     assert "--export_window_cache" not in output
     assert "s09_commercial_compare.py" not in output
+    assert "商业窗口级对比" in output
+    assert "window_level_compare.csv" in output
 
 
 def test_s08_model_search_can_explicitly_run_npz_and_postprocess_search():
@@ -1011,6 +1014,69 @@ def test_s08_model_search_can_explicitly_run_npz_and_postprocess_search():
     assert "s07_postprocess_optimize.py" in output
     assert "--replay_split test" in output
     assert "s09_commercial_compare.py" not in output
+
+
+def test_s08_commercial_compare_is_embedded_not_s09_subprocess():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--commercial_compare",
+            "--stop_after",
+            "commercial_compare",
+        ],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert "商业窗口级对比" in output
+    assert "__commercial_compare__" in output
+    assert "s09_commercial_compare.py" not in output
+    assert "--export_window_cache" not in output
+    assert "s07_postprocess_optimize.py" not in output
+
+
+def test_s09_builds_window_metric_comparison_rows():
+    report = {
+        "commercial": {
+            "window_metrics": {
+                "accuracy": 0.90,
+                "precision": 0.80,
+                "recall": 0.70,
+                "f1": 0.75,
+                "total_windows": 100,
+            }
+        },
+        "project": {
+            "window_metrics": {
+                "accuracy": 0.95,
+                "precision": 0.85,
+                "recall": 0.80,
+                "f1": 0.825,
+                "total_windows": 100,
+            }
+        },
+        "metric_deltas_project_minus_commercial": {
+            "window_metrics": {
+                "accuracy": 0.05,
+                "precision": 0.05,
+                "recall": 0.10,
+                "f1": 0.075,
+            }
+        },
+    }
+
+    rows = s09.build_window_metric_comparison_rows(report)
+
+    assert rows[0]["metric"] == "accuracy"
+    assert rows[0]["commercial"] == pytest.approx(0.90)
+    assert rows[0]["project"] == pytest.approx(0.95)
+    assert rows[0]["delta_project_minus_commercial"] == pytest.approx(0.05)
+    assert rows[-1]["metric"] == "total_windows"
 
 
 def test_s08_full_optimize_enables_cache_and_postprocess_search():

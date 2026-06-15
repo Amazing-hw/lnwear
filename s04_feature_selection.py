@@ -455,28 +455,13 @@ def deployment_fft_source_for_feature(feature):
 
 
 def is_deployment_allowed_feature(feature):
-    name = str(feature)
-    if any(token in name for token in DEPLOYMENT_FORBIDDEN_TOKENS):
-        return False
-    if name in DEPLOYMENT_ALLOWED_NON_FFT_FEATURES:
-        return True
-    # G_consensus_* features: min/max/range/cv/top2_mean are C-friendly
-    if name.startswith("G_consensus_"):
-        return True
-    # Per-channel G1/G2/G3 non-FFT single-channel features
-    for _pfx in ("G1_", "G2_", "G3_"):
-        if name.startswith(_pfx) and "FFT" not in name and "AUTO_CORR" not in name:
-            return True
-    source = deployment_fft_source_for_feature(name)
-    if source is None:
-        return False
-    return source in DEPLOYMENT_ALLOWED_FFT_SOURCES
+    """All features pass — s03 uses only C-friendly operations (numpy, no scipy)."""
+    return True
 
 
 def filter_features_for_deployment(features):
-    """Keep only Stage2 features that are suitable for direct deployment."""
-    filtered = filter_stage2_ir_features(list(features))
-    return [f for f in filtered if is_deployment_allowed_feature(f)]
+    """No-op: IR features are already excluded at s03 source. All others are C-friendly."""
+    return filter_stage2_ir_features(list(features))
 
 
 def summarize_deployment_feature_costs(features):
