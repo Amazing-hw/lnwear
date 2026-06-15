@@ -268,7 +268,61 @@ def prepare_valid_calibration_threshold_data(df_valid, selected_features, fill_v
     }
 
 
-def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False):
+def learn_clip_bounds(df, columns, k=1.5):
+    """Learn IQR clip bounds once from train rows for the requested numeric columns."""
+    cols = [c for c in columns
+            if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    if not cols:
+        return {}
+
+    sub = df[cols]
+    q1 = sub.quantile(0.25)
+    q3 = sub.quantile(0.75)
+    iqr = q3 - q1
+    valid_cols = [c for c in cols if iqr.get(c, 0.0) > 1e-10]
+    if not valid_cols:
+        return {}
+
+    lower = q1[valid_cols] - k * iqr[valid_cols]
+    upper = q3[valid_cols] + k * iqr[valid_cols]
+    return {c: (float(lower[c]), float(upper[c])) for c in valid_cols}
+
+
+def _log_clip_summary(clipped_cols, total_features=None, k=1.5, log_top_n=20):
+    if not clipped_cols:
+        return
+    log_top_n = max(0, int(log_top_n))
+    clipped_cols = sorted(
+        clipped_cols,
+        key=lambda item: max(
+            abs(float(item.get("min_overshoot", 0.0))),
+            abs(float(item.get("max_overshoot", 0.0))),
+        ),
+        reverse=True,
+    )
+    shown = clipped_cols[:log_top_n]
+    logger.info(
+        "异常值裁剪统计 (k=%s): %d/%d features clipped%s",
+        k,
+        len(clipped_cols),
+        int(total_features if total_features is not None else len(clipped_cols)),
+        f"; showing top {len(shown)}" if shown else "",
+    )
+    for item in shown:
+        logger.info(
+            "  %s: lower=%.4f, upper=%.4f, clipped_min=%s, clipped_max=%s",
+            item["column"],
+            item["lower"],
+            item["upper"],
+            item["clipped_min"],
+            item["clipped_max"],
+        )
+    omitted = len(clipped_cols) - len(shown)
+    if omitted > 0:
+        logger.info("  ... %d more clipped features omitted", omitted)
+
+
+def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False, log_top_n=20):
     """
     基于 IQR 的异常值裁剪（向量化版）。
 
@@ -278,6 +332,7 @@ def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False):
         k: IQR 倍数，默认 1.5
         bounds: dict[col -> (lower, upper)] 预先计算好的裁剪边界。给定时跳过 IQR 估计直接应用。
         return_bounds: 是否同时返回 bounds 字典（仅 bounds=None 时有意义）。
+        log_top_n: 最多打印多少个被裁剪特征；其余只汇总，避免搜参日志刷屏。
 
     返回:
         若 return_bounds=False：DataFrame
@@ -298,22 +353,16 @@ def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False):
         lower = pd.Series({c: bounds[c][0] for c in valid_cols})
         upper = pd.Series({c: bounds[c][1] for c in valid_cols})
         df[valid_cols] = df[valid_cols].clip(lower=lower, upper=upper, axis=1)
-        return (df, bounds) if return_bounds else df
+        subset_bounds = {c: (float(bounds[c][0]), float(bounds[c][1])) for c in valid_cols}
+        return (df, subset_bounds) if return_bounds else df
 
-    sub = df[cols]
-    q1 = sub.quantile(0.25)
-    q3 = sub.quantile(0.75)
-    iqr = q3 - q1
-
-    valid_mask = iqr.values > 1e-10
-    if not valid_mask.any():
+    learned_bounds = learn_clip_bounds(df, cols, k=k)
+    if not learned_bounds:
         return (df, {}) if return_bounds else df
 
-    valid_cols = [c for c, ok in zip(cols, valid_mask) if ok]
-    q1v = q1[valid_cols]
-    q3v = q3[valid_cols]
-    lower = q1v - k * (q3v - q1v)
-    upper = q3v + k * (q3v - q1v)
+    valid_cols = [c for c in cols if c in learned_bounds]
+    lower = pd.Series({c: learned_bounds[c][0] for c in valid_cols})
+    upper = pd.Series({c: learned_bounds[c][1] for c in valid_cols})
 
     before_min = df[valid_cols].min()
     before_max = df[valid_cols].max()
@@ -333,18 +382,13 @@ def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False):
                 "upper": float(hi),
                 "clipped_min": bool(bmin < lo),
                 "clipped_max": bool(bmax > hi),
+                "min_overshoot": float(lo - bmin) if bmin < lo else 0.0,
+                "max_overshoot": float(bmax - hi) if bmax > hi else 0.0,
             })
 
-    if clipped_cols:
-        logger.info(f"异常值裁剪统计 (k={k}):")
-        for item in clipped_cols:
-            logger.info(f"  {item['column']}: lower={item['lower']:.4f}, "
-                        f"upper={item['upper']:.4f}, "
-                        f"clipped_min={item['clipped_min']}, "
-                        f"clipped_max={item['clipped_max']}")
+    _log_clip_summary(clipped_cols, total_features=len(valid_cols), k=k, log_top_n=log_top_n)
 
-    out_bounds = {c: (float(lower[c]), float(upper[c])) for c in valid_cols}
-    return (df, out_bounds) if return_bounds else df
+    return (df, learned_bounds) if return_bounds else df
 
 
 def prepare_fill_values(df_train, selected_features):
@@ -1790,14 +1834,23 @@ def _compute_scale_pos_weight(args, neg_count, pos_count, p_train_pos):
 
 
 def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
-                 calibration_threshold_split, scale_pos_weight):
+                 calibration_threshold_split, scale_pos_weight, clip_bounds_cache=None):
     """用 top-k 特征训练并返回完整结果。
 
     返回 dict: model, search_summary, search_records, features, fill_values,
                 clip_bounds, X_valid, y_valid, model_select_split, df_calib
     """
-    # clip
-    df_train, clip_bounds = clip_outliers(df_train_raw, features, k=1.5, return_bounds=True)
+    # clip. In multi-k/local-swap search, reuse train-learned bounds for the
+    # superset of ranked candidates to avoid recomputing quantiles per subset.
+    if clip_bounds_cache is not None:
+        clip_bounds = {
+            f: clip_bounds_cache[f]
+            for f in features
+            if f in clip_bounds_cache
+        }
+        df_train = clip_outliers(df_train_raw, features, k=1.5, bounds=clip_bounds)
+    else:
+        df_train, clip_bounds = clip_outliers(df_train_raw, features, k=1.5, return_bounds=True)
     df_valid = clip_outliers(df_valid_raw, features, k=1.5, bounds=clip_bounds)
 
     # fill
@@ -1922,7 +1975,8 @@ def build_local_swap_feature_sets(ranked_features, base_features, tail_size=3, p
 
 def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
                                        df_train_raw, df_valid_raw, train_groups,
-                                       calibration_threshold_split, scale_pos_weight):
+                                       calibration_threshold_split, scale_pos_weight,
+                                       clip_bounds_cache=None):
     """Quick-score local swaps, then run full model search once on the best fixed-size set."""
     candidate_feature_sets = [(list(base_features), "ranked_top_k")]
     if args.feature_search_local_swap:
@@ -1947,6 +2001,7 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
             result = _train_for_k(
                 args, k, candidate_features, df_train_raw, df_valid_raw,
                 train_groups, calibration_threshold_split, scale_pos_weight,
+                clip_bounds_cache=clip_bounds_cache,
             )
         finally:
             args.model_search = original_model_search
@@ -1961,6 +2016,7 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
         result = _train_for_k(
             args, k, best_quick_result["features"], df_train_raw, df_valid_raw,
             train_groups, calibration_threshold_split, scale_pos_weight,
+            clip_bounds_cache=clip_bounds_cache,
         )
         result["search_summary"]["scale_pos_weight"] = scale_pos_weight
         result["search_summary"]["feature_set_source"] = (
@@ -2171,11 +2227,23 @@ def main(args=None):
 
         logger.info(f"特征数搜参: 测试 k ∈ {_ks}（共 {len(_ks)} 个候选，"
                     f"ranked_features 共 {len(_ranked)} 个）")
+        _clip_feature_limit = max(_ks) + max(0, int(args.feature_search_swap_pool_size))
+        _clip_feature_candidates = [
+            r["feature"] for r in _ranked[:_clip_feature_limit]
+            if r.get("feature") in df_train_raw.columns
+        ]
+        _clip_bounds_cache = learn_clip_bounds(df_train_raw, _clip_feature_candidates, k=1.5)
+        logger.info(
+            "预计算 clip bounds: %d/%d candidate features (reuse across k/local-swap)",
+            len(_clip_bounds_cache),
+            len(_clip_feature_candidates),
+        )
 
         # 前置：计算一次 scale_pos_weight（不随 k 变化）
         _all_features = [r["feature"] for r in _ranked]
         _feats_tmp = _all_features[:min(10, len(_all_features))]
-        _df_tmp = clip_outliers(df_train_raw, _feats_tmp, k=1.5)
+        _tmp_bounds = {f: _clip_bounds_cache[f] for f in _feats_tmp if f in _clip_bounds_cache}
+        _df_tmp = clip_outliers(df_train_raw, _feats_tmp, k=1.5, bounds=_tmp_bounds)
         _fv_tmp = prepare_fill_values(_df_tmp, _feats_tmp)
         _X_tmp, _y_tmp, _ = prepare_xy(_df_tmp, _feats_tmp, fill_values=_fv_tmp)
         _train_groups = (df_train_raw["sample_name"].astype("object").to_numpy()
@@ -2199,6 +2267,7 @@ def main(args=None):
                 _train_groups,
                 None,
                 _sw,
+                clip_bounds_cache=_clip_bounds_cache,
             )
             _score = _result["_combined_score"]
             if _score > _best_score:

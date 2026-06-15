@@ -35,7 +35,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 ### 运行场景速查
 
-先按目标选择命令，再用 `--dry_run` 预览真实执行步骤。除特别说明外，默认都是 Stage2 `5s` 窗口、`1s` stride、Stage2 不使用 IR、特征数量搜索 `8,10,12,15,18`、XGBoost `staged_group_cv` 搜参、最大节点数 `500`。
+先按目标选择命令，再用 `--dry_run` 预览真实执行步骤。除特别说明外，默认都是 Stage2 `5s` 窗口、`1s` stride、Stage2 不使用 IR、特征数量搜索 `8,10,12,15,18`、XGBoost `staged_group_cv` 搜参、最大节点数 `500`。默认运行预算档是 `--runtime_profile balanced`：最多抽样 `180` 个 XGBoost 候选、Stage B 保留 `24` 个候选、local swap 最多 `8` 个候选。
 
 1. **只检查命令是否会串通，不执行训练**
 
@@ -60,7 +60,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
      --artifact_dir artifacts
    ```
 
-   自动步骤：`s01 -> s02 -> s03 -> s04 -> s04_search -> s05 -> s06_eval -> s06_xpt/s06_feat/s06_cb`。默认不跑 NPZ 缓存、`s07` 后处理搜参、`s10` 审计和 `s09` 商业对比。
+   自动步骤：`s01 -> s02 -> s03 -> s04 -> s04_search -> s05 -> s06_eval -> s06_xpt/s06_feat/s06_cb`。默认不跑 NPZ 缓存、`s07` 后处理搜参、`s10` 审计和 `s09` 商业对比。流程结束会输出 `[RUNTIME] step elapsed summary`，用于判断主要耗时阶段。
 
 3. **优先拉高 Stage2 单窗口准确率**
 
@@ -444,7 +444,7 @@ python s08_run_pipeline.py \
   --feature_search_local_swap \
   --feature_search_swap_tail_size 3 \
   --feature_search_swap_pool_size 8 \
-  --feature_search_swap_max_candidates 12 \
+      --feature_search_swap_max_candidates 8 \
   --max_model_nodes 500 \
   --split test
 ```
@@ -462,6 +462,18 @@ python s08_run_pipeline.py \
 ## 复杂度受限模型搜参
 
 模型搜参默认开启，同时默认启用**特征数量搜参**。s08 先用默认参数快速评估每个 k（无 model_search），选出最优 k 后再对该 k 做完整模型搜参。这比每个 k 都跑完整搜参减少约 80% 耗时。
+
+### 运行预算档与日志策略
+
+`s08` 提供三档运行预算，优先通过 `--runtime_profile` 控制默认耗时；单项参数仍可显式覆盖。
+
+| 预算档 | 使用场景 | max_candidates | Stage B top_k | local swap candidates | postprocess budget |
+|---|---|---:|---:|---:|---:|
+| `fast` | 快速冒烟、参数连通性、粗排查 | 120 | 16 | 4 | 240 |
+| `balanced`（默认） | 日常训练与部署候选 | 180 | 24 | 8 | 240 |
+| `thorough` | 最终验收、追求极限准确率 | 360 | 48 | 12 | 2000 |
+
+控制台日志默认走 compact 思路：每个阶段只打印入口命令、阶段结果和耗时摘要；XGBoost 搜参明细写入 `model_search_results.csv`，最终配置写入 `final_model_config.json`。`s05` 的 IQR 异常值裁剪会预先为候选特征学习一次 train clip bounds，并在多 k/local-swap 中复用；控制台只打印裁剪摘要和 top-N 异常特征，不再逐次展开所有特征。
 
 ### 搜索空间
 
@@ -486,12 +498,13 @@ python s08_run_pipeline.py \
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
+  --runtime_profile balanced \
   --max_features 18 \
   --model_search_feature_counts "8,10,12,15,18" \
   --max_model_nodes 500 \
   --model_search_strategy staged_group_cv \
-  --model_search_max_candidates 360 \
-  --model_search_stage2_top_k 48 \
+  --model_search_max_candidates 180 \
+  --model_search_stage2_top_k 24 \
   --model_search_cv_folds 3 \
   --model_search_cv_repeats 2 \
   --model_search_random_state 42 \
@@ -509,8 +522,8 @@ python s08_run_pipeline.py \
 
 ```text
 1. 对每个 k ∈ {8,10,12,15,18}，从 ranked_features.json 取 top-k 特征。
-2. 每个 k 内，从参数空间按固定 random_state 抽样最多 360 个 XGBoost 候选。
-3. Stage A 在 train 内部 group split 上预筛，保留 top 48。
+2. 每个 k 内，从参数空间按固定 random_state 抽样候选；balanced 默认最多 180 个，thorough 为 360 个。
+3. Stage A 在 train 内部 group split 上预筛；balanced 默认保留 top 24，thorough 保留 top 48。
 4. Stage B 用 3 folds x 2 repeats 的 group CV 复评候选。
 5. 在 max_model_nodes 预算内，选最优 (k × params) 组合。
 6. 最优特征集 + 最优模型 → model_bundle.pkl → 自动传递到所有部署产物。
@@ -518,6 +531,16 @@ python s08_run_pipeline.py \
 ```
 
 完整候选结果写入 `artifacts/model_search_results.csv`。最佳参数、特征数、valid calibration/threshold split 和搜索稳定性摘要写入 `artifacts/final_model_config.json` 和 `artifacts/model_bundle.pkl`。
+
+最终验收或需要最大化 98% 单窗目标时，可显式恢复重预算：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts_thorough \
+  --runtime_profile thorough \
+  --model_search_full_top_k 2
+```
 
 ### 窗口准确率优先优化命令
 

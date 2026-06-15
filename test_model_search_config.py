@@ -100,6 +100,74 @@ def test_s08_default_pipeline_uses_5s_windows():
     assert "--window_sec 3" not in output
 
 
+def test_s08_default_runtime_profile_uses_balanced_search_budget():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "运行预算档:   balanced" in output
+    assert "--model_search_max_candidates 180" in output
+    assert "--model_search_stage2_top_k 24" in output
+    assert "--feature_search_swap_max_candidates 8" in output
+    assert "--model_search_max_candidates 360" not in output
+    assert "--model_search_stage2_top_k 48" not in output
+
+
+def test_s08_thorough_runtime_profile_restores_full_search_budget():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--stop_after",
+            "s05",
+            "--runtime_profile",
+            "thorough",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "运行预算档:   thorough" in output
+    assert "--model_search_max_candidates 360" in output
+    assert "--model_search_stage2_top_k 48" in output
+    assert "--feature_search_swap_max_candidates 12" in output
+
+
+def test_s08_dry_run_prints_runtime_summary():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "[RUNTIME] step elapsed summary" in output
+    assert "XGBoost 模型训练 (k=8, quick)" in output
+
+
 def test_s08_accuracy_first_shortcut_keeps_postprocess_disabled():
     result = subprocess.run(
         [
@@ -427,8 +495,8 @@ def test_default_pipeline_search_budget_stays_deployable_and_runtime_bounded():
     assert "--max_model_nodes 500" in output
     assert "[8, 10, 12, 15, 18]" in output
     assert '--model_search_feature_counts "18"' in output
-    assert "--model_search_max_candidates 360" in output
-    assert "--model_search_stage2_top_k 48" in output
+    assert "--model_search_max_candidates 180" in output
+    assert "--model_search_stage2_top_k 24" in output
     assert '--model_search_max_depth "2,3,4"' in output
     assert "--feature_search_local_swap" in output
     assert "--search_budget 240" not in output
@@ -465,7 +533,7 @@ def test_s05_local_swap_search_uses_quick_scoring_before_single_full_search(monk
         feature_search_swap_max_candidates=2,
     )
 
-    def fake_train_for_k(args, k, features, *_rest):
+    def fake_train_for_k(args, k, features, *_rest, **_kwargs):
         calls.append((bool(args.model_search), tuple(features)))
         score = 0.9 + (0.01 if "f9" in features else 0.0)
         return {
@@ -502,7 +570,7 @@ def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch
         feature_search_swap_max_candidates=1,
     )
 
-    def fake_train_for_k(args, k, features, *_rest):
+    def fake_train_for_k(args, k, features, *_rest, **_kwargs):
         calls.append((bool(args.model_search), tuple(features)))
         has_swap = "f9" in features
         if args.model_search:
@@ -533,6 +601,48 @@ def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch
 
     assert "f9" in final["features"]
     assert final["_combined_score"] == pytest.approx(0.99)
+
+
+def test_s05_clip_outliers_logs_summary_instead_of_every_feature(caplog):
+    df = pd.DataFrame({
+        f"f{i}": [0.0, 1.0, 2.0, 100.0 + i]
+        for i in range(8)
+    })
+
+    with caplog.at_level("INFO", logger=s05.logger.name):
+        clipped, bounds = s05.clip_outliers(
+            df,
+            list(df.columns),
+            return_bounds=True,
+            log_top_n=3,
+        )
+
+    assert set(bounds) == set(df.columns)
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "异常值裁剪统计 (k=1.5): 8/8 features clipped" in messages
+    assert "showing top 3" in messages
+    assert "more clipped features omitted" in messages
+    assert np.isfinite(clipped.to_numpy()).all()
+
+
+def test_s05_learn_clip_bounds_can_be_reused_for_feature_subsets():
+    df = pd.DataFrame({
+        "a": [0.0, 1.0, 2.0, 100.0],
+        "b": [10.0, 11.0, 12.0, 200.0],
+        "c": [5.0, 5.0, 5.0, 5.0],
+    })
+
+    bounds = s05.learn_clip_bounds(df, ["a", "b", "c"])
+    clipped, subset_bounds = s05.clip_outliers(
+        df,
+        ["b"],
+        bounds=bounds,
+        return_bounds=True,
+    )
+
+    assert set(bounds) == {"a", "b"}
+    assert set(subset_bounds) == {"b"}
+    assert clipped["b"].max() <= bounds["b"][1]
 
 
 def test_model_search_grid_force_includes_default_params_when_custom_grid_excludes_it():
@@ -822,8 +932,8 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
     assert "--no-model_search" in output
     assert "--max_model_nodes 260" in output
     assert "--model_search_strategy staged_group_cv" in output
-    assert "--model_search_max_candidates 360" in output
-    assert "--model_search_stage2_top_k 48" in output
+    assert "--model_search_max_candidates 180" in output
+    assert "--model_search_stage2_top_k 24" in output
     assert "--model_search_cv_folds 3" in output
     assert "--model_search_cv_repeats 2" in output
     assert "--model_search_random_state 42" in output

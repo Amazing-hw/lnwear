@@ -1204,17 +1204,85 @@ def _script_path(name):
     return os.path.join(SCRIPTS_DIR, f"{name}.py")
 
 
-def _run(name, cmd, dry_run=False):
+RUNTIME_PROFILES = {
+    "fast": {
+        "model_search_max_candidates": 120,
+        "model_search_stage2_top_k": 16,
+        "feature_search_swap_max_candidates": 4,
+        "model_search_full_top_k": 1,
+        "postprocess_search_budget": 240,
+    },
+    "balanced": {
+        "model_search_max_candidates": 180,
+        "model_search_stage2_top_k": 24,
+        "feature_search_swap_max_candidates": 8,
+        "model_search_full_top_k": 1,
+        "postprocess_search_budget": 240,
+    },
+    "thorough": {
+        "model_search_max_candidates": 360,
+        "model_search_stage2_top_k": 48,
+        "feature_search_swap_max_candidates": 12,
+        "model_search_full_top_k": 2,
+        "postprocess_search_budget": 2000,
+    },
+}
+
+
+def _arg_was_provided(argv, opt):
+    prefix = opt + "="
+    return any(item == opt or item.startswith(prefix) for item in argv)
+
+
+def apply_runtime_profile(args, raw_argv):
+    profile = RUNTIME_PROFILES.get(args.runtime_profile, RUNTIME_PROFILES["balanced"])
+    option_map = {
+        "model_search_max_candidates": "--model_search_max_candidates",
+        "model_search_stage2_top_k": "--model_search_stage2_top_k",
+        "feature_search_swap_max_candidates": "--feature_search_swap_max_candidates",
+        "model_search_full_top_k": "--model_search_full_top_k",
+        "postprocess_search_budget": "--postprocess_search_budget",
+    }
+    for attr, opt in option_map.items():
+        if not _arg_was_provided(raw_argv, opt):
+            setattr(args, attr, profile[attr])
+
+
+def _record_runtime(runtime_events, name, elapsed, dry_run=False):
+    if runtime_events is not None:
+        runtime_events.append({
+            "name": str(name),
+            "elapsed": float(elapsed),
+            "dry_run": bool(dry_run),
+        })
+
+
+def _print_runtime_summary(runtime_events):
+    if not runtime_events:
+        return
+    print("\n[RUNTIME] step elapsed summary")
+    total = 0.0
+    for item in runtime_events:
+        elapsed = float(item.get("elapsed", 0.0))
+        total += elapsed
+        suffix = " (dry-run)" if item.get("dry_run") else ""
+        print(f"  - {item['name']}: {timedelta(seconds=int(elapsed))}{suffix}")
+    print(f"  total measured: {timedelta(seconds=int(total))}")
+
+
+def _run(name, cmd, dry_run=False, runtime_events=None):
     """执行一个子步骤。返回 True/False。"""
     print(f"\n{'─' * 70}")
     print(f"[RUN] {name}")
     print(f"  {cmd}")
     if dry_run:
         print("  (dry-run, skipped)")
+        _record_runtime(runtime_events, name, 0.0, dry_run=True)
         return True
     t0 = time.time()
     rc = subprocess.call(cmd, shell=True)
     dt = time.time() - t0
+    _record_runtime(runtime_events, name, dt, dry_run=False)
     if rc == 0:
         print(f"[OK] {name}  [{timedelta(seconds=int(dt))}]")
         return True
@@ -1270,6 +1338,7 @@ def _build_staged_e2e_child_command(args, artifact_dir, stage_flag):
         f'"{PYTHON}" "{_script_path("s08_run_pipeline")}"',
         f'--dataset_dir "{args.dataset_dir}"',
         f'--artifact_dir "{artifact_dir}"',
+        f'--runtime_profile {args.runtime_profile}',
         f'--window_sec {args.window_sec}',
         f'--stride_sec {args.stride_sec}',
         f'--skip_initial_windows {args.skip_initial_windows}',
@@ -2311,6 +2380,9 @@ def main():
                    default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                    help="并行 worker 数")
     p.add_argument("--dry_run", action="store_true", help="只打印命令不执行")
+    p.add_argument("--runtime_profile", default="balanced",
+                   choices=["fast", "balanced", "thorough"],
+                   help="运行预算档：fast 更快，balanced 默认折中，thorough 恢复更重搜参/后处理预算")
 
     # ── 步骤控制 ──
     p.add_argument("--skip", default="", help="跳过的步骤，逗号分隔 (如 s03,s04)")
@@ -2366,11 +2438,11 @@ def main():
                    help="s05 accuracy gap allowed when preferring a smaller model; default 0.0 means accuracy strictly wins under the node budget")
     p.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                    help="fraction of valid calibration pool used for model search")
-    p.add_argument("--model_search_max_candidates", type=int, default=360,
+    p.add_argument("--model_search_max_candidates", type=int, default=180,
                    help="maximum sampled s05 model-search candidates")
     p.add_argument("--model_search_stage1_top_k", type=int, default=4,
                    help="number of stage-1 structure candidates advanced to stage-2 refine")
-    p.add_argument("--model_search_stage2_top_k", type=int, default=48,
+    p.add_argument("--model_search_stage2_top_k", type=int, default=24,
                    help="number of stage-A candidates kept for s05 staged_group_cv")
     p.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
                    help="搜参时测试的特征数量，逗号分隔 (如 8,10,12,15,18)。固定特征数时传单个值，如 --max_features 15 --model_search_feature_counts 15")
@@ -2382,7 +2454,7 @@ def main():
                    help="number of lowest-ranked selected features eligible for local swaps")
     p.add_argument("--feature_search_swap_pool_size", type=int, default=8,
                    help="number of next-ranked candidate features considered for local swaps")
-    p.add_argument("--feature_search_swap_max_candidates", type=int, default=12,
+    p.add_argument("--feature_search_swap_max_candidates", type=int, default=8,
                    help="maximum local-swap feature sets evaluated per k")
     p.add_argument("--model_search_cv_folds", type=int, default=3,
                    help="s05 staged_group_cv folds")
@@ -2465,6 +2537,7 @@ def main():
 
     _raw_argv = sys.argv[1:]
     args = p.parse_args()
+    apply_runtime_profile(args, _raw_argv)
     if args.staged_e2e_optimize:
         if args.accuracy_first_optimize or args.hard_negative_optimize or args.full_optimize:
             print("[ERROR] --staged_e2e_optimize already expands to separate objective stages; do not combine it with shortcut flags.")
@@ -2828,11 +2901,13 @@ def main():
     print(f"  并行 worker:  {args.n_workers}")
     print(f"  入选特征数:   {args.max_features}")
     print(f"  评估 split:   {args.split}")
+    print(f"  运行预算档:   {args.runtime_profile}")
     print(f"  导出部署:     {'是' if args.export_deploy else '否'}")
     print(f"  状态机优化:   {'是' if args.optimize else '否'}")
     print("=" * 70)
 
     total_start = time.time()
+    runtime_events = []
     results = {}
     completed_keys = set()
     stopped_at = None
@@ -2850,6 +2925,7 @@ def main():
             print(f"\n[RUN] {display_name}")
             print(f"  {cmd}")
             print("  (dry-run, skipped)")
+            _record_runtime(runtime_events, display_name, 0.0, dry_run=True)
             completed_keys.add(key)
             if key == stop_after:
                 stopped_at = key
@@ -2863,6 +2939,7 @@ def main():
             plot_error_samples(args.artifact_dir, split=args.split,
                                window_sec=args.window_sec, stride_sec=args.stride_sec)
             dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
             completed_keys.add(key)
             print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
             if key == stop_after:
@@ -2875,6 +2952,7 @@ def main():
             t0 = time.time()
             export_feature_extractor_script(args.artifact_dir)
             dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
             completed_keys.add(key)
             print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
             if key == stop_after:
@@ -2890,6 +2968,7 @@ def main():
                 export_golden_vectors(args.artifact_dir)
                 validate_deploy_artifact_consistency(args.artifact_dir)
             dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
             completed_keys.add(key)
             print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
             if key == stop_after:
@@ -2919,7 +2998,12 @@ def main():
                     _cmd_k = re.sub(r'--model_search_feature_counts "[^"]*"',
                                     f'--model_search_feature_counts "{_k}"', _cmd_k)
                     print(f"\n  --- k={_k} ---")
-                    _ok = _run(f'{display_name} (k={_k}, quick)', _cmd_k, dry_run=args.dry_run)
+                    _ok = _run(
+                        f'{display_name} (k={_k}, quick)',
+                        _cmd_k,
+                        dry_run=args.dry_run,
+                        runtime_events=runtime_events,
+                    )
                     if not _ok:
                         continue
                     # 读取 CV 结果判断最优 k
@@ -2951,6 +3035,7 @@ def main():
                             f'{display_name} (k={_full_k}, full search #{_idx}/{_top_n})',
                             _cmd_best,
                             dry_run=args.dry_run,
+                            runtime_events=runtime_events,
                         )
                         if not ok:
                             break
@@ -2967,7 +3052,7 @@ def main():
                             if args.hard_negative_optimize
                             else f'{display_name} (representative model search #{_idx}/{_top_n})'
                         )
-                        ok = _run(_label, _cmd_best, dry_run=True)
+                        ok = _run(_label, _cmd_best, dry_run=True, runtime_events=runtime_events)
                         if not ok:
                             break
                 else:
@@ -2978,9 +3063,9 @@ def main():
                     )
                     ok = False
             else:
-                ok = _run(display_name, cmd, dry_run=args.dry_run)
+                ok = _run(display_name, cmd, dry_run=args.dry_run, runtime_events=runtime_events)
         else:
-            ok = _run(display_name, cmd, dry_run=args.dry_run)
+            ok = _run(display_name, cmd, dry_run=args.dry_run, runtime_events=runtime_events)
         results[key] = ok
         if ok:
             completed_keys.add(key)
@@ -2994,6 +3079,7 @@ def main():
             break
 
     total_dt = time.time() - total_start
+    _print_runtime_summary(runtime_events)
     print(f"\n{'=' * 70}")
     if stopped_at:
         print(f"[OK] 流水线已按 --stop_after={stopped_at} 结束  [{timedelta(seconds=int(total_dt))}]")
