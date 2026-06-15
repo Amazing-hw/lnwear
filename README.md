@@ -33,6 +33,174 @@ artifacts/staged_e2e/03_e2e_postprocess
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
+### 运行场景速查
+
+先按目标选择命令，再用 `--dry_run` 预览真实执行步骤。除特别说明外，默认都是 Stage2 `5s` 窗口、`1s` stride、Stage2 不使用 IR、特征数量搜索 `8,10,12,15,18`、XGBoost `staged_group_cv` 搜参、最大节点数 `500`。
+
+1. **只检查命令是否会串通，不执行训练**
+
+   适用条件：首次改参数、换数据目录、准备长时间训练前。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --dry_run
+   ```
+
+   作用：只打印 `s01` 到默认终点 `s06_cb` 的命令，不读取 H5、不写训练产物。
+
+2. **默认部署候选训练与导出**
+
+   适用条件：已有原始 H5 数据，希望得到一套可部署模型、部署特征脚本和部署配方。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts
+   ```
+
+   自动步骤：`s01 -> s02 -> s03 -> s04 -> s04_search -> s05 -> s06_eval -> s06_xpt/s06_feat/s06_cb`。默认不跑 NPZ 缓存、`s07` 后处理搜参、`s10` 审计和 `s09` 商业对比。
+
+3. **优先拉高 Stage2 单窗口准确率**
+
+   适用条件：当前主要问题是单窗口模型能力下降，先排除特征质量、特征数量和模型参数问题。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --accuracy_first_optimize \
+     --model_search_full_top_k 2 \
+     --stop_after s05
+   ```
+
+   自动条件：阈值目标使用 `accuracy`；不自动打开 hard negative、NPZ、`s07` 后处理或 `s10` 审计；最终关注 `model_search_results.csv`、`final_model_config.json` 和 `model_bundle.pkl`。
+
+4. **高 FP 风险 / object-worn hard negative 训练**
+
+   适用条件：主要风险是非人体佩戴、物体表面反光、松戴等负样本被识别为佩戴。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --hard_negative_optimize \
+     --hard_negative_weight 3.0 \
+     --hard_negative_top_percentile 0.1 \
+     --stop_after s05
+   ```
+
+   自动条件：启用 train-only OOF hard negative mining；用于训练层面压低高风险 FP。只想先看模型改善时停在 `s05`，暂不跑后处理。
+
+5. **完整 hard negative + NPZ + 后处理闭环**
+
+   适用条件：模型已经有可用窗口能力，需要同时考虑端到端准确率、误识别率和响应时延。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --hard_negative_optimize \
+     --export_window_cache \
+     --optimize_postprocess \
+     --postprocess_split valid \
+     --split test \
+     --postprocess_search_budget 2000 \
+     --stop_after s07_post
+   ```
+
+   自动步骤：先导出 valid/test 逐窗 NPZ，再用 valid 搜 `s07` 状态机参数，并在 test 上 replay。`--postprocess_search_budget` 用于限制后处理候选数量，避免搜参时间过长。
+
+6. **只基于已有模型做后处理搜参**
+
+   适用条件：`model_bundle.pkl` 已存在，不想重新跑数据切分、特征提取、筛选和训练。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --skip s01,s02,s03,s04,s04_search,s05 \
+     --export_window_cache \
+     --optimize_postprocess \
+     --postprocess_split valid \
+     --split test \
+     --postprocess_search_budget 2000 \
+     --stop_after s07_post
+   ```
+
+   前置条件：`artifacts/model_bundle.pkl`、特征配置和 split 产物必须已经存在。
+
+7. **三阶段 staged E2E 自动优化**
+
+   适用条件：需要同时保留三套目标明确的实验产物，便于比较单窗准确率、FP 安全性和最终后处理表现。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --staged_e2e_optimize \
+     --model_search_full_top_k 2
+   ```
+
+   自动产物：`artifacts/staged_e2e/01_accuracy_first`、`02_fp_safe_hard_negative`、`03_e2e_postprocess`。三阶段不要混用同一个目录，避免目标函数覆盖。
+
+8. **泛化审计**
+
+   适用条件：已有 `s06` 评估产物，需要按人群、样本类型、窗口质量等分层看弱点。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --run_generalization_audit \
+     --stop_after s10_audit
+   ```
+
+   输出：`s10` 只读取已有评估/窗口产物，不重新训练模型。
+
+9. **商业 baseline 对比**
+
+   适用条件：已有项目模型和可评估 split，需要比较商业阈值/AdaBoost baseline 与当前 XGBoost 部署链路。
+
+   ```bash
+   python s08_run_pipeline.py \
+     --dataset_dir dataset \
+     --artifact_dir artifacts \
+     --commercial_compare \
+     --stop_after s09_cmp
+   ```
+
+   关键条件：`s09` 会使用同一 `window_sec/stride_sec/skip_initial_windows` 对项目模型做对比；如需保留逐窗概率细节，加 `--keep_window_probs`。
+
+10. **兼容旧 3s 窗口实验**
+
+    适用条件：只用于响应速度或历史结果对照；不要和 5s 产物混在同一部署结论里。
+
+    ```bash
+    python s08_run_pipeline.py \
+      --dataset_dir dataset \
+      --artifact_dir artifacts_3s \
+      --window_sec 3 \
+      --model_search_feature_counts "8,10,12,15,18"
+    ```
+
+    约束：训练、评估、NPZ、后处理和部署导出必须使用同一个 `window_sec`。最终生产推荐仍以 5s 作为默认候选。
+
+11. **固定特征数量做快速对照**
+
+    适用条件：已经决定部署特征数，例如强制不超过 15 个或 18 个，只想验证模型参数。
+
+    ```bash
+    python s08_run_pipeline.py \
+      --dataset_dir dataset \
+      --artifact_dir artifacts \
+      --max_features 15 \
+      --model_search_feature_counts 15
+    ```
+
+    约束：`--model_search_feature_counts` 传单个值时应与 `--max_features` 一致，否则容易误读最终入选特征数。
+
 ### 部署友好特征池
 
 Stage2 默认只有一套部署友好特征池；不再提供研究型/部署型模式开关。限制发生在 `s04` 特征筛选和 `s05` 训练之前，不是在部署导出阶段裁剪，因此最终 `model_bundle.pkl`、`deploy_xgboost.json`、`deploy_feature_extractor.py` 的特征顺序和维度保持一致。
