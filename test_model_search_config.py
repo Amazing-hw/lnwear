@@ -491,6 +491,50 @@ def test_s05_local_swap_search_uses_quick_scoring_before_single_full_search(monk
     assert final["search_summary"]["local_swap_search"]["best_source"] == "local_swap_1"
 
 
+def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch):
+    calls = []
+
+    args = argparse.Namespace(
+        model_search=True,
+        feature_search_local_swap=True,
+        feature_search_swap_tail_size=1,
+        feature_search_swap_pool_size=1,
+        feature_search_swap_max_candidates=1,
+    )
+
+    def fake_train_for_k(args, k, features, *_rest):
+        calls.append((bool(args.model_search), tuple(features)))
+        has_swap = "f9" in features
+        if args.model_search:
+            return {
+                "k": k,
+                "features": list(features),
+                "search_summary": {"best": {"score": 0.80}, "feature_set_source": ""},
+                "search_records": [],
+                "valid_acc": 0.99 if has_swap else 0.98,
+                "search_score": 0.80,
+            }
+        return {
+            "k": k,
+            "features": list(features),
+            "search_summary": {"best": {"score": 0.0}, "feature_set_source": ""},
+            "search_records": [],
+            "valid_acc": 0.99 if has_swap else 0.98,
+            "search_score": 0.0,
+        }
+
+    ranked = [{"feature": f"f{i}"} for i in range(1, 10)]
+    base = [f"f{i}" for i in range(1, 9)]
+    monkeypatch.setattr(s05, "_train_for_k", fake_train_for_k)
+
+    final = s05.train_best_local_feature_set_for_k(
+        args, 8, ranked, base, None, None, None, None, 1.0
+    )
+
+    assert "f9" in final["features"]
+    assert final["_combined_score"] == pytest.approx(0.99)
+
+
 def test_model_search_grid_force_includes_default_params_when_custom_grid_excludes_it():
     args = _model_search_args(
         model_search_n_estimators="20",
@@ -788,6 +832,26 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
     assert '--model_search_n_estimators "20,30"' in output
     assert '--model_search_max_depth "2"' in output
     assert '--model_search_colsample_bytree "0.7,0.8"' in output
+
+
+def test_s08_default_threshold_objective_optimizes_window_accuracy():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert "--threshold_objective accuracy" in output
+    assert "--threshold_objective fbeta" not in output
 
 
 def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search():

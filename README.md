@@ -82,10 +82,10 @@ new_codex/
     扫描 H5，过滤 PPG shape 不符合要求的样本，按 sample/record 分层切分 train/valid/test。
 
   s02_ir_dc_threshold.py
-    固定 Stage1 IR DC/ACDC 阈值为 1.5e6 / 0.35，导出 primitive window 统计和散点图。
+    固定 Stage1 IR DC/ACDC 阈值为 1.5e6 / 1.0，导出 primitive window 统计和散点图。
 
   s03_extract_feature_pool.py
-    提取 Stage2 特征池；3D 预切窗直接逐个使用已有 3s 窗口，连续时序才按 3s/1s 滑窗。
+    提取 Stage2 特征池；3D 预切窗直接逐个使用已有窗口，连续时序默认按 5s/1s 滑窗。
     默认跳过每条样本前 3 个 Stage2 窗口。
     Stage2 特征池固定不包含 IR 派生特征；IR 只用于 Stage1 DC/ACDC 门控。
 
@@ -136,7 +136,7 @@ record/window_group  一个 H5 含多条 record，每条 record 下按窗口 gro
 
 当 `ppg` 是 3D 预切窗时，`s03/s06/s09` 会直接逐个使用已有窗口，不再在每个 sample 内二次滑窗；`s01` 仍按 sample/group 做 train/valid/test 切分。
 
-当前新 H5 结构也支持一个 H5 文件里包含多条数据，每条数据下包含多个 3s 窗口 group。窗口 group 名称必须能从末尾解析出窗口编号和 label：
+当前新 H5 结构也支持一个 H5 文件里包含多条数据，每条数据下包含多个预切窗口 group。窗口 group 名称必须能从末尾解析出窗口编号和 label：
 
 ```text
 record_a/
@@ -151,7 +151,7 @@ record_a/
     acc        (3, 300)
 ```
 
-解析规则是按 `_` 分割后的倒数第二段匹配 `w数字`，最后一段是 `label`。例如 `xxx_w20_1` 表示第 20 个窗口，label=1。H5 内部保存顺序不重要；`s01/s03/s06/s07` 会按 `w` 后的数字排序，`skip_initial_windows=3` 也是在排序后跳过前三个窗口。窗口是从原始信号按 3s 窗长、1s stride 预先截取的，因此后续不会重新滑窗。
+解析规则是按 `_` 分割后的倒数第二段匹配 `w数字`，最后一段是 `label`。例如 `xxx_w20_1` 表示第 20 个窗口，label=1。H5 内部保存顺序不重要；`s01/s03/s06/s07` 会按 `w` 后的数字排序，`skip_initial_windows=3` 也是在排序后跳过前三个窗口。预切窗口后续不会重新滑窗；连续时序默认才按 5s 窗长、1s stride 截取。
 
 切分是 sample 级，不是 window 级。训练、验证、测试应避免同一条采集、同一人或同一 H5 的相邻样本跨 split；如果你的 H5 语义代表同一次采集，建议重点检查 split 结果。
 
@@ -420,7 +420,7 @@ python s02_ir_dc_threshold.py \
 
 ```text
 dc_threshold = 1.5e6
-ac_dc_threshold = 0.35
+ac_dc_threshold = 1.0
 ```
 
 输出：
@@ -437,7 +437,7 @@ artifacts/stage1_scatter.png
 ```bash
 python s03_extract_feature_pool.py \
   --artifact_dir artifacts \
-  --window_sec 3 \
+  --window_sec 5 \
   --stride_sec 1 \
   --skip_initial_windows 3 \
   --no-use_stage2_ir
@@ -495,15 +495,14 @@ python s04_feature_selection.py \
 ```bash
 python s05_train_final_model.py \
   --artifact_dir artifacts \
-  --window_sec 3 \
+  --window_sec 5 \
   --step_sec 1 \
   --no-use_stage2_ir \
-  --threshold_objective fbeta \
-  --threshold_beta 0.5 \
+  --threshold_objective accuracy \
   --calibration_method isotonic
 ```
 
-如果真实运行中主要错误来自“非人体佩戴在物体上”这类高舆情风险 FP，优先把窗口阈值切到 precision 约束模式，而不是只追求总体 accuracy：
+默认训练目标优先保证单窗口 accuracy；如果真实运行中主要错误来自“非人体佩戴在物体上”这类高舆情风险 FP，再显式把窗口阈值切到 precision 约束模式：
 
 ```bash
 python s08_run_pipeline.py \
@@ -614,7 +613,7 @@ python s06_deploy_eval.py \
   --artifact_dir artifacts \
   --split test \
   --method state_machine \
-  --window_sec 3 \
+  --window_sec 5 \
   --stride_sec 1 \
   --skip_initial_windows 3 \
   --no-use_stage2_ir
@@ -691,7 +690,7 @@ artifacts/model_bundle.pkl
 python s06_deploy_eval.py \
   --artifact_dir artifacts \
   --split valid \
-  --window_sec 3 \
+  --window_sec 5 \
   --stride_sec 1 \
   --skip_initial_windows 3 \
   --window_output_root window_outputs \
@@ -812,7 +811,7 @@ python s06_deploy_eval.py \
   --artifact_dir artifacts \
   --split test \
   --method state_machine \
-  --window_sec 3 \
+  --window_sec 5 \
   --stride_sec 1 \
   --skip_initial_windows 3
 ```

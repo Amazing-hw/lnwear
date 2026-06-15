@@ -25,7 +25,7 @@ def test_s02_uses_fixed_stage1_deploy_threshold_constants():
     dc, acdc = s02.resolve_fixed_deploy_thresholds(args)
 
     assert dc == 1.5e6
-    assert acdc == 0.35
+    assert acdc == 1.0
 
 
 def test_s02_cli_does_not_expose_stage1_threshold_args():
@@ -65,6 +65,37 @@ def test_stage1_ambient_check_uses_configured_ratio_threshold():
     assert s03.stage1_ambient_check(ppg, ambient_ratio_threshold=1.0) is True
 
 
+def test_stage1_extraction_no_longer_hard_filters_ambient_ratio(monkeypatch):
+    ppg = np.zeros((3, 300, 6), dtype=float)
+    ppg[:, :, 0] = 2.0e6
+    ppg[:, :, 1] = 1.9e6
+    sample = {"sample_name": "ambient_near_ir", "h5_file": "synthetic.h5", "target": 1}
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: None)
+    monkeypatch.setattr(
+        s03,
+        "extract_feature_pool_from_window",
+        lambda *_args, **_kwargs: ({"GREEN_AC": 1.0}, {}),
+    )
+    monkeypatch.setattr(s03, "detect_green_mode", lambda _ppg: 1)
+
+    rows = s03._extract_rows_for_sample(
+        sample,
+        dc_threshold=1.5e6,
+        ac_dc_threshold=1.0,
+        window_len=75,
+        stride_len=25,
+        fs=25,
+        target_aware_stride=False,
+        stride_neg=25,
+        stride_pos=25,
+        skip_initial_windows=0,
+    )
+
+    assert len(rows) == 3
+
+
 def test_process_pool_worker_hooks_are_pickleable():
     for fn in (
         s04._init_stab_worker,
@@ -73,6 +104,21 @@ def test_process_pool_worker_hooks_are_pickleable():
         s06._worker_infer,
     ):
         assert pickle.loads(pickle.dumps(fn)) is fn
+
+
+def test_s06_summarizes_stage1_target1_pass_rate():
+    summary = s06.summarize_stage1_target1_pass_rate([
+        {"target": 1, "stage1_pass": True, "fallback": False},
+        {"target": 1, "stage1_pass": False, "fallback": False},
+        {"target": 1, "stage1_pass": True, "fallback": True},
+        {"target": 0, "stage1_pass": True, "fallback": False},
+    ])
+
+    assert summary == {
+        "target1_total_samples": 3,
+        "target1_stage1_pass_samples": 1,
+        "target1_stage1_pass_rate": 1 / 3,
+    }
 
 
 def test_s08_dry_run_does_not_expose_stage1_threshold_tuning_args():

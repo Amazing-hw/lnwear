@@ -6,14 +6,14 @@
 
 输入支持两种形态：
 - 3D 预切窗 PPG：直接逐个使用 H5 中已有窗口，不再二次滑窗。
-- 连续时序 PPG：通过 Stage1 后降采样到 25Hz，再按 3s/1s 滑窗。
+- 连续时序 PPG：通过 Stage1 后降采样到 25Hz，再按 5s/1s 滑窗（可显式切到 3s）。
 - grouped-window H5：一个 record 下多个窗口 group，窗口名末尾为 *_w20_1；
   读取时按 w 后数字排序，label 来自最后一段。
 
 功能：
 1. 读取 artifacts/splits.json
 2. 读取 artifacts/stage1_threshold.json
-3. 对通过 Stage1 IR DC/ACDC 阈值的样本提取 3s/25Hz Stage2 特征
+3. 对通过 Stage1 IR DC/ACDC 阈值的样本提取 5s/25Hz Stage2 特征
 4. 复用原始 H5 读取方式
 5. 复用原始绿光通道构建方式：
    - mode=1: ch3/ch4/ch5 为三通道绿光
@@ -2490,8 +2490,6 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                 continue
             if not stage1_sample_pass(raw_window, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs):
                 continue
-            if not stage1_ambient_check(raw_window):
-                continue
             if native_25hz:
                 window = raw_window.astype(np.float64, copy=False)
             else:
@@ -2562,9 +2560,6 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
 
     if not stage1_sample_pass(ppg, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs):
         return []
-    if not stage1_ambient_check(ppg):
-        return []
-
     mode = detect_green_mode(ppg)
     sample_target = int(sample.get("target", 0))
 
@@ -2661,7 +2656,7 @@ def _worker_extract(args_tuple):
 def extract_features_for_split(samples,
                                dc_threshold,
                                ac_dc_threshold,
-                               window_sec=3,
+                               window_sec=5,
                                stride_sec=1,
                                fs=100,
                                target_aware_stride=False,

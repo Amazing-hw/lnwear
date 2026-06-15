@@ -2191,7 +2191,7 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
 
 
 def plot_error_samples(artifact_dir, split="test", method="state_machine",
-                       window_sec=3, stride_sec=1):
+                       window_sec=5, stride_sec=1):
     """
     准确率非 100% 的样本画图。4 子图:
       1. 原始 target (0/1 横线)
@@ -2341,7 +2341,7 @@ def main():
                    help="s04 FP proxy positive-window recall floor")
     p.add_argument("--fp_proxy_state_k_on", type=int, default=3,
                    help="s04 FP proxy consecutive windows for state trigger")
-    p.add_argument("--threshold_objective", default="fbeta",
+    p.add_argument("--threshold_objective", default="accuracy",
                    choices=["f1", "precision", "recall", "fbeta", "precision_constrained", "accuracy"])
     p.add_argument("--threshold_beta", type=float, default=0.5,
                    help="F-beta 参数 (<1 偏precision)")

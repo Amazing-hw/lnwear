@@ -465,10 +465,7 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
         emitted_window_indices.append(window_number)
         emitted_window_targets.append(window_target)
 
-        enabled = (
-            stage1_sample_pass(raw_window, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs)
-            and stage1_ambient_check(raw_window)
-        )
+        enabled = stage1_sample_pass(raw_window, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs)
         stage2_enabled_flags.append(int(enabled))
         if not enabled:
             feats_list.append(None)
@@ -596,11 +593,6 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
             window_sec, stride_sec, bundle, use_stage2_ir,
             skip_initial_windows,
         )
-
-    # 2b. Stage1 环境光检查 (整条数据级别)
-    if not stage1_ambient_check(ppg):
-        base["stage1_pass"] = False
-        return base  # 环境光异常 → 判为未佩戴
 
     # 3. 信号降采样 (25Hz 原生数据跳过)
     try:
@@ -1566,7 +1558,7 @@ def _score_grid_point(args_tuple):
 
 
 def optimize_state_machine_params(samples, dc_threshold, ac_dc_threshold,
-                                   window_sec=3, stride_sec=1, min_recall=0.95,
+                                   window_sec=5, stride_sec=1, min_recall=0.95,
                                    bundle_path=None, n_workers=None,
                                    skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                    use_stage2_ir=None):
@@ -1682,8 +1674,23 @@ def get_deploy_stage1_threshold(th):
     }
 
 
+def summarize_stage1_target1_pass_rate(results):
+    """统计 target=1 样本在第一阶段的通过率。"""
+    positives = [r for r in results if int(r.get("target", 0)) == 1]
+    total = len(positives)
+    passed = sum(
+        1 for r in positives
+        if bool(r.get("stage1_pass", False)) and not bool(r.get("fallback", False))
+    )
+    return {
+        "target1_total_samples": int(total),
+        "target1_stage1_pass_samples": int(passed),
+        "target1_stage1_pass_rate": (float(passed / total) if total > 0 else None),
+    }
+
+
 def predict_sample_with_bundle(sample, dc_threshold, ac_dc_threshold,
-                                window_sec=3, stride_sec=1,
+                                window_sec=5, stride_sec=1,
                                 method="state_machine", postprocess_cfg=None,
                                 skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                 use_stage2_ir=None):
@@ -1725,7 +1732,7 @@ def predict_sample_with_bundle(sample, dc_threshold, ac_dc_threshold,
 
 
 def predict_sample_safe(sample, dc_threshold, ac_dc_threshold,
-                        window_sec=3, stride_sec=1,
+                        window_sec=5, stride_sec=1,
                         method="state_machine", postprocess_cfg=None,
                         skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                         use_stage2_ir=None):
@@ -1768,7 +1775,7 @@ def predict_sample_safe(sample, dc_threshold, ac_dc_threshold,
 
 
 def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
-                                       window_sec=3, stride_sec=1, postprocess_cfg=None,
+                                       window_sec=5, stride_sec=1, postprocess_cfg=None,
                                        bundle_path=None, n_workers=None,
                                        skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                        use_stage2_ir=None):
@@ -1864,7 +1871,7 @@ def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
 
 def predict_sample(sample, model, scaler, selected_features,
                     dc_threshold, ac_dc_threshold,
-                    window_sec=3, stride_sec=1, fs=25,
+                    window_sec=5, stride_sec=1, fs=25,
                     method="state_machine",
                     model_threshold=0.5,
                     postprocess_cfg=None,
@@ -2830,7 +2837,7 @@ def main(args=None):
         use_stage2_ir=use_stage2_ir,
     )
 
-    # 三套指标
+    # 三套指标 + Stage1 target=1 通过率
     sample_summary, details = compute_sample_metrics(
         results, args.method, postprocess_cfg, bundle["threshold"]
     )
@@ -2838,6 +2845,7 @@ def main(args=None):
     window_stream_summary = compute_window_stream_metrics(
         results, postprocess_cfg, warmup_frames=args.warmup_frames
     )
+    stage1_target1_summary = summarize_stage1_target1_pass_rate(results)
 
     # OOD 汇总：每条样本计 OOD 窗占比和触发标志
     ood_summary = _summarize_ood(results, alert_rate=args.ood_alert_rate)
@@ -2878,6 +2886,9 @@ def main(args=None):
     print(f"  端到端 (Stage1→3):       {sample_summary['accuracy']:.4f}")
     print(f"  Stage2 模型 (逐窗):      {window_model_summary['accuracy']:.4f}")
     print(f"  Stage2+3 状态机 (逐窗):  {window_stream_summary['accuracy']:.4f}")
+    pass_rate = stage1_target1_summary["target1_stage1_pass_rate"]
+    pass_rate_text = "NA" if pass_rate is None else f"{pass_rate:.4f}"
+    print(f"  Stage1 target=1 通过率:  {pass_rate_text}")
 
     # Hard negative 输出: 列出 FP 和 FN 样本
     fp_samples = [d for d in details if d["pred"] == 1 and d["target"] == 0]
@@ -2963,7 +2974,7 @@ def main(args=None):
             threshold_sweep = {
                 "thresholds": thr_list,
                 "rows": sweep_rows,
-                "note": "本扫描不修改 bundle.threshold；用 F0.5（偏 precision）选合适操作点后，在 s05 重训阶段把 --threshold_objective fbeta --threshold_beta 0.5 固化。",
+                "note": "本扫描不修改 bundle.threshold；若需控 FP，可在 s05 重训阶段显式使用 --threshold_objective precision_constrained 或 fbeta。",
             }
 
     out_path = os.path.join(args.artifact_dir, f"end_to_end_eval_{args.split}_{args.method}.json")
@@ -2973,6 +2984,7 @@ def main(args=None):
             "window_summary": window_stream_summary,         # 向后兼容旧字段
             "window_model_summary": window_model_summary,    # 新增
             "window_stream_summary": window_stream_summary,  # 新增（与 window_summary 等价）
+            "stage1_target1_summary": stage1_target1_summary,
             "ood_summary": ood_summary,                      # 新增 OOD 汇总
             "threshold_sweep": threshold_sweep,               # 新增 阈值扫描（可选）
             "stratified_errors": stratified_errors,
@@ -2992,6 +3004,7 @@ def main(args=None):
         "window_summary": window_stream_summary,
         "window_model_summary": window_model_summary,
         "window_stream_summary": window_stream_summary,
+        "stage1_target1_summary": stage1_target1_summary,
         "ood_summary": ood_summary,
         "threshold_sweep": threshold_sweep,
         "stratified_errors": stratified_errors,

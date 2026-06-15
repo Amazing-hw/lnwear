@@ -6,7 +6,7 @@
 
 当前部署阈值固定为：
 - dc_threshold = 1.5e6
-- ac_dc_threshold = 0.35
+- ac_dc_threshold = 1.0
 
 本脚本不再做阈值搜参；只提取 train/valid 的 Stage1 primitive windows，
 评估固定阈值表现，并写出 stage1_threshold.json 与 stage1_scatter.png。
@@ -27,7 +27,7 @@ DEFAULT_MIN_DURATION_SEC = STAGE1_DECISION_SEC
 STAGE1_FS = 5
 STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
 FIXED_DEPLOY_DC_THRESHOLD = 1.5e6
-FIXED_DEPLOY_AC_DC_THRESHOLD = 0.35
+FIXED_DEPLOY_AC_DC_THRESHOLD = 1.0
 
 
 def resolve_fixed_deploy_thresholds(_args=None):
@@ -430,12 +430,11 @@ def main(args=None):
         "deploy_stage1_threshold": {
             "dc_threshold": float(deploy_dc),
             "ac_dc_threshold": float(deploy_acdc),
-            "ambient_ratio_threshold": 0.8,
             "primitive_window_sec": float(STAGE1_PRIMITIVE_SEC),
             "decision_sec": float(STAGE1_DECISION_SEC),
             "decision_windows": int(STAGE1_GATE_K),
-            "rule": "1s window: dc > dc_threshold and ac_dc_ratio < ac_dc_threshold and median(ambient)/median(ir) < ambient_ratio_threshold",
-            "sample_rule": "sample_pass = any 3 consecutive 1s windows pass and ambient_ratio check",
+            "rule": "1s window: dc > dc_threshold and ac_dc_ratio < ac_dc_threshold",
+            "sample_rule": "sample_pass = any 3 consecutive 1s windows pass",
             "target_requirement": "target=1 sample pass rate must be 100%",
             "threshold_source": threshold_source,
             "search_source": threshold_source,

@@ -280,7 +280,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
             mode = detect_green_mode(ppg)
             for idx in range(ppg.shape[0]):
                 raw_window = ppg[idx]
-                window_25, ppg_src_fs = _prewindow_to_25hz(sample, raw_window, window_sec=3.0)
+                window_25, ppg_src_fs = _prewindow_to_25hz(sample, raw_window, window_sec=window_sec)
                 enabled = _commercial_stage1_window_pass(raw_window, dc_threshold, ppg_src_fs)
                 base["stage2_enabled_flags"].append(int(enabled))
                 if not enabled:
@@ -290,7 +290,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
                     ir, ambient, g1, g2, g3 = get_channels_from_window(window_25, mode)
                     acc_seg = None
                     if acc is not None and is_prewindowed_signal(acc) and idx < acc.shape[0]:
-                        acc_seg, _ = _prewindow_to_25hz(sample, acc[idx], window_sec=3.0)
+                        acc_seg, _ = _prewindow_to_25hz(sample, acc[idx], window_sec=window_sec)
                     base["features"].append(extract_8_commercial_features(ir, ambient, g1, g2, g3, acc_seg))
                 except Exception:
                     base["features"].append(None)
@@ -534,14 +534,11 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
             for local_i, idx in enumerate(range(first_step, ppg.shape[0])):
                 raw_window = ppg[idx]
                 window_25, ppg_src_fs = _prewindow_to_25hz(sample, raw_window, window_sec)
-                enabled = (
-                    stage1_sample_pass(
-                        raw_window,
-                        stage1["dc_threshold"],
-                        stage1["ac_dc_threshold"],
-                        ppg_fs=ppg_src_fs,
-                    )
-                    and stage1_ambient_check(raw_window)
+                enabled = stage1_sample_pass(
+                    raw_window,
+                    stage1["dc_threshold"],
+                    stage1["ac_dc_threshold"],
+                    ppg_fs=ppg_src_fs,
                 )
                 flags.append(int(enabled))
                 if not enabled:
@@ -567,9 +564,6 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
             base["window_probs"] = probs.tolist()
             base["window_preds"] = window_preds.tolist()
             base["stage2_enabled_flags"] = flags
-            return _finalize_project_detail(base, method, postprocess_cfg, model_threshold)
-        if not stage1_ambient_check(ppg):
-            base["stage1_pass"] = False
             return _finalize_project_detail(base, method, postprocess_cfg, model_threshold)
         ppg_25, acc_25, ppg_src_fs = _to_25hz(sample, ppg, acc)
     except Exception as exc:

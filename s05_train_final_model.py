@@ -476,13 +476,15 @@ def search_threshold_by_valid(model, X_valid, y_valid, objective="f1",
     在 valid 上搜窗口阈值。
 
     objective:
-      - "f1"                 : 默认 F1
+      - "accuracy"           : 默认，最大化窗口准确率
+      - "f1"                 : F1
       - "precision"          : 仅 precision
       - "recall"             : 仅 recall
-      - "fbeta"              : F-beta (默认 beta=0.5 偏 precision)
+      - "fbeta"              : F-beta (beta=0.5 偏 precision)
       - "precision_constrained" : 在 precision >= min_precision 约束下最大化 recall
 
-    本项目背景：FP（非佩戴误判为佩戴）代价更高，建议 fbeta(beta=0.5) 或 precision_constrained。
+    默认优先单窗口 accuracy；FP 风险专项优化时再显式切到
+    fbeta(beta=0.5) 或 precision_constrained。
     """
     probs = model.predict_proba(X_valid)[:, 1]
     if objective == "accuracy":
@@ -1964,7 +1966,7 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
         result["search_summary"]["feature_set_source"] = (
             best_quick_result["search_summary"].get("feature_set_source")
         )
-        result["_combined_score"] = float(result["search_score"])
+        result["_combined_score"] = float(result["valid_acc"])
     else:
         result = best_quick_result
 
@@ -1995,9 +1997,9 @@ def main(args=None):
     parser.add_argument("--feature_search_swap_max_candidates", type=int, default=12,
                         help="maximum local-swap feature sets evaluated per k")
     parser.add_argument(
-        "--threshold_objective", type=str, default="fbeta",
+        "--threshold_objective", type=str, default="accuracy",
         choices=["f1", "precision", "recall", "fbeta", "precision_constrained", "accuracy"],
-        help="阈值搜索目标。默认 fbeta（偏 precision，因为 FP 代价更高）。"
+        help="阈值搜索目标。默认 accuracy，优先单窗口准确率。"
     )
     parser.add_argument("--threshold_beta", type=float, default=0.5,
                         help="F-beta 的 beta。<1 偏 precision，>1 偏 recall。")
@@ -2217,7 +2219,7 @@ def main(args=None):
             "enabled": True,
             "candidates_tested": _ks,
             "best_k": int(_best_result["k"]),
-            "selection_metric": "search_score" if args.model_search else "valid_accuracy",
+            "selection_metric": "valid_accuracy",
             "best_score": float(_best_score),
         }
         # 多 k 搜参只消耗 train 内部 group-CV；valid 仍重新拆成 calibration/threshold。
