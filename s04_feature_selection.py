@@ -32,7 +32,13 @@ from sklearn.inspection import permutation_importance
 from sklearn.metrics import (roc_auc_score, accuracy_score, precision_score,
                               recall_score, f1_score, confusion_matrix)
 
-from s03_extract_feature_pool import filter_stage2_ir_features
+from s03_extract_feature_pool import (
+    DEPLOYMENT_ALLOWED_FFT_FEATURES as S03_DEPLOYMENT_ALLOWED_FFT_FEATURES,
+    DEPLOYMENT_ALLOWED_NON_FFT_FEATURES as S03_DEPLOYMENT_ALLOWED_NON_FFT_FEATURES,
+    filter_deployment_friendly_stage2_features as s03_filter_deployment_friendly_stage2_features,
+    filter_stage2_ir_features,
+    is_deployment_friendly_stage2_feature as s03_is_deployment_friendly_stage2_feature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +298,6 @@ FEATURE_GROUPS = {
         "ACC_BP_RMS", "ACC_DIFF_MAD", "ACC_STILL_SCORE",
         "ACC_MAG_P50", "ACC_MAG_P90",
         "ACC_GREEN_BP_CORR", "ACC_IR_BP_CORR",
-        "ACC_PPG_coherence_mean", "ACC_PPG_coherence_max",
         "ACC_ENERGY_TO_GREEN_AC",
         "ACC_TO_GTOP2_AC_RATIO", "ACC_STILL_X_GREEN_STABILITY",
         "ACC_DIFF_TO_GTOP2_DIFF_RATIO", "ACC_STILL_GREEN_MISMATCH",
@@ -340,6 +345,25 @@ GROUP_LIMITS_DEFAULT = {
     "mode": 1,
     "other": 2,
 }
+
+GROUP_LIMITS_ACCURACY_FIRST = {
+    **GROUP_LIMITS_DEFAULT,
+    "green_stats": 4,
+    "green_spatial": 4,
+    "green_3ch_consistency": 4,
+    "frequency": 5,
+    "amb_cross": 3,
+    "acc_features": 3,
+    "acc_per_axis": 2,
+    "acc_orientation": 2,
+}
+
+
+def group_limits_for_ranking_objective(ranking_objective):
+    objective = str(ranking_objective or "balanced").strip().lower()
+    if objective in {"window_accuracy", "accuracy", "accuracy_first"}:
+        return GROUP_LIMITS_ACCURACY_FIRST
+    return GROUP_LIMITS_DEFAULT
 
 DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
     # Signal quality and robust scalar features.
@@ -444,6 +468,11 @@ DEPLOYMENT_FORBIDDEN_TOKENS = (
 
 DEPLOYMENT_ALLOWED_FFT_SOURCES = {"green_top2", "green", "ambient"}
 
+# s03 is the source of truth for the model-facing deployment-friendly feature pool.
+# s04 may rank and select features, but it must not define a second allowlist.
+DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = S03_DEPLOYMENT_ALLOWED_NON_FFT_FEATURES
+DEPLOYMENT_ALLOWED_FFT_FEATURES = S03_DEPLOYMENT_ALLOWED_FFT_FEATURES
+
 
 def _deployment_fft_source_rank(source):
     order = {"green_top2": 0, "ambient": 1}
@@ -455,13 +484,13 @@ def deployment_fft_source_for_feature(feature):
 
 
 def is_deployment_allowed_feature(feature):
-    """All features pass — s03 uses only C-friendly operations (numpy, no scipy)."""
-    return True
+    """Return whether s03 exposes this feature in the deployment-friendly pool."""
+    return bool(s03_is_deployment_friendly_stage2_feature(feature))
 
 
 def filter_features_for_deployment(features):
-    """No-op: IR features are already excluded at s03 source. All others are C-friendly."""
-    return filter_stage2_ir_features(list(features))
+    """Filter by the s03 source-of-truth deployment-friendly Stage2 policy."""
+    return list(s03_filter_deployment_friendly_stage2_features(list(features)))
 
 
 def summarize_deployment_feature_costs(features):
@@ -1941,6 +1970,9 @@ def main(args=None):
                         help="Positive-window recall floor used by the train-only FP proxy.")
     parser.add_argument("--fp_proxy_state_k_on", type=int, default=3,
                         help="Consecutive windows needed to count a state-machine FP proxy hit.")
+    parser.add_argument("--ranking_objective", type=str, default="balanced",
+                        choices=["balanced", "window_accuracy"],
+                        help="Feature ranking/selection objective. window_accuracy relaxes group caps for Stage2 window accuracy.")
     parser.add_argument("--run_subset_search", action="store_true",
                         help="运行候选特征子集搜索，结果覆写 selected_features.json")
     parser.add_argument("--subset_search_max_features", type=int, default=15,
@@ -2070,10 +2102,11 @@ def main(args=None):
               f"sampleFP={item.get('fp_proxy_sample_fp_rate',0):.3f}, "
               f"stateFP={item.get('fp_proxy_state_fp_rate',0):.3f}{shap_str}")
 
+    group_limits = group_limits_for_ranking_objective(args.ranking_objective)
     selected, group_count = select_by_group_from_combined(
         combined_summary,
         max_features=args.max_features,
-        group_limits=GROUP_LIMITS_DEFAULT,
+        group_limits=group_limits,
     )
     selected = filter_features_for_deployment(selected)
     if len(selected) < min(args.max_features, len(combined_summary)):
@@ -2083,7 +2116,7 @@ def main(args=None):
                 if item["feature"] in set(filter_features_for_deployment([item["feature"]]))
             ],
             max_features=args.max_features,
-            group_limits=GROUP_LIMITS_DEFAULT,
+            group_limits=group_limits,
         )
 
     print("\n最终选择特征:")
@@ -2205,6 +2238,7 @@ def main(args=None):
             "fp_cost_weight": float(args.fp_cost_weight),
             "fp_proxy_recall_floor": float(args.fp_proxy_recall_floor),
             "fp_proxy_state_k_on": int(args.fp_proxy_state_k_on),
+            "ranking_objective": str(args.ranking_objective),
             "ranking_target": "train_only_importance + deployment_proxy_fit + train_only_sample_state_fp_proxy",
         },
         "permutation_summary": summary,
@@ -2213,7 +2247,7 @@ def main(args=None):
         "combined_summary": combined_summary,
         "removed_features": removed,
         "group_count": group_count,
-        "group_limits": GROUP_LIMITS_DEFAULT,
+        "group_limits": group_limits,
         "train_fill_values": fill_values,
         "valid_selected_feature_summary": valid_summary,
         "selected_deployment_summary": {

@@ -197,6 +197,36 @@ def test_s08_accuracy_first_shortcut_keeps_postprocess_disabled():
     assert "--stop_after=s05" in output
 
 
+def test_s08_accuracy_first_defaults_to_three_full_searches_and_18_feature_cap():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_acc_first",
+            "--accuracy_first_optimize",
+            "--stop_after",
+            "s05",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "representative model search #1/3" in output
+    assert "representative model search #2/3" in output
+    assert "representative model search #3/3" in output
+    assert "[8, 10, 12, 15, 18]" in output
+    assert '--model_search_feature_counts "18"' in output
+    assert '--model_search_feature_counts "24"' not in output
+    assert "--max_features 24" not in output
+
+
 def test_s08_dry_run_can_full_search_top_feature_counts():
     result = subprocess.run(
         [

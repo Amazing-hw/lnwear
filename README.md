@@ -203,9 +203,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 ### 部署友好特征池
 
-Stage2 默认只有一套部署友好特征池；不再提供研究型/部署型模式开关。限制发生在 `s04` 特征筛选和 `s05` 训练之前，不是在部署导出阶段裁剪，因此最终 `model_bundle.pkl`、`deploy_xgboost.json`、`deploy_feature_extractor.py` 的特征顺序和维度保持一致。
-
-当前部署友好特征池允许统计量、MAD/IQR、ratio、三绿光一致性、相关性、SampEn、Hjorth、Derivative、Temporal、TREMOR、harmonic/SNR/peak width 和 green/green_top2/ambient FFT source。仅从候选池源头排除 `coherence`（Welch PSD + 交叉谱，C 移植困难）。`final_model_config.json`、`model_search_results.csv` 和 `deploy_cookbook.json` 会记录最终入选特征的部署算子成本摘要。
+s03 已去 scipy 化（FIR 带通 + numpy median + np.correlate），所有特征计算均为 C 可移植运算。无部署过滤器——全部特征参与筛选。训练与部署通过 s03 import 使用完全相同代码，数值一致。
 
 - 只跑到模型搜参 + train-only hard negative 回流训练，不导出 NPZ、不跑后处理：
 

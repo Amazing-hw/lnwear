@@ -35,10 +35,10 @@ def test_deployment_feature_filter_removes_complex_operators():
     assert "GTOP2_BAND_ENERGY_RATIO" in filtered
     assert "GTOP2_DOM_FREQ" in filtered
     assert "AMB_BAND_ENERGY_RATIO" in filtered  # amb FFT now allowed
-    assert "GREEN_Entropy_SampEn" in filtered    # SampEn is C-friendly
-    assert "GREEN_Temporal_peak_prominence" in filtered  # temporal is C-friendly
-    assert "ACC_TREMOR_PEAK_FREQ" in filtered    # tremor FFT is C-friendly
-    assert "G_bp_lag_std" in filtered            # lag is C-friendly
+    assert "GREEN_Entropy_SampEn" not in filtered
+    assert "GREEN_Temporal_peak_prominence" not in filtered
+    assert "ACC_TREMOR_PEAK_FREQ" not in filtered
+    assert "G_bp_lag_std" not in filtered
     assert "ACC_PPG_coherence_mean" not in filtered  # coherence still blocked
 
 
@@ -73,6 +73,30 @@ def test_s03_and_s04_deployment_fft_allow_lists_match():
     s04_allowed = s04.filter_features_for_deployment(features)
 
     assert s03_allowed == s04_allowed
+
+
+def test_s04_deployment_policy_delegates_to_s03_source_of_truth():
+    features = [
+        "GREEN_CORR",
+        "GREEN_AC",
+        "AMB_AC",
+        "ACC_YSUM",
+        "GREEN_DC",
+        "AMB_DC",
+        "GREEN_XCORR",
+        "FFT_PEAK_MEDIAN_RATIO",
+        "ACC_PPG_coherence_mean",
+        "IRX_bp_skewness",
+    ]
+
+    assert s04.DEPLOYMENT_ALLOWED_NON_FFT_FEATURES is s03.DEPLOYMENT_ALLOWED_NON_FFT_FEATURES
+    assert s04.DEPLOYMENT_ALLOWED_FFT_FEATURES is s03.DEPLOYMENT_ALLOWED_FFT_FEATURES
+    for name in features:
+        assert s04.is_deployment_allowed_feature(name) == s03.is_deployment_friendly_stage2_feature(name)
+
+    commercial_8 = s04.FEATURE_GROUPS["commercial_baseline"]
+    assert commercial_8 == s03.COMMERCIAL_8_FEATURE_NAMES
+    assert s04.filter_features_for_deployment(commercial_8) == commercial_8
 
 
 def test_s08_dry_run_does_not_expose_feature_pool_switches():
@@ -254,6 +278,42 @@ def test_s04_generates_accuracy_beam_subset_candidates():
     for name in beam_names:
         assert len(candidates[name]["features"]) <= 6
         assert "accuracy-first beam" in candidates[name]["description"]
+
+
+def test_s04_accuracy_first_group_limits_allow_more_high_signal_features():
+    summary = []
+    for i, feature in enumerate([
+        "ACC_GREEN_BP_CORR",
+        "ACC_TO_GTOP2_AC_RATIO",
+        "ACC_STILL_X_GREEN_STABILITY",
+        "G_TOP2_CORR_MIN",
+        "G_TOP2_TO_ALL_AC_RATIO",
+        "G_SPATIAL_STABILITY_SCORE",
+        "GTOP2_BAND_ENERGY_RATIO",
+        "GTOP2_DOM_FREQ",
+        "GREEN_AC_MAD",
+    ]):
+        summary.append({
+            "feature": feature,
+            "combined_score": 1.0 - i * 0.01,
+            "deployment_score": 1.0 - i * 0.01,
+            "group": s04.feature_to_group(feature),
+        })
+
+    default_selected, _ = s04.select_by_group_from_combined(
+        summary,
+        max_features=8,
+        group_limits=s04.GROUP_LIMITS_DEFAULT,
+    )
+    accuracy_selected, _ = s04.select_by_group_from_combined(
+        summary,
+        max_features=8,
+        group_limits=s04.group_limits_for_ranking_objective("window_accuracy"),
+    )
+
+    assert sum(s04.feature_to_group(f) == "acc_features" for f in default_selected) == 1
+    assert sum(s04.feature_to_group(f) == "acc_features" for f in accuracy_selected) >= 3
+    assert len(accuracy_selected) <= 8
 
 
 def test_s05_threshold_objective_accuracy_prefers_max_window_accuracy():

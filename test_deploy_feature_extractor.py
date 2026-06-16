@@ -268,7 +268,7 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
     assert len(vector) == len(selected)
 
 
-def test_rendered_deploy_feature_extractor_is_project_source_independent():
+def test_rendered_deploy_feature_extractor_is_s03_source_backed():
     selected = [
         "GREEN_CORR",
         "GREEN_AC",
@@ -290,15 +290,11 @@ def test_rendered_deploy_feature_extractor_is_project_source_independent():
         scripts_dir=Path(__file__).resolve().parent,
     )
 
-    forbidden = [
-        "s03_extract_feature_pool",
-        "sys.path",
-        "_CANDIDATE_CODE_DIRS",
-        "SCRIPTS_DIR",
-        "from s03",
-    ]
-    for token in forbidden:
-        assert token not in script
+    assert "from s03_extract_feature_pool import extract_window_features" in script
+    assert "S03_SOURCE_DIR" in script
+    assert "sys.path.insert" in script
+    assert "def _preprocess(" not in script
+    assert "def _fft_metrics(" not in script
     assert "FEATURE_ORDER" in script
     assert "CLIP_BOUNDS" in script
     assert "WINDOW_MODEL_THRESHOLD" in script
@@ -374,8 +370,8 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     script = Path(out_path).read_text(encoding="utf-8")
 
     assert "WINDOW_MODEL_THRESHOLD = 0.37" in script
-    assert "s03_extract_feature_pool" not in script
-    assert "sys.path" not in script
+    assert "s03_extract_feature_pool" in script
+    assert "sys.path.insert" in script
 
 
 def test_s03_stage2_ir_disabled_omits_ir_features_before_selection():

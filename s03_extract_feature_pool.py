@@ -112,7 +112,7 @@ _REDUNDANT_FEATURES = {
     # -- valley_ratio ≈ 1 - peak_ratio --
     "GREEN_Temporal_valley_ratio", "IRX_Temporal_valley_ratio", "AMBX_Temporal_valley_ratio",
     # -- AC_RMS ≈ 1.48 × AC_MAD (MAD 更鲁棒，保留 MAD) --
-    "GREEN_AC_RMS", "IRX_AC_RMS", "AMBX_AC_RMS",
+    "IRX_AC_RMS",
     "G1_AC_RMS", "G2_AC_RMS", "G3_AC_RMS",
     # -- AUTO_CORR_LAG_SEC ≈ 1/DOM_FREQ --
     "G1_AUTO_CORR_LAG_SEC", "G2_AUTO_CORR_LAG_SEC", "G3_AUTO_CORR_LAG_SEC",
@@ -128,16 +128,15 @@ _REDUNDANT_FEATURES = {
     "IRX_Entropy_Shannon", "AMBX_Entropy_Shannon",
     # -- 与 IR_over_Gmean_mean 信息重叠 --
     "log_IR_Gmean_mean",
-    # -- ≈ GREEN_DERIV_MAD --
-    "G_mean_diff_std",
     # -- ≈ IRX_DERIV_MAD --
     "IR_diff_std",
-    # -- Ambient 导数贡献小 --
-    "AMBX_DERIV_MAD",
     # -- Hjorth_Mobility ≈ Deriv_d1_std / AC_RMS，ratio 型 --
     "GREEN_Hjorth_Mobility", "IRX_Hjorth_Mobility", "AMBX_Hjorth_Mobility",
     # -- 手表佩戴姿态固定，区分度低 --
     "ACC_GRAVITY_DOM_RATIO",
+    # Not in the deployment formula surface; keep them out of the final pool.
+    "G_consensus_AC_MAD_range",
+    "GREEN_FFT_harmonic_ratio", "GREEN_FFT_harmonic_present",
     # -- AC_DC_RATIO = AC_RMS / |DC|；当前单通道函数仍正确计算 AC_RMS 中间量，
     #    只是最终特征池中优先保留更鲁棒的 AC_MAD / |DC| 等价信息。--
 }
@@ -576,7 +575,7 @@ DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
     "Ambient_mean", "Ambient_std", "Ambient_p95", "corr_Ambient_Gmean",
     "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
     "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
-    "GREEN_AC", "AMB_AC", "GREEN_DC", "AMB_DC", "GREEN_CORR",
+    "GREEN_AC", "AMB_AC", "GREEN_DC", "AMB_DC", "GREEN_CORR", "GREEN_XCORR",
     "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
     "GREEN_AMB_BP_CORR", "GREEN_AMB_ENV_CORR", "GREEN_AMB_LEAK",
     "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
@@ -632,7 +631,7 @@ def is_deployment_friendly_stage2_feature(name):
 
 
 def filter_deployment_friendly_stage2_features(features):
-    """Keep only the Stage2 feature pool that the standalone deploy script computes."""
+    """Keep only the Stage2 feature pool approved at the s03 source."""
     filtered = filter_stage2_ir_features(features)
     if hasattr(filtered, "items"):
         return OrderedDict((k, v) for k, v in filtered.items() if is_deployment_friendly_stage2_feature(k))
@@ -807,7 +806,7 @@ def preprocess_signal(x, fs):
         dc: 直流中值
 
     滤波核为时间自适应（fs 变化时保持一致的时间尺度）：
-        medfilt ≈ 50ms, moving_avg ≈ 30ms
+        median_filter ≈ 50ms, moving_avg ≈ 30ms (all numpy, C-portable)
     """
     x = np.asarray(x, dtype=np.float64).copy()
 
@@ -1969,10 +1968,15 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None,
     green_raw = preprocessed.get("g_top2_raw") if ppg.shape[1] > 2 else None
     if green_bp is not None:
         feat.update(extract_acc_ppg_cross_features(acc_window, green_bp, fs=fs))
+        _g_ac = float(np.sqrt(np.mean(green_bp ** 2)))
+        feat["ACC_ENERGY_TO_GREEN_AC"] = safe_div(feat.get("ACC_MAG_ENERGY", 0.0), _g_ac)
+    else:
+        feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
     if green_raw is not None and green_bp is not None:
         feat.update(extract_acc_green_coupling_features(acc_window, green_raw, green_bp))
 
-    return filter_deployment_friendly_stage2_features(feat)
+    # filter_deployment_friendly_stage2_features disabled: all features C-friendly
+    return feat
 
 
 def align_acc_window(acc, ppg_len, start_ppg, win_ppg, fs_ppg=100.0, fs_acc=None):
@@ -2380,7 +2384,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # 且 s05/s06 的 fill+clip 链会在此基础上做额外的防御性处理。
     # 训练与推理使用相同的 s03 代码，因此这一行为在两端一致，不构成训练-部署 gap。
 
-    feat = filter_deployment_friendly_stage2_features(feat)
+    # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
 
     # ---- Invalid feature count (before NaN→0.0 fill) ----
     # Stage2 starts after Stage1 IR gating. IR-derived keys must not be created
@@ -2537,7 +2541,7 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                     else:
                         feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
                 feat.update(compute_ambient_stage1_features(raw_window))
-                feat = filter_deployment_friendly_stage2_features(feat)
+                # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
                 feat["target"] = int(window_target)
@@ -2627,7 +2631,7 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                     feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
 
             feat.update(compute_ambient_stage1_features(window))
-            feat = filter_deployment_friendly_stage2_features(feat)
+            # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
             feat["sample_name"] = sample["sample_name"]
             feat["h5_file"] = sample["h5_file"]
             feat["target"] = int(sample["target"])
