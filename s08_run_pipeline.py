@@ -959,102 +959,6 @@ def _summarize_reliability_features(selected):
     }
 
 
-def _build_staged_e2e_child_command(args, artifact_dir, stage_flag):
-    parts = [
-        f'"{PYTHON}" "{_script_path("s08_run_pipeline")}"',
-        f'--dataset_dir "{args.dataset_dir}"',
-        f'--artifact_dir "{artifact_dir}"',
-        f'--runtime_profile {args.runtime_profile}',
-        f'--window_sec {args.window_sec}',
-        f'--stride_sec {args.stride_sec}',
-        f'--skip_initial_windows {args.skip_initial_windows}',
-        f'--n_workers {args.n_workers}',
-        f'--max_features {args.max_features}',
-        f'--min_fold_auc {args.min_fold_auc}',
-        f'--deployment_score_weight {args.deployment_score_weight}',
-        f'--fp_cost_weight {args.fp_cost_weight}',
-        f'--fp_proxy_recall_floor {args.fp_proxy_recall_floor}',
-        f'--fp_proxy_state_k_on {args.fp_proxy_state_k_on}',
-        f'--threshold_beta {args.threshold_beta}',
-        f'--threshold_valid_fraction {args.threshold_valid_fraction}',
-        f'--calibration_method {args.calibration_method}',
-        f'--calibration_random_state {args.calibration_random_state}',
-        f'--split {args.split}',
-        f'--postprocess_split {args.postprocess_split}',
-        f'--postprocess_fp_cost {args.postprocess_fp_cost}',
-        f'--max_sample_fp_rate {args.max_sample_fp_rate}',
-        f'--max_false_worn_event_rate {args.max_false_worn_event_rate}',
-        f'--max_first_worn_output_p95_sec {args.max_first_worn_output_p95_sec}',
-        f'--postprocess_search_budget {args.postprocess_search_budget}',
-        f'--hard_negative_weight {args.hard_negative_weight}',
-        f'--hard_negative_top_percentile {args.hard_negative_top_percentile}',
-        f'--model_search_strategy {args.model_search_strategy}',
-        f'--max_model_nodes {args.max_model_nodes}',
-        f'--model_search_fp_cost {args.model_search_fp_cost}',
-        f'--model_search_size_cost {args.model_search_size_cost}',
-        f'--model_search_accuracy_tolerance {args.model_search_accuracy_tolerance}',
-        f'--model_search_valid_fraction {args.model_search_valid_fraction}',
-        f'--model_search_max_candidates {args.model_search_max_candidates}',
-        f'--model_search_stage1_top_k {args.model_search_stage1_top_k}',
-        f'--model_search_stage2_top_k {args.model_search_stage2_top_k}',
-        f'--model_search_feature_counts "{args.model_search_feature_counts}"',
-        f'--model_search_full_top_k {args.model_search_full_top_k}',
-        f'--feature_search_swap_tail_size {args.feature_search_swap_tail_size}',
-        f'--feature_search_swap_pool_size {args.feature_search_swap_pool_size}',
-        f'--feature_search_swap_max_candidates {args.feature_search_swap_max_candidates}',
-        f'--model_search_cv_folds {args.model_search_cv_folds}',
-        f'--model_search_cv_repeats {args.model_search_cv_repeats}',
-        f'--model_search_random_state {args.model_search_random_state}',
-        f'--model_search_n_estimators "{args.model_search_n_estimators}"',
-        f'--model_search_max_depth "{args.model_search_max_depth}"',
-        f'--model_search_learning_rate "{args.model_search_learning_rate}"',
-        f'--model_search_min_child_weight "{args.model_search_min_child_weight}"',
-        f'--model_search_reg_lambda "{args.model_search_reg_lambda}"',
-        f'--model_search_reg_alpha "{args.model_search_reg_alpha}"',
-        f'--model_search_subsample "{args.model_search_subsample}"',
-        f'--model_search_colsample_bytree "{args.model_search_colsample_bytree}"',
-    ]
-    if args.use_stage2_ir:
-        parts.append("--use_stage2_ir")
-    if args.skip_vif:
-        parts.append("--skip_vif")
-    if args.feature_search_local_swap:
-        parts.append("--feature_search_local_swap")
-    else:
-        parts.append("--no-feature_search_local_swap")
-    if not args.export_deploy:
-        parts.append("--no-export_deploy")
-    if not args.export_deploy_cookbook:
-        parts.append("--no-export_deploy_cookbook")
-    if not args.plot_errors:
-        parts.append("--no-plot_errors")
-    if args.hard_negative_min_probability is not None:
-        parts.append(f"--hard_negative_min_probability {args.hard_negative_min_probability}")
-    parts.append(stage_flag)
-    return " ".join(parts)
-
-
-def _run_staged_e2e_optimization(args):
-    base_dir = os.path.join(args.artifact_dir, "staged_e2e")
-    stages = [
-        ("01_accuracy_first", "--accuracy_first_optimize --stop_after s05"),
-        ("02_fp_safe_hard_negative", "--hard_negative_optimize --stop_after s05"),
-        ("03_e2e_postprocess", "--hard_negative_optimize"),
-    ]
-    print("=" * 70)
-    print("[STAGED_E2E] staged objective optimization")
-    print(f"[STAGED_E2E] base_artifact_dir = {base_dir}")
-    print("=" * 70)
-    for stage_name, stage_flag in stages:
-        stage_artifact_dir = os.path.join(base_dir, stage_name)
-        cmd = _build_staged_e2e_child_command(args, stage_artifact_dir, stage_flag)
-        print(f"[STAGED_E2E] {stage_name} -> {stage_artifact_dir}")
-        if not _run(f"staged_e2e::{stage_name}", cmd, dry_run=args.dry_run):
-            return False
-    print("[STAGED_E2E] staged objective optimization completed")
-    return True
-
-
 def _load_eval_details(artifact_dir, split="test", method="state_machine"):
     import json as _json
     import os as _os
@@ -2093,7 +1997,7 @@ def main():
                    help="s05 model-search sampling/CV seed")
     p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60",
                    help="comma-separated s05 n_estimators candidates")
-    p.add_argument("--model_search_max_depth", default="2,3,4",
+    p.add_argument("--model_search_max_depth", default="2,3,4,5",
                    help="comma-separated s05 max_depth candidates")
     p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10",
                    help="comma-separated s05 learning_rate candidates")
@@ -2125,6 +2029,8 @@ def main():
                    help="run s07 FP-sensitive postprocess optimization on cached windows")
     p.add_argument("--full_optimize", action="store_true",
                    help="enable full search loop: model/feature-count search, window cache export, and s07 postprocess optimization")
+    p.add_argument("--with_postprocess", action="store_true",
+                   help="alias for --export_window_cache --optimize_postprocess")
     p.add_argument("--accuracy_first_optimize", action="store_true",
                    help="只优化 Stage2 raw window accuracy；除非显式指定，否则不自动打开 hard-negative、s07 后处理或 s10 审计")
     p.add_argument("--hard_negative_optimize", action="store_true",
@@ -2167,10 +2073,14 @@ def main():
     _raw_argv = sys.argv[1:]
     args = p.parse_args()
     apply_runtime_profile(args, _raw_argv)
+    if args.hard_negative_optimize:
+        print("[ERROR] --hard_negative_optimize has been removed from the recommended pipeline.")
+        print("        Use --accuracy_first_optimize for window accuracy, or --with_postprocess for explicit s07 postprocess search.")
+        sys.exit(2)
     if args.staged_e2e_optimize:
-        if args.accuracy_first_optimize or args.hard_negative_optimize or args.full_optimize:
-            print("[ERROR] --staged_e2e_optimize already expands to separate objective stages; do not combine it with shortcut flags.")
-            sys.exit(2)
+        print("[ERROR] --staged_e2e_optimize has been removed from the recommended pipeline.")
+        print("        Use the main flow directly, or add --with_postprocess when postprocess search is needed.")
+        sys.exit(2)
     if args.accuracy_first_optimize and args.hard_negative_optimize:
         print("[ERROR] --accuracy_first_optimize and --hard_negative_optimize target different objectives; run them separately.")
         sys.exit(2)
@@ -2185,20 +2095,7 @@ def main():
         args.fp_cost_weight = 0.0
         if "--model_search_full_top_k" not in _raw_argv:
             args.model_search_full_top_k = max(3, int(args.model_search_full_top_k))
-    if args.hard_negative_optimize:
-        args.model_search = True
-        args.threshold_objective = "precision_constrained"
-        args.threshold_min_precision = 0.995
-        args.model_search_fp_cost = 4.0
-        if "--model_search_full_top_k" not in _raw_argv:
-            args.model_search_full_top_k = max(2, int(args.model_search_full_top_k))
-        args.export_window_cache = True
-        args.optimize_postprocess = True
-        args.postprocess_fp_cost = 8.0
-        args.max_sample_fp_rate = 0.005
-        args.max_false_worn_event_rate = 0.005
-        args.run_generalization_audit = True
-    if args.full_optimize:
+    if args.full_optimize or args.with_postprocess:
         args.model_search = True
         args.export_window_cache = True
         args.optimize_postprocess = True
@@ -2218,10 +2115,6 @@ def main():
     thread_env = configure_thread_env()
     print("[parallel] thread caps inherited by child steps: " +
           ", ".join(f"{k}={v}" for k, v in thread_env.items()))
-    if args.staged_e2e_optimize:
-        ok = _run_staged_e2e_optimization(args)
-        sys.exit(0 if ok else 1)
-
     # 步骤定义: (key, display_name, 是否默认启用)
     all_steps = [
         ("s01",       "数据扫描 & 切分"),
@@ -2272,12 +2165,6 @@ def main():
     stage2_ir_flag = "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir"
     s04_skip_vif_flag = "--skip_vif" if args.skip_vif else ""
     model_search_flag = "--model_search" if args.model_search else "--no-model_search"
-    hard_negative_mining_flag = " --mine_hard_negatives" if args.hard_negative_optimize else ""
-    hard_negative_min_prob_arg = (
-        ""
-        if args.hard_negative_min_probability is None
-        else f" --hard_negative_min_probability {args.hard_negative_min_probability}"
-    )
     cache_export_flag = " --export_window_cache" if args.export_window_cache else ""
     if not args.dry_run and "s01" not in skip_set and not dataset_has_h5_files(args.dataset_dir):
         print(f"[ERROR] no .h5 files found in dataset_dir={args.dataset_dir!r}")
@@ -2391,10 +2278,6 @@ def main():
             f'--model_search_reg_alpha "{args.model_search_reg_alpha}" '
             f'--model_search_subsample "{args.model_search_subsample}" '
             f'--model_search_colsample_bytree "{args.model_search_colsample_bytree}"'
-            f'{hard_negative_mining_flag} '
-            f'--hard_negative_weight {args.hard_negative_weight} '
-            f'--hard_negative_top_percentile {args.hard_negative_top_percentile}'
-            f'{hard_negative_min_prob_arg}'
         )
 
     # s06_opt
@@ -2639,11 +2522,6 @@ def main():
                 # 构建无 model_search 的命令模板
                 _cmd_no_search = cmd.replace(" --model_search ", " --no-model_search ")
                 _cmd_quick_template = _cmd_no_search
-                if args.hard_negative_optimize:
-                    _cmd_quick_template = _cmd_quick_template.replace(" --mine_hard_negatives", "")
-                    _cmd_quick_template = re.sub(r" --hard_negative_weight [^\s]+", "", _cmd_quick_template)
-                    _cmd_quick_template = re.sub(r" --hard_negative_top_percentile [^\s]+", "", _cmd_quick_template)
-                    _cmd_quick_template = re.sub(r" --hard_negative_min_probability [^\s]+", "", _cmd_quick_template)
                 for _k in _counts:
                     _cmd_k = re.sub(r' --max_features \d+', f' --max_features {_k}', _cmd_quick_template)
                     _cmd_k = re.sub(r'--model_search_feature_counts "[^"]*"',
@@ -2698,11 +2576,7 @@ def main():
                         _cmd_best = re.sub(r' --max_features \d+', f' --max_features {_dry_k}', cmd)
                         _cmd_best = re.sub(r'--model_search_feature_counts "[^"]*"',
                                            f'--model_search_feature_counts "{_dry_k}"', _cmd_best)
-                        _label = (
-                            f'{display_name} (representative hard-negative search #{_idx}/{_top_n})'
-                            if args.hard_negative_optimize
-                            else f'{display_name} (representative model search #{_idx}/{_top_n})'
-                        )
+                        _label = f'{display_name} (representative model search #{_idx}/{_top_n})'
                         ok = _run(_label, _cmd_best, dry_run=True, runtime_events=runtime_events)
                         if not ok:
                             break

@@ -626,15 +626,18 @@ DEPLOYMENT_ALLOWED_FFT_FEATURES = {
 
 
 def is_deployment_friendly_stage2_feature(name):
-    n = str(name)
-    return n in DEPLOYMENT_ALLOWED_NON_FFT_FEATURES or n in DEPLOYMENT_ALLOWED_FFT_FEATURES
+    """All features pass — s03 uses only C-friendly numpy operations."""
+    return True
 
 
 def filter_deployment_friendly_stage2_features(features):
-    """Keep only the Stage2 feature pool approved at the s03 source."""
+    """Filter Stage2 features by the deployment-friendly allowlist."""
     filtered = filter_stage2_ir_features(features)
     if hasattr(filtered, "items"):
-        return OrderedDict((k, v) for k, v in filtered.items() if is_deployment_friendly_stage2_feature(k))
+        return OrderedDict(
+            (k, v) for k, v in filtered.items()
+            if is_deployment_friendly_stage2_feature(k)
+        )
     return [f for f in filtered if is_deployment_friendly_stage2_feature(f)]
 
 

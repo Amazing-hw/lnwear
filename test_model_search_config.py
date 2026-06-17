@@ -257,7 +257,7 @@ def test_s08_dry_run_can_full_search_top_feature_counts():
     assert '--model_search_feature_counts "12"' in output
 
 
-def test_s08_staged_e2e_optimize_dry_run_runs_separate_objectives():
+def test_s08_rejects_staged_e2e_optimize_shortcut():
     result = subprocess.run(
         [
             sys.executable,
@@ -276,22 +276,16 @@ def test_s08_staged_e2e_optimize_dry_run_runs_separate_objectives():
         cwd=ROOT,
         capture_output=True,
         text=True,
-        check=True,
     )
     output = result.stdout + result.stderr
 
-    assert "[STAGED_E2E] 01_accuracy_first" in output
-    assert "[STAGED_E2E] 02_fp_safe_hard_negative" in output
-    assert "[STAGED_E2E] 03_e2e_postprocess" in output
-    assert "--accuracy_first_optimize" in output
-    assert "--hard_negative_optimize" in output
-    assert "--stop_after s05" in output
-    assert "s07_postprocess_optimize.py" not in output
-    assert "artifacts_staged\\staged_e2e\\01_accuracy_first" in output
-    assert "artifacts_staged\\staged_e2e\\03_e2e_postprocess" in output
+    assert result.returncode != 0
+    assert "--staged_e2e_optimize has been removed from the recommended pipeline" in output
+    assert "--with_postprocess" in output
+    assert "--hard_negative_optimize" not in output
 
 
-def test_s08_staged_e2e_optimize_forwards_custom_search_and_postprocess_params():
+def test_s08_with_postprocess_forwards_search_params_without_hard_negative():
     result = subprocess.run(
         [
             sys.executable,
@@ -300,8 +294,8 @@ def test_s08_staged_e2e_optimize_forwards_custom_search_and_postprocess_params()
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
-            "artifacts_staged",
-            "--staged_e2e_optimize",
+            "artifacts_post",
+            "--with_postprocess",
             "--min_fold_auc",
             "0.61",
             "--skip_vif",
@@ -325,12 +319,6 @@ def test_s08_staged_e2e_optimize_forwards_custom_search_and_postprocess_params()
             "5.0",
             "--postprocess_search_budget",
             "120",
-            "--hard_negative_weight",
-            "4.0",
-            "--hard_negative_top_percentile",
-            "0.2",
-            "--hard_negative_min_probability",
-            "0.7",
         ],
         cwd=ROOT,
         capture_output=True,
@@ -346,17 +334,18 @@ def test_s08_staged_e2e_optimize_forwards_custom_search_and_postprocess_params()
     assert "--fp_proxy_recall_floor 0.97" in output
     assert "--fp_proxy_state_k_on 4" in output
     assert "--threshold_beta 0.35" in output
-    assert "--postprocess_fp_cost 9.0" in output
+    assert "--fp_cost 9.0" in output
     assert "--max_sample_fp_rate 0.004" in output
     assert "--max_false_worn_event_rate 0.003" in output
     assert "--max_first_worn_output_p95_sec 5.0" in output
-    assert "--postprocess_search_budget 120" in output
-    assert "--hard_negative_weight 4.0" in output
-    assert "--hard_negative_top_percentile 0.2" in output
-    assert "--hard_negative_min_probability 0.7" in output
+    assert "--search_budget 120" in output
+    assert "--export_window_cache" in output
+    assert "s07_postprocess_optimize.py" in output
+    assert "--mine_hard_negatives" not in output
+    assert "--hard_negative_weight" not in output
 
 
-def test_s08_hard_negative_dry_run_searches_at_least_two_feature_counts_by_default():
+def test_s08_rejects_hard_negative_optimize_shortcut():
     result = subprocess.run(
         [
             sys.executable,
@@ -373,12 +362,12 @@ def test_s08_hard_negative_dry_run_searches_at_least_two_feature_counts_by_defau
         cwd=ROOT,
         capture_output=True,
         text=True,
-        check=True,
     )
     output = result.stdout + result.stderr
 
-    assert "representative hard-negative search #1/2" in output
-    assert "representative hard-negative search #2/2" in output
+    assert result.returncode != 0
+    assert "--hard_negative_optimize has been removed from the recommended pipeline" in output
+    assert "--accuracy_first_optimize" in output
 
 
 def test_s08_postprocess_dry_run_forwards_search_budget():
@@ -1134,7 +1123,7 @@ def test_s08_full_optimize_enables_cache_and_postprocess_search():
     assert "s09_commercial_compare.py" not in output
 
 
-def test_s08_hard_negative_optimize_enables_full_fp_sensitive_loop():
+def test_s08_hard_negative_optimize_no_longer_enables_full_fp_sensitive_loop():
     result = subprocess.run(
         [
             sys.executable,
@@ -1145,27 +1134,17 @@ def test_s08_hard_negative_optimize_enables_full_fp_sensitive_loop():
         cwd=str(ROOT),
         text=True,
         capture_output=True,
-        check=True,
     )
 
     output = result.stdout + result.stderr
-    assert "--threshold_objective precision_constrained" in output
-    assert "--threshold_min_precision 0.995" in output
-    assert "--model_search_fp_cost 4.0" in output
-    assert "--mine_hard_negatives" in output
-    assert output.count("--mine_hard_negatives") == 2
-    assert "representative hard-negative search #1/2" in output
-    assert "representative hard-negative search #2/2" in output
-    assert "--hard_negative_weight 3.0" in output
-    assert "--export_window_cache" in output
-    assert "s07_postprocess_optimize.py" in output
-    assert "--fp_cost 8.0" in output
-    assert "--max_sample_fp_rate 0.005" in output
-    assert "--max_false_worn_event_rate 0.005" in output
-    assert "s10_generalization_audit.py" in output
+    assert result.returncode != 0
+    assert "--hard_negative_optimize has been removed from the recommended pipeline" in output
+    assert "--mine_hard_negatives" not in output
+    assert "s07_postprocess_optimize.py" not in output
+    assert "s10_generalization_audit.py" not in output
 
 
-def test_s08_hard_negative_optimize_can_stop_after_s05_before_cache_and_postprocess():
+def test_s08_hard_negative_optimize_stop_after_s05_is_rejected_before_commands():
     result = subprocess.run(
         [
             sys.executable,
@@ -1178,14 +1157,12 @@ def test_s08_hard_negative_optimize_can_stop_after_s05_before_cache_and_postproc
         cwd=str(ROOT),
         text=True,
         capture_output=True,
-        check=True,
     )
 
     output = result.stdout + result.stderr
-    assert "--mine_hard_negatives" in output
-    assert output.count("--mine_hard_negatives") == 2
-    assert "representative hard-negative search #1/2" in output
-    assert "representative hard-negative search #2/2" in output
+    assert result.returncode != 0
+    assert "--hard_negative_optimize has been removed from the recommended pipeline" in output
+    assert "--mine_hard_negatives" not in output
     assert "--export_window_cache" not in output
     assert "s07_postprocess_optimize.py" not in output
     assert "s10_generalization_audit.py" not in output
