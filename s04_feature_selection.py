@@ -353,9 +353,11 @@ GROUP_LIMITS_ACCURACY_FIRST = {
     "green_3ch_consistency": 4,
     "frequency": 5,
     "amb_cross": 3,
-    "acc_features": 3,
-    "acc_per_axis": 2,
-    "acc_orientation": 2,
+    # ACC reduced: motion features less informative for wearing detection
+    "acc_features": 1,
+    "acc_per_axis": 1,
+    "acc_tremor": 1,
+    "acc_orientation": 1,
 }
 
 

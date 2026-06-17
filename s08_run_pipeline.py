@@ -488,21 +488,99 @@ if __name__ == "__main__":
         print(f"{{i:02d}} {{name}} = {{value:.8g}}")
 '''
 
+def _standalone_feature_engine_source():
+    """Inline s03 source so deploy script is standalone yet numerically identical."""
+    s03_path = os.path.join(SCRIPTS_DIR, "s03_extract_feature_pool.py")
+    with open(s03_path, "r", encoding="utf-8") as f:
+        source = f.read()
+    engine_start = source.index("def apply_stage2_ir_policy")
+    try:
+        engine_end = source.index("def _downsample_ppg", engine_start)
+    except ValueError:
+        engine_end = len(source)
+    engine = source[engine_start:engine_end].strip()
+    redundant_start = source.index("_REDUNDANT_FEATURES = {")
+    redundant_end = source.index("}", redundant_start) + 1
+    redundant_block = source[redundant_start:redundant_end].strip()
+    return f"EPS = 1e-12\nDEFAULT_USE_STAGE2_IR = False\nFEATURE_FS = 25\n\n{redundant_block}\n\n{engine}"
+
+
 def _render_selected_feature_extractor(selected_features, fill_values, clip_bounds, formulas, scripts_dir=None,
                                        window_model_threshold=0.5,
                                        use_stage2_ir=False,
                                        default_fs=25.0,
                                        window_sec=5.0):
-    return _render_deployment_feature_extractor(
-        selected_features,
-        fill_values,
-        clip_bounds,
-        formulas,
-        window_model_threshold=window_model_threshold,
-        default_fs=default_fs,
-        window_sec=window_sec,
-        scripts_dir=scripts_dir,
-    )
+    """Generate a standalone deploy script with inlined s03 source."""
+    order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
+    fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
+    clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
+    threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
+    engine_source = _standalone_feature_engine_source()
+
+    return f'''# -*- coding: utf-8 -*-
+"""Auto-generated standalone deployment feature extractor.
+
+Inlines s03_extract_feature_pool source for numerical identity with training.
+No s03 import — fully standalone. Only dependencies: numpy + scipy resample_poly.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+
+import numpy as np
+from scipy.signal import resample_poly
+
+
+FEATURE_ORDER = {order_json}
+FILL_VALUES = {fill_json}
+CLIP_BOUNDS = {clip_json}
+WINDOW_MODEL_THRESHOLD = {threshold_json}
+
+
+{engine_source}
+
+
+def _clean_value(name, value):
+    if value is None or not np.isfinite(value):
+        return float(FILL_VALUES.get(name, 0.0))
+    v = float(value)
+    bound = CLIP_BOUNDS.get(name)
+    if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
+        lo, hi = float(bound[0]), float(bound[1])
+        v = min(max(v, lo), hi)
+    return v
+
+
+def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
+    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros_like(ir)])
+    feat = extract_window_features(ppg, fs=fs, acc_window=acc)
+    vec = []
+    for name in FEATURE_ORDER:
+        v = feat.get(name, 0.0)
+        vec.append(_clean_value(name, v))
+    return vec
+
+
+def classify_probability(probability):
+    return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
+
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    n = max(32, int(round({float(default_fs)} * {float(window_sec)})))
+    t = np.arange(n, dtype=float) / {float(default_fs)}
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t)
+    acc = rng.normal(0, 0.01, (n, 3))
+    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs={float(default_fs)})
+    print(f"Feature vector: {{len(vec)}} values")
+    for i, (name, value) in enumerate(zip(FEATURE_ORDER, vec)):
+        print(f"{{i:02d}} {{name}} = {{value:.8g}}")
+'''
 
 
 def export_feature_extractor_script(artifact_dir):
@@ -1999,7 +2077,7 @@ def main():
                    help="comma-separated s05 n_estimators candidates")
     p.add_argument("--model_search_max_depth", default="2,3,4,5",
                    help="comma-separated s05 max_depth candidates")
-    p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10",
+    p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10,0.15,0.20",
                    help="comma-separated s05 learning_rate candidates")
     p.add_argument("--model_search_min_child_weight", default="10,15,20,25,30,40,50",
                    help="comma-separated s05 min_child_weight candidates")
@@ -2368,6 +2446,7 @@ def main():
             f'--max_false_worn_event_rate {args.max_false_worn_event_rate} '
             f'--max_first_worn_output_p95_sec {args.max_first_worn_output_p95_sec} '
             f'--search_budget {args.postprocess_search_budget} '
+            f'--n_workers {args.n_workers} '
             f'--replay_split {args.split}'
         )
     elif "s07_post" not in skip_set:

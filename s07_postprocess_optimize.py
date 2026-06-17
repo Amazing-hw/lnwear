@@ -313,8 +313,8 @@ def iter_param_grid():
                 for T_off in [0.20, 0.35, 0.50]:
                     if T_on <= T_off:
                         continue
-                    for K_on in [3, 5, 8]:
-                        for K_off in [2, 3, 5]:
+                    for K_on in [2, 3, 5]:
+                        for K_off in [1, 2, 3]:
                             if K_on < K_off:
                                 continue
                             for cooldown_sec in [0.0, 2.0, 5.0]:
@@ -544,7 +544,7 @@ def main():
     parser.add_argument("--max_false_worn_event_rate", type=float, default=0.02)
     parser.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0)
     parser.add_argument("--fp_cost", type=float, default=1.5)
-    parser.add_argument("--n_workers", type=int, default=1)
+    parser.add_argument("--n_workers", type=int, default=4)
     parser.add_argument("--search_budget", type=int, default=240,
                         help="maximum postprocess candidates to evaluate; <=0 keeps the full grid")
     parser.add_argument("--replay_split", type=str, default="",

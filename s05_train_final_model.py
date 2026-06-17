@@ -85,7 +85,7 @@ MODEL_SEARCH_PARAM_KEYS = [
 DEFAULT_MODEL_SEARCH_SPACE = {
     "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60],
     "max_depth": [2, 3, 4, 5],
-    "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
+    "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.20],
     "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
     "reg_lambda": [5, 8, 10, 12, 16, 20, 30],
     "reg_alpha": [0, 0.5, 1, 1.5, 2, 3],
