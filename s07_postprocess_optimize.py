@@ -11,7 +11,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
-                              f1_score, confusion_matrix)
+                             f1_score, confusion_matrix)
+
+from s06_deploy_eval import WearStateMachine
 
 REQUIRED_NPZ_KEYS = [
     "sample_name", "target", "window_start_sec", "window_end_sec",
@@ -90,12 +92,14 @@ def run_postprocess_on_cache(cache, params):
     probs = np.where(enabled > 0, probs, 0.0)
     probs = causal_median_filter_1d(probs, int(params.get("median_k", 1)))
 
-    ema = 0.0
-    state = 0
-    on_count = 0
-    off_count = 0
-    steps_since_flip = 999
-    cooldown_steps = int(float(params.get("cooldown_sec", 0.0)) / stride_sec) if stride_sec > 0 else 0
+    sm = WearStateMachine(
+        alpha=float(params["ema_alpha"]),
+        T_on=float(params["T_on"]),
+        T_off=float(params["T_off"]),
+        K_on=int(params["K_on"]),
+        K_off=int(params["K_off"]),
+        cooldown_sec=float(params.get("cooldown_sec", 0.0)),
+    )
     states = []
     scores = []
     first_output_sec = None
@@ -104,34 +108,14 @@ def run_postprocess_on_cache(cache, params):
     for i, p in enumerate(probs):
         decision_time = float(ends[i]) if i < len(ends) else float((i + 1) * stride_sec)
         q = float(np.clip(quality[i] if i < len(quality) else 1.0, 0.0, 1.0))
-        alpha = float(params["ema_alpha"]) * q
-        ema = alpha * float(p) + (1.0 - alpha) * ema
-        steps_since_flip += 1
-        scores.append(float(ema))
-        if enabled[i] <= 0 or ema < float(params["T_off"]):
-            off_count += 1
-            on_count = 0
-        elif ema >= float(params["T_on"]):
-            on_count += 1
-            off_count = 0
-        else:
-            on_count = 0
-            off_count = 0
-        if state == 0 and on_count >= int(params["K_on"]) and steps_since_flip >= cooldown_steps:
-            state = 1
-            on_count = 0
-            off_count = 0
-            steps_since_flip = 0
+        state, score = sm.update(float(p), quality=q, stride_sec=stride_sec)
+        scores.append(float(score))
+        if state == 1:
             if first_output_sec is None:
                 first_output_sec = decision_time
             if positive_output_sec is None:
                 positive_output_sec = decision_time
-        elif state == 1 and off_count >= int(params["K_off"]) and steps_since_flip >= cooldown_steps:
-            state = 0
-            on_count = 0
-            off_count = 0
-            steps_since_flip = 0
-        elif state == 0 and first_output_sec is None and off_count >= int(params["K_off"]):
+        elif state == 0 and first_output_sec is None and sm.off_count >= int(params["K_off"]):
             first_output_sec = decision_time
         if first_output_sec is not None and time_to_correct_sec is None and state == int(cache["target"]):
             time_to_correct_sec = decision_time
@@ -141,6 +125,10 @@ def run_postprocess_on_cache(cache, params):
         "target": int(cache["target"]),
         "pred": int(state),
         "states": states,
+        "window_targets": np.asarray(
+            cache.get("window_targets", np.full(len(states), int(cache["target"]))),
+            dtype=int,
+        )[:len(states)].tolist(),
         "state_times_sec": [float(x) for x in ends[:len(states)]],
         "scores": scores,
         "stride_sec": stride_sec,
@@ -207,8 +195,10 @@ def compute_dataset_metrics(details, params_label=""):
     # Window-level metrics from states
     all_true, all_pred = [], []
     for d in details:
-        t = d["target"]
-        for s in d.get("states", []):
+        window_targets = list(d.get("window_targets", []))
+        sample_target = int(d["target"])
+        for idx, s in enumerate(d.get("states", [])):
+            t = int(window_targets[idx]) if idx < len(window_targets) else sample_target
             all_true.append(t)
             all_pred.append(int(s))
     if all_true:

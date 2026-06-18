@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+import s06_deploy_eval as s06
 import s07_postprocess_optimize as s07
 
 
@@ -88,3 +89,64 @@ def test_s07_zero_budget_keeps_full_grid():
     full_grid = list(s07.iter_param_grid())
 
     assert s07.select_postprocess_search_grid(full_grid, search_budget=0) == full_grid
+
+
+def test_s07_window_accuracy_uses_per_window_targets_from_cache():
+    cache = {
+        "sample_name": "mixed-record",
+        "target": 1,
+        "window_end_sec": np.array([1.0, 2.0, 3.0]),
+        "stage1_enabled": np.array([1, 1, 1]),
+        "prob_raw": np.array([0.1, 0.9, 0.9]),
+        "quality": np.ones(3),
+        "stride_sec": 1.0,
+        "window_targets": np.array([0, 1, 1]),
+    }
+    params = {
+        "ema_alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.5,
+        "K_on": 1,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+    }
+
+    _details, metrics = s07.evaluate_postprocess_on_caches([cache], params)
+
+    assert metrics["window_accuracy"] == 1.0
+
+
+def test_s07_postprocess_state_machine_matches_s06_leaky_counter_semantics():
+    probs = [0.8, 0.8, 0.6, 0.8, 0.8]
+    params = {
+        "ema_alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.7,
+        "T_off": 0.3,
+        "K_on": 3,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+    }
+    sm = s06.WearStateMachine(
+        alpha=params["ema_alpha"],
+        T_on=params["T_on"],
+        T_off=params["T_off"],
+        K_on=params["K_on"],
+        K_off=params["K_off"],
+        cooldown_sec=params["cooldown_sec"],
+    )
+    expected_states = [sm.update(p, quality=1.0, stride_sec=1.0)[0] for p in probs]
+    cache = {
+        "sample_name": "pos",
+        "target": 1,
+        "window_end_sec": np.arange(1, len(probs) + 1, dtype=float),
+        "stage1_enabled": np.ones(len(probs), dtype=int),
+        "prob_raw": np.asarray(probs, dtype=float),
+        "quality": np.ones(len(probs), dtype=float),
+        "stride_sec": 1.0,
+    }
+
+    actual = s07.run_postprocess_on_cache(cache, params)
+
+    assert actual["states"] == expected_states
