@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 
 import s05_train_final_model as s05
+import s08_run_pipeline as s08
 import s09_commercial_compare as s09
 
 
@@ -343,6 +344,148 @@ def test_s08_with_postprocess_forwards_search_params_without_hard_negative():
     assert "s07_postprocess_optimize.py" in output
     assert "--mine_hard_negatives" not in output
     assert "--hard_negative_weight" not in output
+
+
+def test_s08_auto_optimize_e2e_dry_run_enables_product_metric_loop():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--dataset_dir",
+            "dataset",
+            "--artifact_dir",
+            "artifacts_auto",
+            "--auto_optimize_e2e",
+            "--stop_after",
+            "s07_post",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "--export_window_cache" in output
+    assert "s07_postprocess_optimize.py" in output
+    assert "--replay_split test" in output
+    assert "--ranking_objective balanced" in output
+    assert "--threshold_objective precision_constrained" in output
+    assert "--threshold_min_precision 0.97" in output
+    assert "--model_search_fp_cost 4.0" in output
+    assert "--search_budget 240" in output
+    assert "--mine_hard_negatives" not in output
+
+
+def test_auto_e2e_selector_prefers_constraint_passing_product_candidate():
+    candidates = [
+        {
+            "candidate": "high_accuracy_fp_risk",
+            "valid_metrics": {
+                "sample_accuracy": 0.99,
+                "sample_recall": 0.99,
+                "window_accuracy": 0.99,
+                "sample_fp_rate": 0.08,
+                "false_worn_event_rate": 0.07,
+                "first_worn_output_p95_sec": 3.0,
+            },
+            "deploy_cost": 0.2,
+        },
+        {
+            "candidate": "balanced_product",
+            "valid_metrics": {
+                "sample_accuracy": 0.96,
+                "sample_recall": 0.95,
+                "window_accuracy": 0.965,
+                "sample_fp_rate": 0.01,
+                "false_worn_event_rate": 0.01,
+                "first_worn_output_p95_sec": 5.0,
+            },
+            "deploy_cost": 0.4,
+        },
+    ]
+
+    selected = s08.select_auto_e2e_candidate(
+        candidates,
+        baseline_window_accuracy=0.96,
+        constraints={
+            "max_sample_fp_rate": 0.02,
+            "max_false_worn_event_rate": 0.02,
+            "max_first_worn_output_p95_sec": 6.0,
+            "min_window_accuracy_delta": -0.01,
+        },
+    )
+
+    assert selected["candidate"] == "balanced_product"
+    assert selected["constraint_pass"] is True
+    assert selected["auto_score"] > 0.0
+
+
+def test_export_auto_e2e_summary_reads_replay_metrics(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    replay_dir = artifact_dir / "postprocess_opt"
+    replay_dir.mkdir(parents=True)
+    replay_payload = {
+        "selection": {
+            "split": "valid",
+            "metrics": {
+                "sample_accuracy": 0.95,
+                "sample_recall": 0.94,
+                "window_accuracy": 0.96,
+                "sample_fp_rate": 0.01,
+                "false_worn_event_rate": 0.01,
+                "first_worn_output_p95_sec": 4.0,
+            },
+        },
+        "replay": {
+            "split": "test",
+            "metrics": {
+                "sample_accuracy": 0.93,
+                "sample_recall": 0.92,
+                "window_accuracy": 0.95,
+                "sample_fp_rate": 0.02,
+                "false_worn_event_rate": 0.02,
+                "first_worn_output_p95_sec": 5.0,
+            },
+        },
+    }
+    (replay_dir / "postprocess_replay_valid_to_test.json").write_text(
+        json.dumps(replay_payload),
+        encoding="utf-8",
+    )
+    (artifact_dir / "end_to_end_eval_test_state_machine.json").write_text(
+        json.dumps({"window_model_summary": {"accuracy": 0.955}}),
+        encoding="utf-8",
+    )
+    (artifact_dir / "deploy_performance_profile.json").write_text(
+        json.dumps({"feature_cost_summary": {"deployment_cost_mean": 0.25}}),
+        encoding="utf-8",
+    )
+
+    summary_path = s08.export_auto_e2e_summary(
+        artifact_dir,
+        postprocess_split="valid",
+        split="test",
+        constraints={
+            "max_sample_fp_rate": 0.02,
+            "max_false_worn_event_rate": 0.02,
+            "max_first_worn_output_p95_sec": 6.0,
+            "min_window_accuracy_delta": -0.01,
+        },
+    )
+
+    summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
+    selected = summary["selected_candidate"]
+    assert selected["candidate"] == "auto_e2e_current_best"
+    assert selected["constraint_pass"] is True
+    assert selected["test_metrics"]["sample_accuracy"] == 0.93
+    assert (artifact_dir / "auto_optimize" / "candidate_scores.csv").exists()
+    manifest = json.loads(
+        (artifact_dir / "auto_optimize" / "candidate_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["selected_candidate"] == "auto_e2e_current_best"
+    assert manifest["artifacts"]["postprocess_replay"].endswith("postprocess_replay_valid_to_test.json")
 
 
 def test_s08_rejects_hard_negative_optimize_shortcut():

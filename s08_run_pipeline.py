@@ -152,6 +152,202 @@ def _read_s05_quick_k_score(artifact_dir):
         pass
     return None
 
+
+AUTO_E2E_SCORE_WEIGHTS = {
+    "sample_accuracy": 0.30,
+    "sample_recall": 0.20,
+    "window_accuracy": 0.15,
+    "sample_fp_rate": -0.25,
+    "false_worn_event_rate": -0.20,
+    "latency_penalty": -0.10,
+    "deploy_cost": -0.05,
+}
+
+
+def _finite_float(value, default=0.0):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if value != value or value in (float("inf"), float("-inf")):
+        return float(default)
+    return value
+
+
+def score_auto_e2e_metrics(metrics, deploy_cost=0.0, max_first_worn_output_p95_sec=6.0):
+    """Product-oriented score for automatic end-to-end model selection."""
+    metrics = metrics or {}
+    max_latency = max(_finite_float(max_first_worn_output_p95_sec, 6.0), 1e-6)
+    latency = _finite_float(metrics.get("first_worn_output_p95_sec"), max_latency)
+    latency_penalty = max(0.0, latency / max_latency)
+    return float(
+        AUTO_E2E_SCORE_WEIGHTS["sample_accuracy"] * _finite_float(metrics.get("sample_accuracy"))
+        + AUTO_E2E_SCORE_WEIGHTS["sample_recall"] * _finite_float(metrics.get("sample_recall"))
+        + AUTO_E2E_SCORE_WEIGHTS["window_accuracy"] * _finite_float(metrics.get("window_accuracy"))
+        + AUTO_E2E_SCORE_WEIGHTS["sample_fp_rate"] * _finite_float(metrics.get("sample_fp_rate"))
+        + AUTO_E2E_SCORE_WEIGHTS["false_worn_event_rate"] * _finite_float(metrics.get("false_worn_event_rate"))
+        + AUTO_E2E_SCORE_WEIGHTS["latency_penalty"] * latency_penalty
+        + AUTO_E2E_SCORE_WEIGHTS["deploy_cost"] * _finite_float(deploy_cost)
+    )
+
+
+def auto_e2e_constraints_pass(metrics, baseline_window_accuracy=None, constraints=None):
+    constraints = constraints or {}
+    metrics = metrics or {}
+    if _finite_float(metrics.get("sample_fp_rate"), float("inf")) > _finite_float(constraints.get("max_sample_fp_rate"), float("inf")):
+        return False
+    if _finite_float(metrics.get("false_worn_event_rate"), float("inf")) > _finite_float(constraints.get("max_false_worn_event_rate"), float("inf")):
+        return False
+    if _finite_float(metrics.get("first_worn_output_p95_sec"), float("inf")) > _finite_float(constraints.get("max_first_worn_output_p95_sec"), float("inf")):
+        return False
+    if baseline_window_accuracy is not None:
+        min_delta = _finite_float(constraints.get("min_window_accuracy_delta"), -0.01)
+        min_window = _finite_float(baseline_window_accuracy) + min_delta
+        if _finite_float(metrics.get("window_accuracy"), 0.0) < min_window:
+            return False
+    return True
+
+
+def select_auto_e2e_candidate(candidates, baseline_window_accuracy=None, constraints=None):
+    """Select the best E2E candidate, preferring candidates that satisfy hard constraints."""
+    constraints = constraints or {}
+    scored = []
+    for item in candidates or []:
+        enriched = dict(item)
+        metrics = dict(enriched.get("valid_metrics") or enriched.get("metrics") or {})
+        deploy_cost = _finite_float(enriched.get("deploy_cost"), 0.0)
+        enriched["valid_metrics"] = metrics
+        enriched["deploy_cost"] = deploy_cost
+        enriched["constraint_pass"] = auto_e2e_constraints_pass(
+            metrics,
+            baseline_window_accuracy=baseline_window_accuracy,
+            constraints=constraints,
+        )
+        enriched["auto_score"] = score_auto_e2e_metrics(
+            metrics,
+            deploy_cost=deploy_cost,
+            max_first_worn_output_p95_sec=constraints.get("max_first_worn_output_p95_sec", 6.0),
+        )
+        scored.append(enriched)
+    if not scored:
+        raise ValueError("select_auto_e2e_candidate requires at least one candidate")
+    scored.sort(
+        key=lambda item: (
+            bool(item.get("constraint_pass", False)),
+            _finite_float(item.get("auto_score"), float("-inf")),
+            _finite_float(item.get("valid_metrics", {}).get("sample_accuracy"), 0.0),
+        ),
+        reverse=True,
+    )
+    return scored[0]
+
+
+def _extract_replay_metrics(payload, selection_split="valid", replay_split="test"):
+    if not isinstance(payload, dict):
+        return None, None
+    selection = payload.get("selection") or {}
+    replay = payload.get("replay") or {}
+    valid_metrics = selection.get("metrics") if selection else None
+    test_metrics = replay.get("metrics") if replay else None
+    return valid_metrics, test_metrics
+
+
+def export_auto_e2e_summary(artifact_dir, postprocess_split="valid", split="test",
+                            constraints=None, dry_run=False):
+    """Write the automatic E2E selection summary from the current pipeline artifacts."""
+    out_dir = os.path.join(os.fspath(artifact_dir), "auto_optimize")
+    summary_path = os.path.join(out_dir, "auto_optimization_summary.json")
+    candidate_scores_path = os.path.join(out_dir, "candidate_scores.csv")
+    candidate_manifest_path = os.path.join(out_dir, "candidate_manifest.json")
+    if dry_run:
+        print(f"[auto_e2e] would write {summary_path}")
+        return None
+
+    replay_path = os.path.join(
+        os.fspath(artifact_dir),
+        "postprocess_opt",
+        f"postprocess_replay_{postprocess_split}_to_{split}.json",
+    )
+    if not os.path.exists(replay_path):
+        replay_path = os.path.join(
+            os.fspath(artifact_dir),
+            "postprocess_opt",
+            f"postprocess_replay_{postprocess_split}.json",
+        )
+    replay_payload = _load_json_if_exists(replay_path) or {}
+    valid_metrics, test_metrics = _extract_replay_metrics(
+        replay_payload,
+        selection_split=postprocess_split,
+        replay_split=split,
+    )
+    if not valid_metrics:
+        print(f"[auto_e2e] replay metrics not found, skip summary: {replay_path}")
+        return None
+
+    eval_payload = _load_json_if_exists(
+        os.path.join(os.fspath(artifact_dir), f"end_to_end_eval_{split}_state_machine.json")
+    ) or {}
+    baseline_window = (eval_payload.get("window_model_summary") or {}).get("accuracy")
+    perf = _load_json_if_exists(os.path.join(os.fspath(artifact_dir), "deploy_performance_profile.json")) or {}
+    feature_cost = perf.get("feature_cost_summary") or {}
+    deploy_cost = _finite_float(feature_cost.get("deployment_cost_mean"), 0.0)
+    candidate = {
+        "candidate": "auto_e2e_current_best",
+        "valid_metrics": valid_metrics,
+        "test_metrics": test_metrics,
+        "deploy_cost": deploy_cost,
+        "source": replay_path,
+    }
+    selected = select_auto_e2e_candidate(
+        [candidate],
+        baseline_window_accuracy=baseline_window,
+        constraints=constraints,
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    summary = {
+        "source": "s08_run_pipeline --auto_optimize_e2e",
+        "selection_policy": "product_metrics_first",
+        "constraints": constraints or {},
+        "score_weights": AUTO_E2E_SCORE_WEIGHTS,
+        "baseline_window_accuracy": baseline_window,
+        "selected_candidate": selected,
+    }
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+    with open(candidate_scores_path, "w", encoding="utf-8") as f:
+        f.write("candidate,constraint_pass,auto_score,sample_accuracy,sample_recall,window_accuracy,sample_fp_rate,false_worn_event_rate,first_worn_output_p95_sec,deploy_cost\n")
+        m = selected.get("valid_metrics", {})
+        f.write(
+            f"{selected.get('candidate')},{selected.get('constraint_pass')},"
+            f"{selected.get('auto_score')},"
+            f"{m.get('sample_accuracy')},{m.get('sample_recall')},{m.get('window_accuracy')},"
+            f"{m.get('sample_fp_rate')},{m.get('false_worn_event_rate')},"
+            f"{m.get('first_worn_output_p95_sec')},{selected.get('deploy_cost')}\n"
+        )
+    manifest = {
+        "source": "s08_run_pipeline --auto_optimize_e2e",
+        "selected_candidate": selected.get("candidate"),
+        "constraint_pass": bool(selected.get("constraint_pass", False)),
+        "artifacts": {
+            "summary": summary_path,
+            "candidate_scores": candidate_scores_path,
+            "postprocess_replay": replay_path,
+            "end_to_end_eval": os.path.join(
+                os.fspath(artifact_dir), f"end_to_end_eval_{split}_state_machine.json"
+            ),
+            "deploy_performance_profile": os.path.join(
+                os.fspath(artifact_dir), "deploy_performance_profile.json"
+            ),
+        },
+    }
+    with open(candidate_manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(f"[OK] auto E2E summary -> {summary_path}")
+    print(f"[OK] auto E2E candidate scores -> {candidate_scores_path}")
+    print(f"[OK] auto E2E candidate manifest -> {candidate_manifest_path}")
+    return summary_path
+
+
 EXTRA_FEATURE_FORMULAS = {
     "GREEN_CORR": {
         "formula": "safe_corr(g_mean_bp, moving_average(g_mean_bp, window=round(0.15*fs)))",
@@ -510,77 +706,17 @@ def _render_selected_feature_extractor(selected_features, fill_values, clip_boun
                                        use_stage2_ir=False,
                                        default_fs=25.0,
                                        window_sec=5.0):
-    """Generate a standalone deploy script with inlined s03 source."""
-    order_json = json.dumps(selected_features, ensure_ascii=False, indent=2)
-    fill_json = json.dumps(fill_values, ensure_ascii=False, indent=2)
-    clip_json = json.dumps(clip_bounds, ensure_ascii=False, indent=2)
-    threshold_json = json.dumps(float(window_model_threshold), ensure_ascii=False)
-    engine_source = _standalone_feature_engine_source()
-
-    return f'''# -*- coding: utf-8 -*-
-"""Auto-generated standalone deployment feature extractor.
-
-Inlines s03_extract_feature_pool source for numerical identity with training.
-No s03 import — fully standalone. Only dependencies: numpy + scipy resample_poly.
-"""
-
-from __future__ import annotations
-
-from collections import OrderedDict
-
-import numpy as np
-from scipy.signal import resample_poly
-
-
-FEATURE_ORDER = {order_json}
-FILL_VALUES = {fill_json}
-CLIP_BOUNDS = {clip_json}
-WINDOW_MODEL_THRESHOLD = {threshold_json}
-
-
-{engine_source}
-
-
-def _clean_value(name, value):
-    if value is None or not np.isfinite(value):
-        return float(FILL_VALUES.get(name, 0.0))
-    v = float(value)
-    bound = CLIP_BOUNDS.get(name)
-    if bound is not None and isinstance(bound, (list, tuple)) and len(bound) == 2:
-        lo, hi = float(bound[0]), float(bound[1])
-        v = min(max(v, lo), hi)
-    return v
-
-
-def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros_like(ir)])
-    feat = extract_window_features(ppg, fs=fs, acc_window=acc)
-    vec = []
-    for name in FEATURE_ORDER:
-        v = feat.get(name, 0.0)
-        vec.append(_clean_value(name, v))
-    return vec
-
-
-def classify_probability(probability):
-    return int(float(probability) >= float(WINDOW_MODEL_THRESHOLD))
-
-
-if __name__ == "__main__":
-    rng = np.random.default_rng(0)
-    n = max(32, int(round({float(default_fs)} * {float(window_sec)})))
-    t = np.arange(n, dtype=float) / {float(default_fs)}
-    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
-    ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
-    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
-    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t)
-    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t)
-    acc = rng.normal(0, 0.01, (n, 3))
-    vec = extract_features(ir, ambient, g1, g2, g3, acc=acc, fs={float(default_fs)})
-    print(f"Feature vector: {{len(vec)}} values")
-    for i, (name, value) in enumerate(zip(FEATURE_ORDER, vec)):
-        print(f"{{i:02d}} {{name}} = {{value:.8g}}")
-'''
+    """Generate the source-backed deploy script used by tests and golden vectors."""
+    return _render_deployment_feature_extractor(
+        selected_features,
+        fill_values,
+        clip_bounds,
+        formulas,
+        window_model_threshold=window_model_threshold,
+        default_fs=default_fs,
+        window_sec=window_sec,
+        scripts_dir=scripts_dir,
+    )
 
 
 def export_feature_extractor_script(artifact_dir):
@@ -724,8 +860,8 @@ def export_golden_vectors(artifact_dir, n_vectors=1):
         g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03 + phase)
         g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02 + phase)
         acc = rng.normal(0, 0.01, (n, 3))
-        feature_dict = module.extract_feature_dict(ir, ambient, g1, g2, g3, acc=acc, fs=fs, mode=0)
-        feature_vector = [float(feature_dict[name]) for name in selected]
+        feature_vector = module.extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=fs)
+        feature_dict = dict(zip(selected, feature_vector))
         X = np.asarray([feature_vector], dtype=float)
         model = bundle.get("model") or bundle.get("raw_model")
         probability = float(model.predict_proba(X)[:, 1][0])
@@ -2109,6 +2245,8 @@ def main():
                    help="enable full search loop: model/feature-count search, window cache export, and s07 postprocess optimization")
     p.add_argument("--with_postprocess", action="store_true",
                    help="alias for --export_window_cache --optimize_postprocess")
+    p.add_argument("--auto_optimize_e2e", action="store_true",
+                   help="product-metric-first automatic E2E optimization using s04/s05/s06/s07")
     p.add_argument("--accuracy_first_optimize", action="store_true",
                    help="只优化 Stage2 raw window accuracy；除非显式指定，否则不自动打开 hard-negative、s07 后处理或 s10 审计")
     p.add_argument("--hard_negative_optimize", action="store_true",
@@ -2173,6 +2311,20 @@ def main():
         args.fp_cost_weight = 0.0
         if "--model_search_full_top_k" not in _raw_argv:
             args.model_search_full_top_k = max(3, int(args.model_search_full_top_k))
+    if args.auto_optimize_e2e:
+        args.model_search = True
+        args.export_window_cache = True
+        args.optimize_postprocess = True
+        args.ranking_objective = "balanced"
+        args.threshold_objective = "precision_constrained"
+        if "--threshold_min_precision" not in _raw_argv:
+            args.threshold_min_precision = 0.97
+        if "--model_search_fp_cost" not in _raw_argv:
+            args.model_search_fp_cost = 4.0
+        if "--fp_cost_weight" not in _raw_argv:
+            args.fp_cost_weight = max(float(args.fp_cost_weight), 0.35)
+        if "--postprocess_fp_cost" not in _raw_argv:
+            args.postprocess_fp_cost = max(float(args.postprocess_fp_cost), 4.0)
     if args.full_optimize or args.with_postprocess:
         args.model_search = True
         args.export_window_cache = True
@@ -2690,6 +2842,20 @@ def main():
     else:
         print(f"[OK] 全流程完成  [{timedelta(seconds=int(total_dt))}]")
     print(f"{'=' * 70}")
+
+    if args.auto_optimize_e2e:
+        export_auto_e2e_summary(
+            args.artifact_dir,
+            postprocess_split=args.postprocess_split,
+            split=args.split,
+            constraints={
+                "max_sample_fp_rate": float(args.max_sample_fp_rate),
+                "max_false_worn_event_rate": float(args.max_false_worn_event_rate),
+                "max_first_worn_output_p95_sec": float(args.max_first_worn_output_p95_sec),
+                "min_window_accuracy_delta": -0.01,
+            },
+            dry_run=args.dry_run,
+        )
 
     if args.export_deploy and "s06_xpt" in completed_keys and not args.dry_run:
         pkg = os.path.join(args.artifact_dir, "deploy_package")
