@@ -102,6 +102,7 @@ def run_postprocess_on_cache(cache, params):
     )
     states = []
     scores = []
+    state = 0
     first_output_sec = None
     positive_output_sec = None
     time_to_correct_sec = None
@@ -180,7 +181,7 @@ def _time_to_correct(detail):
     return np.inf
 
 
-def compute_dataset_metrics(details, params_label=""):
+def compute_dataset_metrics(details, params_label="", warmup_frames=0):
     y_true = np.array([d["target"] for d in details])
     y_pred = np.array([d["pred"] for d in details])
     tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
@@ -194,10 +195,15 @@ def compute_dataset_metrics(details, params_label=""):
 
     # Window-level metrics from states
     all_true, all_pred = [], []
+    warmup_frames = max(0, int(warmup_frames))
+    skipped_warmup_windows = 0
     for d in details:
         window_targets = list(d.get("window_targets", []))
         sample_target = int(d["target"])
-        for idx, s in enumerate(d.get("states", [])):
+        states = list(d.get("states", []))
+        start = min(warmup_frames, len(states))
+        skipped_warmup_windows += start
+        for idx, s in enumerate(states[start:], start=start):
             t = int(window_targets[idx]) if idx < len(window_targets) else sample_target
             all_true.append(t)
             all_pred.append(int(s))
@@ -255,6 +261,9 @@ def compute_dataset_metrics(details, params_label=""):
         "sample_fp_rate": sample_fp_rate, "sample_tp": int(tp), "sample_fp": int(fp),
         "sample_fn": int(fn), "sample_tn": int(tn),
         "window_accuracy": window_accuracy, "window_fp_rate": window_fp_rate,
+        "window_warmup_frames": int(warmup_frames),
+        "skipped_warmup_windows": int(skipped_warmup_windows),
+        "window_total_windows": int(len(all_true)),
         "first_output_mean_sec": first_output_mean,
         "first_output_p95_sec": first_output_p95,
         "first_worn_output_p95_sec": first_worn_output_p95,
@@ -379,15 +388,17 @@ def metrics_with_params(metrics, params):
     return out
 
 
-def evaluate_postprocess_on_caches(caches, params):
+def evaluate_postprocess_on_caches(caches, params, warmup_frames=0):
     details = [run_postprocess_on_cache(c, params) for c in caches]
-    return details, compute_dataset_metrics(details, _params_label(params))
+    return details, compute_dataset_metrics(
+        details, _params_label(params), warmup_frames=warmup_frames)
 
 
 def build_replay_report(best_params, selection_split, selection_caches,
-                        replay_split=None, replay_caches=None):
+                        replay_split=None, replay_caches=None,
+                        warmup_frames=0):
     selection_details, selection_metrics = evaluate_postprocess_on_caches(
-        selection_caches, best_params)
+        selection_caches, best_params, warmup_frames=warmup_frames)
     payload = {
         "source": "s07_postprocess_optimize",
         "best_params": {
@@ -407,7 +418,7 @@ def build_replay_report(best_params, selection_split, selection_caches,
     }
     if replay_split and replay_caches is not None:
         replay_details, replay_metrics = evaluate_postprocess_on_caches(
-            replay_caches, best_params)
+            replay_caches, best_params, warmup_frames=warmup_frames)
         payload["replay"] = {
             "split": replay_split,
             "n_samples": int(len(replay_caches)),
@@ -445,6 +456,7 @@ def write_optimized_config(best, out_dir, split, constraints):
     metric_keys = [
         "sample_accuracy", "sample_precision", "sample_recall", "sample_f1",
         "sample_fp_rate", "window_accuracy", "window_fp_rate",
+        "window_warmup_frames", "skipped_warmup_windows", "window_total_windows",
         "first_output_p95_sec", "first_worn_output_p95_sec", "score",
         "accuracy_at_8s", "time_to_correct_mean_sec",
         "false_worn_event_rate", "false_worn_duration_mean_sec",
@@ -504,12 +516,14 @@ def load_split_caches(artifact_dir, cache_root, split):
 # =========================================================
 # Worker globals for parallel evaluation
 _WORKER_CACHES = None
+_WORKER_WARMUP_FRAMES = 0
 
 
-def _init_worker_caches(caches):
+def _init_worker_caches(caches, warmup_frames=0):
     """Initialize per-process cache state for ProcessPoolExecutor workers."""
-    global _WORKER_CACHES
+    global _WORKER_CACHES, _WORKER_WARMUP_FRAMES
     _WORKER_CACHES = caches
+    _WORKER_WARMUP_FRAMES = max(0, int(warmup_frames))
 
 
 def _eval_one_param(params):
@@ -518,7 +532,8 @@ def _eval_one_param(params):
     if caches is None:
         raise RuntimeError("worker caches not initialized")
     details = [run_postprocess_on_cache(c, params) for c in caches]
-    metrics = compute_dataset_metrics(details, _params_label(params))
+    metrics = compute_dataset_metrics(
+        details, _params_label(params), warmup_frames=_WORKER_WARMUP_FRAMES)
     return params, metrics
 
 
@@ -537,6 +552,8 @@ def main():
     parser.add_argument("--n_workers", type=int, default=4)
     parser.add_argument("--search_budget", type=int, default=240,
                         help="maximum postprocess candidates to evaluate; <=0 keeps the full grid")
+    parser.add_argument("--warmup_frames", type=int, default=3,
+                        help="skip the first N state-machine windows when computing window-level postprocess metrics")
     parser.add_argument("--replay_split", type=str, default="",
                         help="optional split to replay the selected postprocess params on, e.g. test")
     args = parser.parse_args()
@@ -578,7 +595,7 @@ def main():
     n_workers = max(1, int(args.n_workers))
     t0 = time.time()
 
-    _init_worker_caches(caches)
+    _init_worker_caches(caches, args.warmup_frames)
 
     results = []
     n_done = 0
@@ -607,7 +624,7 @@ def main():
         with ProcessPoolExecutor(
             max_workers=n_workers,
             initializer=_init_worker_caches,
-            initargs=(caches,),
+            initargs=(caches, args.warmup_frames),
         ) as ex:
             futures = {ex.submit(_eval_one_param, p): p for p in grid}
             for fut in as_completed(futures):
@@ -667,6 +684,7 @@ def main():
             "max_false_worn_event_rate": args.max_false_worn_event_rate,
             "max_first_worn_output_p95_sec": args.max_first_worn_output_p95_sec,
             "fp_cost": args.fp_cost,
+            "warmup_frames": args.warmup_frames,
         },
     )
     print(f"[OK] {config_path}")
@@ -691,6 +709,7 @@ def main():
         selection_caches=caches,
         replay_split=replay_split if replay_caches is not None else None,
         replay_caches=replay_caches,
+        warmup_frames=args.warmup_frames,
     )
     replay_path = os.path.join(
         out_dir,
@@ -707,6 +726,199 @@ def main():
     df = df.sort_values("score", ascending=False)
     df.to_csv(os.path.join(out_dir, "postprocess_search_results.csv"), index=False)
     print(f"[OK] {out_dir}/postprocess_search_results.csv")
+
+    # Export search visualisation
+    try:
+        export_postprocess_search_plots(df, out_dir)
+    except Exception as e:
+        print(f"[WARN] postprocess search plot failed: {e}")
+
+
+def export_postprocess_search_plots(df_results, out_dir):
+    """Export multi-panel postprocess parameter search visualisation."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip s07 plot: {e}")
+        return None
+
+    df = df_results.copy() if hasattr(df_results, "copy") else pd.DataFrame(df_results)
+    if len(df) < 2:
+        print("[WARN] fewer than 2 search candidates, skip s07 viz")
+        return None
+
+    metric_cols = [
+        "sample_accuracy", "sample_recall", "sample_fp_rate",
+        "window_accuracy", "false_worn_event_rate",
+        "first_worn_output_p95_sec", "score",
+    ]
+    available = [c for c in metric_cols if c in df.columns]
+    df_plot = df[available].copy()
+    for c in available:
+        df_plot[c] = pd.to_numeric(df_plot[c], errors="coerce")
+    df_plot = df_plot.dropna(subset=["score"] if "score" in df_plot.columns else available[:1])
+    if len(df_plot) < 2:
+        print("[WARN] insufficient clean rows for s07 viz")
+        return None
+
+    best = df_plot.iloc[0]
+    out_path = os.path.join(str(out_dir), "postprocess_search_summary.png")
+    os.makedirs(str(out_dir), exist_ok=True)
+
+    fig = plt.figure(figsize=(18, 10), facecolor="white")
+    gs = fig.add_gridspec(2, 3, hspace=0.32, wspace=0.30)
+
+    def _scatter(ax, x_col, y_col, xlabel, ylabel, title, best_x=None, best_y=None):
+        x = df_plot[x_col].values
+        y = df_plot[y_col].values
+        c = df_plot["score"].values if "score" in df_plot.columns else np.arange(len(x))
+        sc = ax.scatter(x, y, c=c, cmap="viridis_r", alpha=0.6, s=18, edgecolors="none")
+        if best_x is not None and best_y is not None and np.isfinite(best_x) and np.isfinite(best_y):
+            ax.scatter([best_x], [best_y], marker="*", s=280, color="#d35f2d",
+                       edgecolors="#222222", linewidths=0.8, zorder=5, label="best")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(alpha=0.18)
+        return sc
+
+    fp_col = "sample_fp_rate"
+    rec_col = "sample_recall"
+    lat_col = "first_worn_output_p95_sec"
+
+    # (0,0) FP Rate vs Recall
+    ax1 = fig.add_subplot(gs[0, 0])
+    if fp_col in df_plot.columns and rec_col in df_plot.columns:
+        _scatter(ax1, rec_col, fp_col,
+                 "Sample Recall", "Sample FP Rate", "FP Rate vs Recall",
+                 best_x=best.get(rec_col), best_y=best.get(fp_col))
+        ax1.invert_yaxis()
+    else:
+        ax1.text(0.5, 0.5, "FP/Recall columns missing", ha="center", va="center")
+        ax1.set_axis_off()
+
+    # (0,1) Latency vs FP Rate
+    ax2 = fig.add_subplot(gs[0, 1])
+    if lat_col in df_plot.columns and fp_col in df_plot.columns:
+        _scatter(ax2, lat_col, fp_col,
+                 "P95 First-Worn Latency (s)", "Sample FP Rate", "Latency vs FP Rate",
+                 best_x=best.get(lat_col), best_y=best.get(fp_col))
+        ax2.invert_yaxis()
+    else:
+        ax2.text(0.5, 0.5, "Latency/FP columns missing", ha="center", va="center")
+        ax2.set_axis_off()
+
+    # (0,2) Score distribution
+    ax3 = fig.add_subplot(gs[0, 2])
+    if "score" in df_plot.columns:
+        scores = df_plot["score"].dropna().values
+        ax3.hist(scores, bins=min(40, len(scores) // 4), color="#4c78a8", alpha=0.7, edgecolor="white")
+        ax3.axvline(best["score"], color="#d35f2d", linewidth=2, linestyle="--",
+                    label=f"best={best['score']:.4f}")
+        ax3.set_xlabel("Composite Score")
+        ax3.set_ylabel("Count")
+        ax3.set_title("Score Distribution")
+        ax3.grid(alpha=0.18)
+        ax3.legend(frameon=False)
+    else:
+        ax3.text(0.5, 0.5, "No score column", ha="center", va="center")
+        ax3.set_axis_off()
+
+    # (1,0) T_on / T_off heatmap
+    ax4 = fig.add_subplot(gs[1, 0])
+    param_cols = [c for c in df.columns if c in {"T_on", "T_off", "K_on", "K_off",
+                                                   "ema_alpha", "median_k", "cooldown_sec"}]
+    t_on_vals = sorted(df["T_on"].dropna().unique()) if "T_on" in df.columns else []
+    t_off_vals = sorted(df["T_off"].dropna().unique()) if "T_off" in df.columns else []
+    if len(t_on_vals) >= 2 and len(t_off_vals) >= 2:
+        heatmap = np.full((len(t_off_vals), len(t_on_vals)), np.nan)
+        for i, toff in enumerate(t_off_vals):
+            for j, ton in enumerate(t_on_vals):
+                mask = (df["T_on"] == ton) & (df["T_off"] == toff)
+                if mask.any() and "score" in df.columns:
+                    heatmap[i, j] = df.loc[mask, "score"].mean()
+        im = ax4.imshow(heatmap, aspect="auto", cmap="viridis_r", origin="lower")
+        ax4.set_xticks(range(len(t_on_vals)))
+        ax4.set_xticklabels([f"{v:.2f}" for v in t_on_vals])
+        ax4.set_yticks(range(len(t_off_vals)))
+        ax4.set_yticklabels([f"{v:.2f}" for v in t_off_vals])
+        ax4.set_xlabel("T_on")
+        ax4.set_ylabel("T_off")
+        ax4.set_title("Score by T_on × T_off")
+        plt.colorbar(im, ax=ax4, fraction=0.046)
+    else:
+        ax4.text(0.5, 0.5, "Insufficient T_on/T_off values for heatmap",
+                 ha="center", va="center")
+        ax4.set_axis_off()
+        ax4.set_title("T_on × T_off")
+
+    # (1,1) K_on / K_off heatmap
+    ax5 = fig.add_subplot(gs[1, 1])
+    k_on_vals = sorted(df["K_on"].dropna().unique()) if "K_on" in df.columns else []
+    k_off_vals = sorted(df["K_off"].dropna().unique()) if "K_off" in df.columns else []
+    if len(k_on_vals) >= 2 and len(k_off_vals) >= 2:
+        heatmap_k = np.full((len(k_off_vals), len(k_on_vals)), np.nan)
+        for i, koff in enumerate(k_off_vals):
+            for j, kon in enumerate(k_on_vals):
+                mask = (df["K_on"] == kon) & (df["K_off"] == koff)
+                if mask.any() and "score" in df.columns:
+                    heatmap_k[i, j] = df.loc[mask, "score"].mean()
+        im2 = ax5.imshow(heatmap_k, aspect="auto", cmap="viridis_r", origin="lower")
+        ax5.set_xticks(range(len(k_on_vals)))
+        ax5.set_xticklabels([str(v) for v in k_on_vals])
+        ax5.set_yticks(range(len(k_off_vals)))
+        ax5.set_yticklabels([str(v) for v in k_off_vals])
+        ax5.set_xlabel("K_on")
+        ax5.set_ylabel("K_off")
+        ax5.set_title("Score by K_on × K_off")
+        plt.colorbar(im2, ax=ax5, fraction=0.046)
+    else:
+        ax5.text(0.5, 0.5, "Insufficient K_on/K_off values for heatmap",
+                 ha="center", va="center")
+        ax5.set_axis_off()
+        ax5.set_title("K_on × K_off")
+
+    # (1,2) Constraint filtering breakdown
+    ax6 = fig.add_subplot(gs[1, 2])
+    constraint_cols = {
+        "sample_fp_rate": ("max_sample_fp_rate", 0.02),
+        "false_worn_event_rate": ("max_false_worn_event_rate", 0.02),
+        "first_worn_output_p95_sec": ("max_first_worn_output_p95_sec", 6.0),
+    }
+    counts = {"total": len(df)}
+    cum_pass = np.ones(len(df), dtype=bool)
+    for col, (_, thresh) in constraint_cols.items():
+        if col in df.columns:
+            valid = df[col].notna()
+            cum_pass = cum_pass & valid & (df[col].fillna(float("inf")) <= thresh)
+        label = col.replace("sample_", "").replace("_", " ").title()
+        counts[label] = int(cum_pass.sum())
+
+    if len(counts) > 1:
+        names = list(counts.keys())
+        vals = list(counts.values())
+        colors = ["#4c78a8"] + ["#c44e52"] * (len(counts) - 2) + ["#2f6f73"]
+        ax6.bar(range(len(names)), vals, color=colors[:len(names)], width=0.6)
+        ax6.set_xticks(range(len(names)))
+        ax6.set_xticklabels(names, rotation=25, ha="right", fontsize=8)
+        ax6.set_ylabel("Candidates Passed")
+        ax6.set_title("Constraint Filtering Cascade")
+        ax6.grid(axis="y", alpha=0.18)
+        for i, v in enumerate(vals):
+            ax6.text(i, v + max(1, max(vals) * 0.02), str(v), ha="center", fontsize=9)
+    else:
+        ax6.text(0.5, 0.5, "No constraint columns found",
+                 ha="center", va="center")
+        ax6.set_axis_off()
+
+    fig.suptitle("Postprocess Parameter Search Summary", fontsize=16, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] s07 postprocess search plot -> {out_path}")
+    return out_path
 
 
 if __name__ == "__main__":

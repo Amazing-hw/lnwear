@@ -31,9 +31,11 @@ import json
 import argparse
 import logging
 import joblib
+import glob
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -2671,6 +2673,157 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
     return fpath
 
 
+def export_tree_feature_usage_plot(artifact_dir):
+    """Export XGBoost tree-level feature usage visualisation."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip tree viz: {e}")
+        return None
+
+    bundle_path = os.path.join(str(artifact_dir), "model_bundle.pkl")
+    if not os.path.exists(bundle_path):
+        print("[WARN] model_bundle.pkl not found, skip tree viz")
+        return None
+
+    bundle = joblib.load(bundle_path)
+    raw_model = bundle.get("raw_model")
+    if raw_model is None:
+        print("[WARN] raw_model not in bundle, skip tree viz")
+        return None
+
+    try:
+        booster = raw_model.get_booster()
+    except Exception as e:
+        print(f"[WARN] cannot access booster for tree viz: {e}")
+        return None
+
+    feature_names = list(bundle.get("feature_names", []))
+    out_dir = os.path.join(str(artifact_dir), "report_plots")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "s06_tree_feature_usage.png")
+
+    # Extract tree data
+    try:
+        nodes_df = booster.trees_to_data_frame()
+    except Exception:
+        try:
+            dump = booster.get_dump(with_stats=True)
+            rows = []
+            for tidx, tree_str in enumerate(dump):
+                for line in tree_str.splitlines():
+                    stripped = line.strip()
+                    if not stripped or "leaf" in stripped:
+                        continue
+                    import re
+                    feat_match = re.search(r"f(\d+)", stripped)
+                    feat_idx = int(feat_match.group(1)) if feat_match else -1
+                    gain_match = re.search(r"gain=([\d.]+)", stripped)
+                    cover_match = re.search(r"cover=([\d.]+)", stripped)
+                    rows.append({
+                        "Tree": tidx,
+                        "Feature": f"f{feat_idx}" if feat_idx >= 0 else "",
+                        "Gain": float(gain_match.group(1)) if gain_match else 0.0,
+                        "Cover": float(cover_match.group(1)) if cover_match else 0.0,
+                    })
+            nodes_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+        except Exception as e2:
+            print(f"[WARN] tree data extraction failed: {e2}")
+            return None
+
+    if nodes_df.empty or "Feature" not in nodes_df.columns:
+        print("[WARN] empty tree node data, skip tree viz")
+        return None
+
+    # Map feature indices to names
+    if feature_names:
+        def _feat_name(f):
+            try:
+                fi = int(str(f).replace("f", ""))
+                return feature_names[fi] if 0 <= fi < len(feature_names) else str(f)
+            except (ValueError, IndexError):
+                return str(f)
+        nodes_df["FeatureName"] = nodes_df["Feature"].astype(str).apply(_feat_name)
+    else:
+        nodes_df["FeatureName"] = nodes_df["Feature"].astype(str)
+
+    split_nodes = nodes_df[nodes_df["FeatureName"].notna() & (nodes_df["FeatureName"] != "")
+                           & (nodes_df["FeatureName"] != "f-1")]
+    if split_nodes.empty:
+        print("[WARN] no split nodes found, skip tree viz")
+        return None
+
+    # Compute per-feature aggregates
+    feat_freq = split_nodes["FeatureName"].value_counts().head(15)
+    feat_gain = split_nodes.groupby("FeatureName")["Gain"].mean().sort_values(ascending=False).head(15)
+    feat_cover = split_nodes.groupby("FeatureName")["Cover"].mean().sort_values(ascending=False).head(15)
+    tree_sizes = nodes_df.groupby("Tree").size() if "Tree" in nodes_df.columns else pd.Series(dtype=int)
+
+    fig = plt.figure(figsize=(14, 10), facecolor="white")
+    gs = fig.add_gridspec(2, 2, hspace=0.30, wspace=0.28)
+
+    # (0,0) Feature split frequency
+    ax_freq = fig.add_subplot(gs[0, 0])
+    names_f = list(feat_freq.index)[::-1]
+    vals_f = [feat_freq[n] for n in names_f]
+    ax_freq.barh(np.arange(len(names_f)), vals_f, color="#4c78a8", height=0.68)
+    ax_freq.set_yticks(np.arange(len(names_f)))
+    ax_freq.set_yticklabels(names_f, fontsize=8)
+    ax_freq.set_xlabel("Split Count")
+    ax_freq.set_title(f"Feature Split Frequency (Top {len(names_f)})")
+    ax_freq.grid(axis="x", alpha=0.18)
+
+    # (0,1) Feature mean gain
+    ax_gain = fig.add_subplot(gs[0, 1])
+    names_g = list(feat_gain.index)[::-1]
+    vals_g = [feat_gain[n] for n in names_g]
+    ax_gain.barh(np.arange(len(names_g)), vals_g, color="#2f6f73", height=0.68)
+    ax_gain.set_yticks(np.arange(len(names_g)))
+    ax_gain.set_yticklabels(names_g, fontsize=8)
+    ax_gain.set_xlabel("Mean Gain")
+    ax_gain.set_title(f"Feature Mean Gain (Top {len(names_g)})")
+    ax_gain.grid(axis="x", alpha=0.18)
+
+    # (1,0) Feature mean cover
+    ax_cover = fig.add_subplot(gs[1, 0])
+    names_c = list(feat_cover.index)[::-1]
+    vals_c = [feat_cover[n] for n in names_c]
+    ax_cover.barh(np.arange(len(names_c)), vals_c, color="#8172b2", height=0.68)
+    ax_cover.set_yticks(np.arange(len(names_c)))
+    ax_cover.set_yticklabels(names_c, fontsize=8)
+    ax_cover.set_xlabel("Mean Cover")
+    ax_cover.set_title(f"Feature Mean Cover (Top {len(names_c)})")
+    ax_cover.grid(axis="x", alpha=0.18)
+
+    # (1,1) Tree size distribution
+    ax_tree = fig.add_subplot(gs[1, 1])
+    if len(tree_sizes) > 0:
+        sizes = tree_sizes.values
+        ax_tree.hist(sizes, bins=min(20, len(tree_sizes)), color="#d35f2d", alpha=0.7, edgecolor="white")
+        ax_tree.axvline(sizes.mean(), color="#222222", linewidth=1.5, linestyle="--",
+                        label=f"mean={sizes.mean():.1f}")
+        ax_tree.axvline(np.median(sizes), color="#4c78a8", linewidth=1.5, linestyle=":",
+                        label=f"median={np.median(sizes):.0f}")
+        ax_tree.set_xlabel("Nodes per Tree")
+        ax_tree.set_ylabel("Tree Count")
+        ax_tree.set_title(f"Tree Size Distribution ({len(tree_sizes)} trees, {int(sizes.sum())} total nodes)")
+        ax_tree.grid(alpha=0.18)
+        ax_tree.legend(frameon=False)
+    else:
+        ax_tree.text(0.5, 0.5, "No tree size data", ha="center", va="center")
+        ax_tree.set_axis_off()
+        ax_tree.set_title("Tree Size Distribution")
+
+    fig.suptitle("XGBoost Tree Feature Usage Report", fontsize=16, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] s06 tree feature usage plot -> {out_path}")
+    return out_path
+
+
 def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, model_threshold,
                         quality_thresholds=None, metadata=None, cache_root="window_outputs"):
     import os as _os, pandas as _pd
@@ -2744,9 +2897,24 @@ def main(args=None):
                         help="directory under artifact_dir for per-sample model-output NPZ files")
     parser.add_argument("--export_deploy", action="store_true",
                         help="导出部署产物到 artifacts/deploy_package/")
+    parser.add_argument("--generalization_audit", action="store_true",
+                        help="只读取已有评估产物并导出 generalization_audit，不重新推理")
+    parser.add_argument("--min_support", type=int, default=10,
+                        help="generalization audit 最小分层样本数")
 
     if args is None:
         args = parser.parse_args()
+
+    if args.generalization_audit:
+        result = run_audit(
+            args.artifact_dir,
+            split=args.split,
+            method=args.method,
+            min_support=args.min_support,
+        )
+        print(f"[OK] generalization_audit -> {result['out_dir']}")
+        print(json.dumps(result["paths"], indent=2, ensure_ascii=False))
+        return
 
     with open(os.path.join(args.artifact_dir, "splits.json"), "r", encoding="utf-8") as f:
         split = json.load(f)
@@ -3048,5 +3216,1019 @@ def main(args=None):
         )
 
 
+# =========================================================
+# Generalization audit utilities (formerly s10).
+# =========================================================
+OPTIONAL_DIMENSIONS = ["subject_id", "device_id", "session_id"]
+GREEN_RELIABILITY_FEATURES = [
+    "G_2OF3_AC_SUPPORT",
+    "G_TOP2_TO_ALL_AC_RATIO",
+    "G_TOP2_CORR_MIN",
+    "G_WEAK_CHANNEL_GAP",
+    "G_SPATIAL_STABILITY_SCORE",
+]
+GREEN_RELIABILITY_DIMENSIONS = [
+    "green_support_bin",
+    "green_top2_ratio_bin",
+    "green_top2_corr_bin",
+    "green_weak_gap_bin",
+    "green_stability_bin",
+]
+WINDOW_DIMENSIONS = [
+    "mode",
+    "h5_file",
+    "sample_name",
+    "record",
+    "window_index",
+    "time_bin",
+    "quality_bin",
+    "ood_bin",
+] + GREEN_RELIABILITY_DIMENSIONS + OPTIONAL_DIMENSIONS
+SAMPLE_DIMENSIONS = [
+    "mode",
+    "h5_file",
+    "sample_name",
+    "record",
+] + OPTIONAL_DIMENSIONS
+STRATA_COLUMNS = [
+    "level",
+    "dimension",
+    "stratum",
+    "n_windows",
+    "n_samples",
+    "accuracy",
+    "precision",
+    "recall",
+    "fp_rate",
+    "fn_rate",
+    "fp",
+    "fn",
+    "tp",
+    "tn",
+    "low_support",
+]
+
+
+def _first_existing(patterns):
+    for pattern in patterns:
+        matches = sorted(glob.glob(os.fspath(pattern)))
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _read_json(path):
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _read_csv(path):
+    if not path or not os.path.exists(path):
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _safe_div(num, den):
+    den = float(den)
+    if den <= 0:
+        return 0.0
+    return float(num) / den
+
+
+def _counts_from_target_pred(df, target_col="target", pred_col="pred_raw"):
+    if df.empty or target_col not in df.columns or pred_col not in df.columns:
+        return {"TN": 0, "FP": 0, "FN": 0, "TP": 0}
+    y = df[target_col].fillna(0).astype(int)
+    p = df[pred_col].fillna(0).astype(int)
+    return {
+        "TN": int(((y == 0) & (p == 0)).sum()),
+        "FP": int(((y == 0) & (p == 1)).sum()),
+        "FN": int(((y == 1) & (p == 0)).sum()),
+        "TP": int(((y == 1) & (p == 1)).sum()),
+    }
+
+
+def _metrics_from_counts(cm):
+    tn = int(cm.get("TN", 0))
+    fp = int(cm.get("FP", 0))
+    fn = int(cm.get("FN", 0))
+    tp = int(cm.get("TP", 0))
+    total = tn + fp + fn + tp
+    return {
+        "n": int(total),
+        "accuracy": _safe_div(tn + tp, total),
+        "precision": _safe_div(tp, tp + fp),
+        "recall": _safe_div(tp, tp + fn),
+        "fp_rate": _safe_div(fp, tn + fp),
+        "fn_rate": _safe_div(fn, tp + fn),
+        "confusion_matrix": {"TN": tn, "FP": fp, "FN": fn, "TP": tp},
+    }
+
+
+def _as_list(value):
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return list(value)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return []
+        return _as_list(parsed)
+    return []
+
+
+def _finite_float(value):
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _green_support_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v < 2.0 / 3.0:
+        return "<2of3"
+    if v < 1.0:
+        return "2of3"
+    return "3of3"
+
+
+def _green_corr_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v < 0.50:
+        return "low_corr"
+    if v < 0.85:
+        return "mid_corr"
+    return "high_corr"
+
+
+def _green_gap_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v > 0.60:
+        return "large_gap"
+    if v > 0.25:
+        return "mid_gap"
+    return "low_gap"
+
+
+def _green_stability_bin(value):
+    v = _finite_float(value)
+    if v is None:
+        return "missing"
+    if v < 0.35:
+        return "low_stability"
+    if v < 0.75:
+        return "mid_stability"
+    return "high_stability"
+
+
+def add_green_reliability_bins(window_df):
+    """Add deployment-readable bins for optional three-green reliability features."""
+    if window_df.empty:
+        return window_df
+    df = window_df.copy()
+    if "G_2OF3_AC_SUPPORT" in df.columns:
+        df["green_support_bin"] = df["G_2OF3_AC_SUPPORT"].map(_green_support_bin)
+    if "G_TOP2_TO_ALL_AC_RATIO" in df.columns:
+        df["green_top2_ratio_bin"] = df["G_TOP2_TO_ALL_AC_RATIO"].map(
+            lambda v: "single_dominant" if (_finite_float(v) or 0.0) > 0.90 else "balanced_top2"
+        )
+    if "G_TOP2_CORR_MIN" in df.columns:
+        df["green_top2_corr_bin"] = df["G_TOP2_CORR_MIN"].map(_green_corr_bin)
+    if "G_WEAK_CHANNEL_GAP" in df.columns:
+        df["green_weak_gap_bin"] = df["G_WEAK_CHANNEL_GAP"].map(_green_gap_bin)
+    if "G_SPATIAL_STABILITY_SCORE" in df.columns:
+        df["green_stability_bin"] = df["G_SPATIAL_STABILITY_SCORE"].map(_green_stability_bin)
+    return df
+
+
+def _first_worn_latencies(sample_df):
+    """Return positive-sample response latencies from explicit columns or states.
+
+    s06 details normally keep ``window_states`` and ``window_end_sec`` rather
+    than a precomputed latency column, so this derives first-worn latency from
+    the first state-machine window whose state becomes 1.
+    """
+    if sample_df.empty or "target" not in sample_df.columns:
+        return []
+    positive = sample_df[sample_df["target"].fillna(0).astype(int) == 1]
+    latencies = []
+    for col in [
+        "first_worn_output_sec",
+        "first_worn_latency_sec",
+        "first_worn_output_latency_sec",
+        "first_worn_sec",
+    ]:
+        if col not in positive.columns:
+            continue
+        for value in positive[col].tolist():
+            parsed = _finite_float(value)
+            if parsed is not None:
+                latencies.append(parsed)
+    if latencies:
+        return latencies
+
+    for _, row in positive.iterrows():
+        states = _as_list(row.get("window_states"))
+        if not states:
+            continue
+        end_times = _as_list(row.get("window_end_sec"))
+        start_times = _as_list(row.get("window_start_sec"))
+        times = end_times if end_times else start_times
+        for idx, state in enumerate(states):
+            state_value = _finite_float(state)
+            if state_value is None or int(state_value) != 1:
+                continue
+            if idx < len(times):
+                latency = _finite_float(times[idx])
+                if latency is not None:
+                    latencies.append(latency)
+            break
+    return latencies
+
+
+def summarize_window_metrics(window_df):
+    return _metrics_from_counts(_counts_from_target_pred(window_df))
+
+
+def _pred_col_for_sample_df(sample_df):
+    for col in ["pred", "final_pred", "sample_pred", "prediction"]:
+        if col in sample_df.columns:
+            return col
+    return None
+
+
+def _sample_df_from_eval(eval_payload, window_df):
+    details = eval_payload.get("details", []) if isinstance(eval_payload, dict) else []
+    if details:
+        return pd.DataFrame(details)
+    if window_df.empty or "sample_name" not in window_df.columns:
+        return pd.DataFrame()
+    grouped = []
+    for sample_name, sub in window_df.groupby("sample_name", dropna=False):
+        row = {
+            "sample_name": sample_name,
+            "target": int(sub["target"].mode().iloc[0]) if "target" in sub.columns else 0,
+            "pred": int((sub.get("pred_raw", pd.Series([0])) == 1).any()),
+        }
+        for col in SAMPLE_DIMENSIONS:
+            if col in sub.columns and col not in row:
+                row[col] = sub[col].iloc[0]
+        grouped.append(row)
+    return pd.DataFrame(grouped)
+
+
+def summarize_sample_metrics(sample_df):
+    if sample_df.empty or "target" not in sample_df.columns:
+        return {
+            "n": 0,
+            "accuracy": 0.0,
+            "false_worn_event_rate": 0.0,
+            "first_worn_latency_p50_sec": None,
+            "first_worn_latency_p95_sec": None,
+            "confusion_matrix": {"TN": 0, "FP": 0, "FN": 0, "TP": 0},
+        }
+    pred_col = _pred_col_for_sample_df(sample_df)
+    if pred_col is None:
+        pred = pd.Series(np.zeros(len(sample_df), dtype=int), index=sample_df.index)
+    else:
+        pred = sample_df[pred_col].fillna(0).astype(int)
+    tmp = sample_df.copy()
+    tmp["_pred"] = pred
+    metrics = _metrics_from_counts(_counts_from_target_pred(tmp, pred_col="_pred"))
+    latencies = _first_worn_latencies(sample_df)
+    metrics.update({
+        "false_worn_event_rate": metrics["fp_rate"],
+        "first_worn_latency_p50_sec": float(np.percentile(latencies, 50)) if latencies else None,
+        "first_worn_latency_p95_sec": float(np.percentile(latencies, 95)) if latencies else None,
+    })
+    return metrics
+
+
+def _strata_rows(df, dimensions, min_support, level):
+    rows = []
+    if df.empty:
+        return rows
+    pred_col = "pred_raw" if level == "window" else _pred_col_for_sample_df(df)
+    if pred_col is None:
+        return rows
+    for dim in dimensions:
+        if dim not in df.columns:
+            continue
+        for value, sub in df.groupby(dim, dropna=False):
+            metrics = _metrics_from_counts(_counts_from_target_pred(sub, pred_col=pred_col))
+            n_samples = int(sub["sample_name"].nunique()) if "sample_name" in sub.columns else int(len(sub))
+            support_n = n_samples if "sample_name" in sub.columns else int(len(sub))
+            row = {
+                "level": level,
+                "dimension": dim,
+                "stratum": str(value),
+                "n_windows": int(len(sub)) if level == "window" else None,
+                "n_samples": n_samples,
+                "accuracy": metrics["accuracy"],
+                "precision": metrics["precision"],
+                "recall": metrics["recall"],
+                "fp_rate": metrics["fp_rate"],
+                "fn_rate": metrics["fn_rate"],
+                "fp": metrics["confusion_matrix"]["FP"],
+                "fn": metrics["confusion_matrix"]["FN"],
+                "tp": metrics["confusion_matrix"]["TP"],
+                "tn": metrics["confusion_matrix"]["TN"],
+                "low_support": bool(support_n < int(min_support)),
+            }
+            rows.append(row)
+    return rows
+
+
+def build_strata(window_df, sample_df, min_support):
+    window_df = add_green_reliability_bins(window_df)
+    window_strata = pd.DataFrame(
+        _strata_rows(window_df, WINDOW_DIMENSIONS, min_support, "window"),
+        columns=STRATA_COLUMNS,
+    )
+    sample_strata = pd.DataFrame(
+        _strata_rows(sample_df, SAMPLE_DIMENSIONS, min_support, "sample"),
+        columns=STRATA_COLUMNS,
+    )
+    return window_strata, sample_strata
+
+
+def _group_accuracy_variance(df, group_candidates, pred_col):
+    if df.empty or "target" not in df.columns or pred_col not in df.columns:
+        return {"available": False}
+    for group_col in group_candidates:
+        if group_col not in df.columns or df[group_col].nunique(dropna=False) <= 1:
+            continue
+        rows = []
+        for value, sub in df.groupby(group_col, dropna=False):
+            metrics = _metrics_from_counts(_counts_from_target_pred(sub, pred_col=pred_col))
+            rows.append({
+                "group": str(value),
+                "n": int(len(sub)),
+                "accuracy": metrics["accuracy"],
+                "fp_rate": metrics["fp_rate"],
+                "fn_rate": metrics["fn_rate"],
+            })
+        acc = np.asarray([r["accuracy"] for r in rows], dtype=float)
+        return {
+            "available": True,
+            "group_col": group_col,
+            "n_groups": int(len(rows)),
+            "accuracy_mean": float(np.mean(acc)),
+            "accuracy_std": float(np.std(acc, ddof=1)) if len(acc) > 1 else 0.0,
+            "accuracy_min": float(np.min(acc)),
+            "accuracy_max": float(np.max(acc)),
+        }
+    return {"available": False}
+
+
+def summarize_group_variance(window_df, sample_df):
+    sample_pred_col = _pred_col_for_sample_df(sample_df)
+    return {
+        "window_by_group": _group_accuracy_variance(
+            window_df,
+            ["sample_name", "record", "h5_file", "mode"],
+            "pred_raw",
+        ),
+        "sample_by_group": _group_accuracy_variance(
+            sample_df,
+            ["record", "h5_file", "mode", "sample_name"],
+            sample_pred_col,
+        ) if sample_pred_col else {"available": False},
+    }
+
+
+def _add_action(items, priority, issue_type, stratum, evidence_metric, n_samples, suggested_action):
+    items.append({
+        "priority": priority,
+        "issue_type": issue_type,
+        "stratum": str(stratum),
+        "evidence_metric": str(evidence_metric),
+        "n_samples": int(n_samples),
+        "suggested_action": suggested_action,
+    })
+
+
+def _hard_negative_count(hard_payload):
+    fps = hard_payload.get("false_positives", []) if isinstance(hard_payload, dict) else []
+    return len(fps), fps
+
+
+def _is_object_worn_fp(row):
+    text = " ".join(
+        str(row.get(col, ""))
+        for col in ["negative_type", "scene_type", "subject_type", "sample_name", "h5_file", "record"]
+        if isinstance(row, dict)
+    ).lower()
+    return any(token in text for token in [
+        "object_worn", "object-worn", "non_human", "non-human", "reflective", "物体", "非人体"
+    ])
+
+
+def _top_rows(df, condition, limit=5):
+    if df.empty:
+        return []
+    sub = df[condition(df)].copy()
+    if sub.empty:
+        return []
+    return sub.head(limit).to_dict("records")
+
+
+def _model_search_stability_summary(model_search_df, close_margin=0.002):
+    if model_search_df is None or model_search_df.empty or "mean_cv_accuracy" not in model_search_df.columns:
+        return {"available": False}
+    df = model_search_df.copy()
+    if "eligible" in df.columns:
+        df = df[df["eligible"].astype(bool)]
+    df["mean_cv_accuracy"] = pd.to_numeric(df["mean_cv_accuracy"], errors="coerce")
+    df = df[df["mean_cv_accuracy"].notna()].copy()
+    if df.empty:
+        return {"available": False}
+    sort_cols = ["mean_cv_accuracy"]
+    ascending = [False]
+    for col in ["std_cv_accuracy", "mean_cv_fp_rate", "final_total_nodes"]:
+        if col in df.columns:
+            sort_cols.append(col)
+            ascending.append(True)
+    df = df.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    best_acc = float(df.loc[0, "mean_cv_accuracy"])
+    second_acc = float(df.loc[1, "mean_cv_accuracy"]) if len(df) > 1 else None
+    margin = None if second_acc is None else float(best_acc - second_acc)
+    close_df = df[(best_acc - df["mean_cv_accuracy"].astype(float)) <= float(close_margin)]
+    default_rank = None
+    if "is_default_params" in df.columns:
+        hits = df.index[df["is_default_params"].astype(bool)].tolist()
+        if hits:
+            default_rank = int(hits[0] + 1)
+    return {
+        "available": True,
+        "best_mean_cv_accuracy": best_acc,
+        "second_mean_cv_accuracy": second_acc,
+        "top_accuracy_margin": margin,
+        "close_top_candidate_count": int(len(close_df)),
+        "default_params_rank": default_rank,
+        "is_unstable": bool(len(close_df) > 1 or (default_rank is not None and default_rank <= 3)),
+    }
+
+
+def _collect_feature_names(value):
+    if isinstance(value, dict):
+        out = []
+        for key, nested in value.items():
+            if key in {"selected_features", "feature_names", "features"}:
+                out.extend(_collect_feature_names(nested))
+            elif isinstance(nested, (dict, list, tuple)):
+                out.extend(_collect_feature_names(nested))
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, (dict, list, tuple)):
+                out.extend(_collect_feature_names(item))
+        return out
+    return []
+
+
+def green_reliability_feature_usage(final_config):
+    features = list(dict.fromkeys(_collect_feature_names(final_config)))
+    selected = [f for f in features if f in GREEN_RELIABILITY_FEATURES]
+    return {
+        "known_features": list(GREEN_RELIABILITY_FEATURES),
+        "selected_features": selected,
+        "selected_count": int(len(selected)),
+        "selected_fraction": _safe_div(len(selected), len(features)) if features else 0.0,
+    }
+
+
+def build_action_items(window_strata, sample_strata, hard_payload, model_search_df,
+                       window_metrics, min_support):
+    """Translate recurring deployment-risk patterns into concrete next actions."""
+    items = []
+    hard_count, hard_fps = _hard_negative_count(hard_payload)
+    if hard_count > 0:
+        object_fps = [row for row in hard_fps if _is_object_worn_fp(row)]
+        if object_fps:
+            _add_action(
+                items,
+                "P0",
+                "object_worn_false_positive_cluster",
+                "object_worn/non_human hard negatives",
+                f"object_worn_false_positives={len(object_fps)}",
+                len(object_fps),
+                "Prioritize object-worn/non-human negatives in data collection, hard-negative weighting, and acceptance checks before tuning state-machine latency.",
+            )
+        _add_action(
+            items,
+            "P0",
+            "hard_negative_fp_cluster",
+            "hard_negatives:false_positives",
+            f"false_positive_samples={hard_count}",
+            hard_count,
+            "Prioritize collecting/labeling these negative scenes and add FP-proxy features.",
+        )
+
+    if not window_strata.empty:
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"].isin(["quality_bin", "ood_bin"]))
+            & (df["fn"] > 0)
+            & (df["n_windows"] >= 1),
+        ):
+            _add_action(
+                items,
+                "P1",
+                "fn_low_quality_or_ood",
+                f"{row['dimension']}={row['stratum']}",
+                f"fn={row['fn']}, fn_rate={row['fn_rate']:.4f}",
+                row["n_samples"],
+                "Check Stage1/quality gating and add matching positive low-quality/OOD data.",
+            )
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"].isin(["quality_bin", "ood_bin"]))
+            & (df["fp"] > 0)
+            & (df["n_windows"] >= 1),
+        ):
+            _add_action(
+                items,
+                "P1",
+                "fp_low_quality_or_ood",
+                f"{row['dimension']}={row['stratum']}",
+                f"fp={row['fp']}, fp_rate={row['fp_rate']:.4f}",
+                row["n_samples"],
+                "Try quality-aware threshold or quality gating before changing the state machine.",
+            )
+        overall_acc = float(window_metrics.get("accuracy", 0.0))
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"] == "mode")
+            & (df["accuracy"] < overall_acc - 0.05)
+            & (df["n_windows"] >= max(1, int(min_support))),
+        ):
+            _add_action(
+                items,
+                "P1",
+                "mode_specific_drop",
+                f"mode={row['stratum']}",
+                f"accuracy={row['accuracy']:.4f}, overall={overall_acc:.4f}",
+                row["n_samples"],
+                "Inspect mode-specific feature selection or try a mode-specific threshold on valid only.",
+            )
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"] == "time_bin")
+            & ((df["fp"] + df["fn"]) > 0)
+            & (df["stratum"].astype(str).str.contains("0-10|early|<", regex=True)),
+        ):
+            _add_action(
+                items,
+                "P2",
+                "early_window_errors",
+                f"time_bin={row['stratum']}",
+                f"errors={int(row['fp'] + row['fn'])}",
+                row["n_samples"],
+                "Review skip_initial_windows, warmup behavior, and window ordering.",
+            )
+        for row in _top_rows(
+            window_strata,
+            lambda df: (df["dimension"].isin([
+                "green_support_bin",
+                "green_top2_ratio_bin",
+                "green_top2_corr_bin",
+                "green_weak_gap_bin",
+                "green_stability_bin",
+            ]))
+            & (df["fp"] > 0)
+            & (
+                df["stratum"].astype(str).isin([
+                    "<2of3",
+                    "single_dominant",
+                    "low_corr",
+                    "large_gap",
+                    "low_stability",
+                ])
+            ),
+        ):
+            _add_action(
+                items,
+                "P1",
+                "green_reliability_fp_cluster",
+                f"{row['dimension']}={row['stratum']}",
+                f"fp={row['fp']}, fp_rate={row['fp_rate']:.4f}",
+                row["n_samples"],
+                "Inspect hard negatives with poor three-green reliability; consider keeping these features if they reduce FP on valid/test.",
+            )
+
+    if not model_search_df.empty and "mean_cv_accuracy" in model_search_df.columns:
+        cv_best = pd.to_numeric(model_search_df["mean_cv_accuracy"], errors="coerce").max()
+        if np.isfinite(cv_best) and cv_best - float(window_metrics.get("accuracy", 0.0)) > 0.03:
+            _add_action(
+                items,
+                "P1",
+                "cv_test_generalization_gap",
+                "model_search_vs_test",
+                f"best_cv_accuracy={cv_best:.4f}, test_window_accuracy={window_metrics.get('accuracy', 0.0):.4f}",
+                int(window_metrics.get("n", 0)),
+                "Audit split leakage and record/person/device distribution shift.",
+            )
+        stability = _model_search_stability_summary(model_search_df)
+        if stability.get("available") and stability.get("is_unstable"):
+            _add_action(
+                items,
+                "P2",
+                "model_search_unstable_top_candidates",
+                "model_search_results",
+                (
+                    f"top_margin={stability.get('top_accuracy_margin')}, "
+                    f"close_top={stability.get('close_top_candidate_count')}, "
+                    f"default_rank={stability.get('default_params_rank')}"
+                ),
+                int(window_metrics.get("n", 0)),
+                "Do not trust a single top candidate blindly; inspect top-k stability or increase group-CV repeats.",
+            )
+
+    if not items:
+        _add_action(
+            items,
+            "P3",
+            "no_major_cluster_detected",
+            "overall",
+            "no rule triggered",
+            int(window_metrics.get("n", 0)),
+            "Review summary.md and continue monitoring with larger deployment-like data.",
+        )
+    return pd.DataFrame(items)
+
+
+def _path_map(artifact_dir, split, method):
+    artifact_dir = Path(artifact_dir)
+    return {
+        "end_to_end": _first_existing([
+            artifact_dir / f"end_to_end_eval_{split}_{method}.json",
+            artifact_dir / f"end_to_end_eval_*_{method}.json",
+            artifact_dir / "end_to_end_eval_*.json",
+        ]),
+        "window_error_csv": _first_existing([
+            artifact_dir / f"window_error_analysis_{split}_{method}.csv",
+            artifact_dir / f"window_error_analysis_*_{method}.csv",
+            artifact_dir / "window_error_analysis_*.csv",
+        ]),
+        "hard_negatives": _first_existing([
+            artifact_dir / f"hard_negatives_{split}_{method}.json",
+            artifact_dir / f"hard_negatives_*_{method}.json",
+            artifact_dir / "hard_negatives_*.json",
+        ]),
+        "model_search_results": _first_existing([artifact_dir / "model_search_results.csv"]),
+        "final_model_config": _first_existing([artifact_dir / "final_model_config.json"]),
+    }
+
+
+def _missing_optional_dimensions(window_df, sample_df):
+    missing = []
+    for dim in OPTIONAL_DIMENSIONS:
+        if dim not in window_df.columns and dim not in sample_df.columns:
+            missing.append(dim)
+    return missing
+
+
+def _markdown_summary(summary, action_items):
+    lines = [
+        "# Generalization Audit",
+        "",
+        f"- Split: `{summary['split']}`",
+        f"- Method: `{summary['method']}`",
+        f"- Window accuracy: {summary['window_metrics']['accuracy']:.4f}",
+        f"- Window FP rate: {summary['window_metrics']['fp_rate']:.4f}",
+        f"- Window FN rate: {summary['window_metrics']['fn_rate']:.4f}",
+        f"- Sample false-worn event rate: {summary['sample_metrics']['false_worn_event_rate']:.4f}",
+        f"- Positive first-worn latency P95 sec: {summary['sample_metrics']['first_worn_latency_p95_sec']}",
+        f"- Window group variance: `{summary['group_level_variance']['window_by_group']}`",
+        "",
+        "## Top Action Items",
+        "",
+    ]
+    for row in action_items.head(10).to_dict("records"):
+        lines.append(
+            f"- {row['priority']} `{row['issue_type']}` {row['stratum']}: "
+            f"{row['evidence_metric']} -> {row['suggested_action']}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_audit(artifact_dir, split="test", method="state_machine", min_support=10):
+    """Build the complete read-only audit package for one split/method pair."""
+    artifact_dir = Path(artifact_dir)
+    out_dir = artifact_dir / "generalization_audit"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    paths = _path_map(artifact_dir, split, method)
+    eval_payload = _read_json(paths["end_to_end"])
+    hard_payload = _read_json(paths["hard_negatives"])
+    final_config = _read_json(paths["final_model_config"])
+    window_df = _read_csv(paths["window_error_csv"])
+    model_search_df = _read_csv(paths["model_search_results"])
+    sample_df = _sample_df_from_eval(eval_payload, window_df)
+
+    window_metrics = summarize_window_metrics(window_df)
+    sample_metrics = summarize_sample_metrics(sample_df)
+    group_level_variance = summarize_group_variance(window_df, sample_df)
+    window_strata, sample_strata = build_strata(window_df, sample_df, min_support=min_support)
+    action_items = build_action_items(
+        window_strata,
+        sample_strata,
+        hard_payload,
+        model_search_df,
+        window_metrics,
+        min_support=min_support,
+    )
+
+    summary = {
+        "split": split,
+        "method": method,
+        "input_paths": {k: (str(v) if v else None) for k, v in paths.items()},
+        "missing_optional_dimensions": _missing_optional_dimensions(window_df, sample_df),
+        "min_support": int(min_support),
+        "window_metrics": window_metrics,
+        "sample_metrics": sample_metrics,
+        "group_level_variance": group_level_variance,
+        "model_search": final_config.get("model_search", {}),
+        "green_reliability_feature_usage": green_reliability_feature_usage(final_config),
+        "n_window_strata": int(len(window_strata)),
+        "n_sample_strata": int(len(sample_strata)),
+        "n_action_items": int(len(action_items)),
+    }
+
+    (out_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (out_dir / "summary.md").write_text(
+        _markdown_summary(summary, action_items),
+        encoding="utf-8",
+    )
+    window_strata.to_csv(out_dir / "window_strata.csv", index=False)
+    sample_strata.to_csv(out_dir / "sample_strata.csv", index=False)
+    action_items.to_csv(out_dir / "action_items.csv", index=False)
+
+    # Export audit heatmap visualisation
+    try:
+        export_audit_heatmap(window_strata, out_dir, min_support=min_support)
+    except Exception as e:
+        print(f"[WARN] audit heatmap export failed: {e}")
+    try:
+        export_audit_ranked_error_bars(window_strata, sample_strata, out_dir)
+    except Exception as e:
+        print(f"[WARN] audit ranked error bars export failed: {e}")
+    try:
+        export_audit_latency_distribution(sample_df, out_dir)
+    except Exception as e:
+        print(f"[WARN] audit latency distribution export failed: {e}")
+
+    return {
+        "out_dir": str(out_dir),
+        "summary": summary,
+        "paths": {
+            "summary_json": str(out_dir / "summary.json"),
+            "summary_md": str(out_dir / "summary.md"),
+            "window_strata": str(out_dir / "window_strata.csv"),
+            "sample_strata": str(out_dir / "sample_strata.csv"),
+            "action_items": str(out_dir / "action_items.csv"),
+            "ranked_error_bars": str(out_dir / "audit_ranked_error_bars.png"),
+            "latency_distribution": str(out_dir / "audit_latency_distribution.png"),
+        },
+    }
+
+
+def export_audit_ranked_error_bars(window_strata, sample_strata, out_dir, top_k=15):
+    """Export ranked FP/FN bars for deployment-relevant audit strata."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip audit ranked error bars: {e}")
+        return None
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for level, df in [("window", window_strata), ("sample", sample_strata)]:
+        if df is None or len(df) == 0:
+            continue
+        work = df.copy()
+        work["level"] = level
+        frames.append(work)
+    if frames:
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+    else:
+        combined = pd.DataFrame(columns=["level", "dimension", "stratum", "fp", "fn"])
+
+    for col in ["fp", "fn"]:
+        if col not in combined.columns:
+            combined[col] = 0
+        combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0).astype(int)
+    combined["total_errors"] = combined["fp"] + combined["fn"]
+    ranked = combined[combined["total_errors"] > 0].copy()
+    ranked = ranked.sort_values(["total_errors", "fp", "fn"], ascending=False).head(int(top_k))
+    source_path = out_dir / "audit_ranked_error_bars.csv"
+    ranked.to_csv(source_path, index=False)
+
+    fig, ax = plt.subplots(figsize=(11, max(4.0, 0.42 * max(len(ranked), 1) + 1.2)), facecolor="white")
+    if ranked.empty:
+        ax.text(0.5, 0.5, "No FP/FN strata above support threshold", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        labels = [
+            f"{row.level}:{row.dimension}={str(row.stratum)[:28]}"
+            for row in ranked.itertuples(index=False)
+        ][::-1]
+        fp_vals = ranked["fp"].to_numpy(dtype=int)[::-1]
+        fn_vals = ranked["fn"].to_numpy(dtype=int)[::-1]
+        y = np.arange(len(labels))
+        ax.barh(y, fp_vals, color="#c44e52", label="FP")
+        ax.barh(y, fn_vals, left=fp_vals, color="#4c78a8", label="FN")
+        ax.set_yticks(y, labels, fontsize=8)
+        ax.set_xlabel("error count")
+        ax.set_title("Ranked FP/FN Strata")
+        ax.grid(axis="x", alpha=0.18)
+        ax.legend(frameon=False, loc="lower right")
+    fig.tight_layout()
+    out_path = out_dir / "audit_ranked_error_bars.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] audit ranked error bars -> {out_path}")
+    return str(out_path)
+
+
+def export_audit_latency_distribution(sample_df, out_dir):
+    """Export first-worn latency distribution and false-worn sample count."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip audit latency distribution: {e}")
+        return None
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    latencies = _first_worn_latencies(sample_df)
+    false_worn_count = 0
+    true_negative_count = 0
+    if sample_df is not None and not sample_df.empty and {"target", "pred"}.issubset(sample_df.columns):
+        target = pd.to_numeric(sample_df["target"], errors="coerce").fillna(0).astype(int)
+        pred = pd.to_numeric(sample_df["pred"], errors="coerce").fillna(0).astype(int)
+        false_worn_count = int(((target == 0) & (pred == 1)).sum())
+        true_negative_count = int((target == 0).sum())
+    pd.DataFrame({"first_worn_latency_sec": latencies}).to_csv(
+        out_dir / "audit_latency_distribution.csv",
+        index=False,
+    )
+
+    fig = plt.figure(figsize=(10, 5), facecolor="white")
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.35, 0.8], wspace=0.25)
+    ax_hist = fig.add_subplot(gs[0, 0])
+    if latencies:
+        ax_hist.hist(latencies, bins=min(12, max(4, len(latencies))), color="#4c78a8", alpha=0.78)
+        ax_hist.axvline(np.percentile(latencies, 95), color="#c44e52", linestyle="--", linewidth=1.4, label="P95")
+        ax_hist.legend(frameon=False)
+    else:
+        ax_hist.text(0.5, 0.5, "No positive first-worn latency values", ha="center", va="center")
+    ax_hist.set_xlabel("first-worn latency (sec)")
+    ax_hist.set_ylabel("positive samples")
+    ax_hist.set_title("Positive Output Latency")
+    ax_hist.grid(axis="y", alpha=0.18)
+
+    ax_bar = fig.add_subplot(gs[0, 1])
+    ax_bar.bar(["false worn", "target=0"], [false_worn_count, true_negative_count],
+               color=["#c44e52", "#9aa6ac"])
+    ax_bar.set_title("Negative Sample Risk")
+    ax_bar.set_ylabel("samples")
+    ax_bar.grid(axis="y", alpha=0.18)
+
+    fig.suptitle("Latency and False-Worn Summary", fontsize=14, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    out_path = out_dir / "audit_latency_distribution.png"
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] audit latency distribution -> {out_path}")
+    return str(out_path)
+
+
+def export_audit_heatmap(strata_df, out_dir, min_support=10):
+    """Export heatmap of stratified evaluation metrics across dimensions."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip audit heatmap: {e}")
+        return None
+
+    if strata_df is None or len(strata_df) == 0:
+        print("[WARN] empty strata, skip audit heatmap")
+        return None
+
+    df = strata_df.copy()
+    out_path = os.path.join(str(out_dir), "audit_strata_heatmap.png")
+    os.makedirs(str(out_dir), exist_ok=True)
+
+    # Select columns for the heatmap
+    metric_cols = ["accuracy", "precision", "recall", "fp_rate"]
+    metric_cols = [c for c in metric_cols if c in df.columns]
+    if not metric_cols:
+        print("[WARN] no metric columns in strata, skip audit heatmap")
+        return None
+
+    # Build "dimension:stratum" labels
+    dim_col = "dimension" if "dimension" in df.columns else None
+    strat_col = "stratum" if "stratum" in df.columns else None
+    if dim_col and strat_col:
+        df["label"] = df[dim_col].astype(str) + ":" + df[strat_col].astype(str)
+    elif strat_col:
+        df["label"] = df[strat_col].astype(str)
+    else:
+        df["label"] = df.index.astype(str)
+
+    # Sort by accuracy descending
+    if "accuracy" in df.columns:
+        df = df.sort_values("accuracy", ascending=False)
+    if "n_windows" in df.columns:
+        low_mask = df["n_windows"] < min_support
+    else:
+        low_mask = pd.Series(False, index=df.index)
+
+    # Truncate to top 50 for readability
+    max_rows = 50
+    if len(df) > max_rows:
+        df = df.head(max_rows)
+        low_mask = low_mask.loc[df.index]
+
+    n_rows = len(df)
+    n_cols = len(metric_cols)
+    heatmap_data = df[metric_cols].values.astype(float)
+
+    # Handle fp_rate: lower is better, so invert
+    display_data = heatmap_data.copy()
+    fp_idx = metric_cols.index("fp_rate") if "fp_rate" in metric_cols else None
+
+    # Build a masked array for low-support strata
+    mask = np.tile(low_mask.values.reshape(-1, 1), (1, n_cols))
+
+    fig_height = max(6, 2.5 + 0.22 * n_rows)
+    fig, axes = plt.subplots(1, n_cols, figsize=(3.5 * n_cols, fig_height),
+                              facecolor="white", squeeze=False)
+    axes = axes[0]
+
+    cmap = plt.cm.RdYlGn
+    for idx, metric in enumerate(metric_cols):
+        ax = axes[idx]
+        col_data = display_data[:, idx].reshape(-1, 1)
+        col_mask = mask[:, idx].reshape(-1, 1)
+
+        if idx == fp_idx:
+            # Invert fp_rate: lower is better → higher score on heatmap
+            col_data = 1.0 - np.clip(col_data, 0, 1)
+
+        masked_data = np.ma.array(col_data, mask=col_mask)
+        im = ax.imshow(masked_data, aspect="auto", cmap=cmap, vmin=0, vmax=1,
+                        interpolation="nearest")
+        ax.set_xticks([])
+        ax.set_yticks(range(n_rows))
+        ax.set_yticklabels(df["label"].values, fontsize=7)
+        ax.set_title(metric.replace("_", " ").title(), fontsize=10)
+        # Low-support hatching
+        for r in range(n_rows):
+            if low_mask.iloc[r]:
+                ax.axhline(y=r, color="#9aa6ac", linewidth=1.5, alpha=0.4)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"Generalization Audit — Stratified Metrics (min_support={min_support})",
+                 fontsize=14, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] audit heatmap -> {out_path}")
+    return out_path
+
+
 if __name__ == "__main__":
     main()
+

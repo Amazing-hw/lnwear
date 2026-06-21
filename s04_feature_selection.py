@@ -20,17 +20,28 @@ import argparse
 import pickle
 import logging
 import time
+import re
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 
 from sklearn.model_selection import GroupKFold
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import (roc_auc_score, accuracy_score, precision_score,
                               recall_score, f1_score, confusion_matrix)
+from sklearn.decomposition import PCA
+from sklearn.impute import SimpleImputer
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
 
 from s03_extract_feature_pool import (
     DEPLOYMENT_ALLOWED_FFT_FEATURES as S03_DEPLOYMENT_ALLOWED_FFT_FEATURES,
@@ -1049,6 +1060,121 @@ def shap_consistency_check(df_train, df_valid, feature_cols):
         "shap_valid": shap_valid,
         "suspicious_train_only": suspicious,
     }
+
+
+def export_shap_importance_plot(shap_train, shap_valid, spearman_rho, topk_overlap,
+                                suspicious, selected_features, artifact_dir):
+    """Export SHAP feature importance and consistency visualisation."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip SHAP plot: {e}")
+        return None
+
+    out_dir = os.path.join(str(artifact_dir), "report_plots")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "s04_shap_importance.png")
+
+    shap_items_tr = sorted(shap_train.items(), key=lambda kv: kv[1], reverse=True) if shap_train else []
+    top_n = min(20, len(shap_items_tr))
+    selected_set = set(selected_features or [])
+
+    fig = plt.figure(figsize=(14, 10), facecolor="white")
+    gs = fig.add_gridspec(2, 2, hspace=0.30, wspace=0.28)
+
+    # (0,0) SHAP bar — top 20 features from train
+    ax_bar = fig.add_subplot(gs[0, 0])
+    if shap_items_tr:
+        top_items = shap_items_tr[:top_n][::-1]
+        names = [x[0] for x in top_items]
+        vals = [x[1] for x in top_items]
+        colors = [
+            "#2f6f73" if name in selected_set else "#9aa6ac"
+            for name in names
+        ]
+        ax_bar.barh(np.arange(len(names)), vals, color=colors, height=0.68)
+        ax_bar.set_yticks(np.arange(len(names)))
+        ax_bar.set_yticklabels(names, fontsize=8)
+        ax_bar.set_xlabel("mean(|SHAP|)")
+        ax_bar.set_title(f"SHAP Feature Importance (Top {top_n})")
+        ax_bar.grid(axis="x", alpha=0.18)
+    else:
+        ax_bar.text(0.5, 0.5, "No SHAP data", ha="center", va="center")
+        ax_bar.set_axis_off()
+        ax_bar.set_title("SHAP Feature Importance")
+
+    # (0,1) Train vs Valid SHAP scatter
+    ax_sc = fig.add_subplot(gs[0, 1])
+    common = [f for f in shap_train if f in shap_valid]
+    if common and len(common) >= 2:
+        x_vals = [shap_train[f] for f in common]
+        y_vals = [shap_valid[f] for f in common]
+        min_v = min(min(x_vals), min(y_vals)) * 0.9
+        max_v = max(max(x_vals), max(y_vals)) * 1.1
+        ax_sc.scatter(x_vals, y_vals, c="#4c78a8", alpha=0.7, s=22, edgecolors="none")
+        ax_sc.plot([min_v, max_v], [min_v, max_v], color="#9aa6ac", linewidth=1.2, linestyle="--")
+        rho_text = f"ρ = {spearman_rho:.4f}" if spearman_rho is not None else "ρ = N/A"
+        ax_sc.text(0.05, 0.95, rho_text, transform=ax_sc.transAxes, fontsize=11, va="top",
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor="#f4f6f7", edgecolor="#d9dee2"))
+        ax_sc.set_xlim(min_v, max_v)
+        ax_sc.set_ylim(min_v, max_v)
+    else:
+        ax_sc.text(0.5, 0.5, "Insufficient features for comparison",
+                   ha="center", va="center")
+        ax_sc.set_axis_off()
+    ax_sc.set_xlabel("Train mean(|SHAP|)")
+    ax_sc.set_ylabel("Valid mean(|SHAP|)")
+    ax_sc.set_title("Train vs Valid SHAP Consistency")
+    ax_sc.grid(alpha=0.18)
+
+    # (1,0) Top-K overlap bar
+    ax_ov = fig.add_subplot(gs[1, 0])
+    k_vals = [3, 5, 10, 15, 20]
+    bar_vals = []
+    for kval in k_vals:
+        k_eff = min(kval, len(common)) if common else 0
+        if k_eff <= 0:
+            bar_vals.append(0.0)
+            continue
+        top_tr_k = set(sorted(common, key=lambda f: shap_train.get(f, 0.0), reverse=True)[:k_eff])
+        top_va_k = set(sorted(common, key=lambda f: shap_valid.get(f, 0.0), reverse=True)[:k_eff])
+        bar_vals.append(len(top_tr_k & top_va_k) / float(k_eff))
+    colors_ov = ["#2f6f73" if v >= 0.6 else "#d35f2d" if v < 0.4 else "#8172b2" for v in bar_vals]
+    ax_ov.bar(range(len(k_vals)), bar_vals, color=colors_ov, width=0.6)
+    ax_ov.set_xticks(range(len(k_vals)))
+    ax_ov.set_xticklabels([f"k={k}" for k in k_vals])
+    ax_ov.set_ylim(0, 1.05)
+    ax_ov.set_ylabel("Overlap Ratio")
+    ax_ov.set_title("Top-K Feature Overlap (Train ∩ Valid)")
+    ax_ov.grid(axis="y", alpha=0.18)
+    for i, v in enumerate(bar_vals):
+        ax_ov.text(i, v + 0.02, f"{v:.2f}", ha="center", fontsize=9)
+
+    # (1,1) Suspicious train-only features
+    ax_sus = fig.add_subplot(gs[1, 1])
+    if suspicious:
+        sus_names = [s["feature"] for s in suspicious[:15]][::-1]
+        sus_vals = [s["shap_train"] for s in suspicious[:15]][::-1]
+        ax_sus.barh(np.arange(len(sus_names)), sus_vals, color="#c44e52", height=0.6)
+        ax_sus.set_yticks(np.arange(len(sus_names)))
+        ax_sus.set_yticklabels(sus_names, fontsize=8)
+        ax_sus.set_xlabel("Train mean(|SHAP|)")
+        ax_sus.set_title(f"Train-only Strong Features ({len(suspicious)} found)")
+    else:
+        ax_sus.text(0.5, 0.5, "No suspicious train-only features",
+                    ha="center", va="center", fontsize=13, color="#2f6f73")
+        ax_sus.set_axis_off()
+        ax_sus.set_title("Train-only Strong Features")
+    ax_sus.grid(axis="x", alpha=0.18)
+
+    fig.suptitle("SHAP Feature Importance Report", fontsize=16, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] s04 SHAP plot -> {out_path}")
+    return out_path
 
 
 # 标量绝对量纲（依赖原始 ADC 数值大小）的特征清单。
@@ -2289,6 +2415,941 @@ def main(args=None):
 
 
     export_feature_selection_report_plot(result, args.artifact_dir)
+
+    # Export SHAP importance plot when SHAP is available
+    if SHAP_AVAILABLE:
+        shap_train = result.get("shap_importance", {}) or {}
+        shap_check = result.get("shap_consistency", {}) or {}
+        if shap_train and shap_check.get("available"):
+            try:
+                export_shap_importance_plot(
+                    shap_train=shap_train,
+                    shap_valid=shap_check.get("shap_valid", {}),
+                    spearman_rho=shap_check.get("spearman_rho"),
+                    topk_overlap=shap_check.get("topk_overlap", 0.0),
+                    suspicious=shap_check.get("suspicious_train_only", []),
+                    selected_features=result.get("selected_features", []),
+                    artifact_dir=args.artifact_dir,
+                )
+            except Exception as e:
+                print(f"[WARN] SHAP plot export failed: {e}")
+    else:
+        print("(s04 SHAP plot: shap unavailable, skipped)")
+
+
+# =========================================================
+# Feature embedding report utilities (formerly s11).
+# =========================================================
+FEATURE_POOL_FILES = {
+    "train": "feature_pool_train.csv",
+    "valid": "feature_pool_valid.csv",
+    "test": "feature_pool_test.csv",
+}
+
+META_COLUMNS = {
+    "sample_name",
+    "h5_file",
+    "target",
+    "start_100hz",
+    "start_sec",
+    "window_index",
+    "mode",
+    "split",
+}
+
+LABEL_COLORS = {
+    0: "#4C78A8",
+    1: "#D65F5F",
+}
+
+METHOD_TITLES = {
+    "pca": "PCA",
+    "tsne": "t-SNE",
+    "umap": "UMAP",
+}
+
+
+def _normalize_list(values: Iterable[str]) -> Tuple[str, ...]:
+    return tuple(str(v).strip().lower() for v in values if str(v).strip())
+
+
+def _parse_csv_list(value: str, cast=str) -> Tuple:
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    return tuple(cast(p) for p in parts)
+
+
+def _set_nature_style() -> None:
+    plt.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans"],
+            "font.size": 7,
+            "axes.labelsize": 7,
+            "axes.titlesize": 8,
+            "xtick.labelsize": 6,
+            "ytick.labelsize": 6,
+            "legend.fontsize": 6,
+            "axes.linewidth": 0.6,
+            "xtick.major.width": 0.5,
+            "ytick.major.width": 0.5,
+            "xtick.major.size": 2.5,
+            "ytick.major.size": 2.5,
+            "figure.dpi": 160,
+            "savefig.dpi": 600,
+            "savefig.bbox": "tight",
+            "savefig.pad_inches": 0.03,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+            "svg.fonttype": "none",
+        }
+    )
+
+
+def load_feature_pools(artifact_dir: Path) -> Tuple[pd.DataFrame, List[str]]:
+    frames = []
+    for split, filename in FEATURE_POOL_FILES.items():
+        path = artifact_dir / filename
+        if not path.exists():
+            continue
+        df = pd.read_csv(path)
+        if len(df) == 0:
+            continue
+        df = df.copy()
+        df["split"] = split
+        frames.append(df)
+
+    if not frames:
+        expected = ", ".join(FEATURE_POOL_FILES.values())
+        raise FileNotFoundError(f"No non-empty feature pools found in {artifact_dir}; expected {expected}")
+
+    data = pd.concat(frames, ignore_index=True, sort=False)
+    if "target" not in data.columns:
+        raise ValueError("Feature pools must contain a 'target' column")
+
+    numeric_cols = list(data.select_dtypes(include=[np.number]).columns)
+    feature_cols = [c for c in numeric_cols if c not in META_COLUMNS]
+    if not feature_cols:
+        raise ValueError("No numeric feature columns found after excluding metadata columns")
+
+    return data, feature_cols
+
+
+def _sample_rows(df: pd.DataFrame, max_points: int, random_state: int) -> pd.DataFrame:
+    if max_points is None or max_points <= 0 or len(df) <= max_points:
+        return df.copy()
+
+    group_cols = [c for c in ["target", "split"] if c in df.columns]
+    if not group_cols:
+        return df.sample(n=max_points, random_state=random_state).sort_index().reset_index(drop=True)
+
+    rng = np.random.default_rng(random_state)
+    pieces = []
+    grouped = list(df.groupby(group_cols, dropna=False, sort=False))
+    total = len(df)
+    remaining = max_points
+    for idx, (_, group) in enumerate(grouped):
+        if idx == len(grouped) - 1:
+            take = min(len(group), remaining)
+        else:
+            take = max(1, int(round(max_points * len(group) / total)))
+            take = min(len(group), take, remaining - (len(grouped) - idx - 1))
+        remaining -= take
+        seed = int(rng.integers(0, np.iinfo(np.int32).max))
+        pieces.append(group.sample(n=take, random_state=seed))
+
+    return pd.concat(pieces).sort_index().reset_index(drop=True)
+
+
+def prepare_matrix(
+    df: pd.DataFrame,
+    feature_cols: Sequence[str],
+    max_points: int,
+    random_state: int,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    sampled = _sample_rows(df, int(max_points), int(random_state))
+    raw = sampled.loc[:, feature_cols].replace([np.inf, -np.inf], np.nan)
+    imputed = SimpleImputer(strategy="median").fit_transform(raw)
+    scaled = StandardScaler().fit_transform(imputed)
+    return sampled.reset_index(drop=True), scaled
+
+
+def _pad_components(values: np.ndarray, dim: int) -> np.ndarray:
+    if values.shape[1] >= dim:
+        return values[:, :dim]
+    padded = np.zeros((values.shape[0], dim), dtype=float)
+    padded[:, : values.shape[1]] = values
+    return padded
+
+
+def _pca_axis_labels(explained_variance_ratio: Sequence[float], dims: Sequence[int]) -> List[str]:
+    max_dim = max([int(d) for d in dims if int(d) in {2, 3}] or [2])
+    labels = []
+    for idx in range(max_dim):
+        if idx < len(explained_variance_ratio):
+            labels.append(f"PC{idx + 1} ({100.0 * float(explained_variance_ratio[idx]):.1f}%)")
+        else:
+            labels.append(f"PC{idx + 1}")
+    return labels
+
+
+def compute_embeddings(
+    x: np.ndarray,
+    methods: Sequence[str],
+    dims: Sequence[int],
+    random_state: int,
+    perplexity: float,
+) -> Tuple[Dict[str, Dict[int, np.ndarray]], Dict[str, Mapping[str, object]]]:
+    requested_methods = _normalize_list(methods)
+    requested_dims = tuple(sorted({int(d) for d in dims if int(d) in {2, 3}}))
+    embeddings: Dict[str, Dict[int, np.ndarray]] = {}
+    status: Dict[str, Mapping[str, object]] = {}
+
+    if x.shape[0] < 3:
+        raise ValueError("At least 3 windows are required for 2D/3D embedding figures")
+
+    if "pca" in requested_methods:
+        n_components = min(3, x.shape[0], x.shape[1])
+        pca = PCA(n_components=n_components, random_state=random_state)
+        coords = pca.fit_transform(x)
+        embeddings["pca"] = {dim: _pad_components(coords, dim) for dim in requested_dims}
+        explained = [float(v) for v in pca.explained_variance_ratio_]
+        status["pca"] = {
+            "status": "ok",
+            "explained_variance_ratio": explained,
+            "axis_labels": _pca_axis_labels(explained, requested_dims),
+        }
+
+    if "tsne" in requested_methods:
+        if x.shape[0] < 5:
+            status["tsne"] = {"status": "skipped", "reason": "need at least 5 windows for stable t-SNE"}
+        else:
+            method_embeddings = {}
+            effective_perplexity = min(float(perplexity), max(2.0, (x.shape[0] - 1) / 3.0))
+            for dim in requested_dims:
+                init = "pca" if x.shape[1] >= dim else "random"
+                model = TSNE(
+                    n_components=dim,
+                    init=init,
+                    learning_rate="auto",
+                    perplexity=effective_perplexity,
+                    random_state=random_state,
+                    metric="euclidean",
+                )
+                method_embeddings[dim] = model.fit_transform(x)
+            embeddings["tsne"] = method_embeddings
+            status["tsne"] = {"status": "ok", "perplexity": float(effective_perplexity)}
+
+    if "umap" in requested_methods:
+        try:
+            from umap import UMAP  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on optional package
+            status["umap"] = {
+                "status": "skipped",
+                "reason": f"umap-learn is not installed ({exc.__class__.__name__})",
+            }
+        else:  # pragma: no cover - optional package is absent in CI by default
+            n_neighbors = min(30, max(2, x.shape[0] - 1))
+            method_embeddings = {}
+            for dim in requested_dims:
+                model = UMAP(
+                    n_components=dim,
+                    n_neighbors=n_neighbors,
+                    min_dist=0.12,
+                    metric="euclidean",
+                    random_state=random_state,
+                )
+                method_embeddings[dim] = model.fit_transform(x)
+            embeddings["umap"] = method_embeddings
+            status["umap"] = {"status": "ok", "n_neighbors": int(n_neighbors), "min_dist": 0.12}
+
+    return embeddings, status
+
+
+def _axis_label(method: str, axis_idx: int, method_info: Optional[Mapping[str, object]] = None) -> str:
+    if method == "pca":
+        if method_info:
+            labels = method_info.get("axis_labels")
+            if isinstance(labels, Sequence) and not isinstance(labels, str) and axis_idx < len(labels):
+                return str(labels[axis_idx])
+        return f"PC{axis_idx + 1}"
+    if method == "tsne":
+        return f"t-SNE {axis_idx + 1}"
+    return f"UMAP {axis_idx + 1}"
+
+
+def _format_axes_2d(ax, method: str, method_info: Optional[Mapping[str, object]] = None) -> None:
+    ax.set_xlabel(_axis_label(method, 0, method_info))
+    ax.set_ylabel(_axis_label(method, 1, method_info))
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, linewidth=0.25, color="#D9D9D9", alpha=0.55)
+    ax.set_axisbelow(True)
+
+
+def _format_axes_3d(ax, method: str, method_info: Optional[Mapping[str, object]] = None) -> None:
+    ax.set_xlabel(_axis_label(method, 0, method_info), labelpad=-2)
+    ax.set_ylabel(_axis_label(method, 1, method_info), labelpad=-2)
+    ax.set_zlabel(_axis_label(method, 2, method_info), labelpad=-2)
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.grid(True, linewidth=0.25, color="#D9D9D9", alpha=0.45)
+    ax.view_init(elev=24, azim=38)
+
+
+def _plot_points(ax, coords: np.ndarray, labels: np.ndarray, dim: int) -> None:
+    unique_labels = sorted(pd.Series(labels).dropna().unique().tolist())
+    for label in unique_labels:
+        mask = labels == label
+        color = LABEL_COLORS.get(int(label), "#6F6F6F") if str(label).lstrip("-").isdigit() else "#6F6F6F"
+        label_text = f"label={label}"
+        if dim == 2:
+            ax.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                s=14,
+                marker="o",
+                c=color,
+                edgecolors="white",
+                linewidths=0.18,
+                alpha=0.76,
+                label=label_text,
+            )
+        else:
+            ax.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                coords[mask, 2],
+                s=12,
+                marker="o",
+                c=color,
+                edgecolors="white",
+                linewidths=0.12,
+                alpha=0.72,
+                depthshade=False,
+                label=label_text,
+            )
+
+
+def _save_figure(fig, stem: Path, formats: Sequence[str], dpi: int) -> List[str]:
+    paths = []
+    for fmt in formats:
+        out = stem.with_suffix(f".{fmt}")
+        save_kwargs = {"dpi": dpi}
+        if fmt.lower() in {"png", "tif", "tiff"}:
+            save_kwargs["facecolor"] = "white"
+        fig.savefig(out, **save_kwargs)
+        paths.append(str(out))
+    return paths
+
+
+def _safe_feature_name(name: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(name)).strip("._")
+    return safe or "feature"
+
+
+def load_selected_features(artifact_dir: Path, available_features: Sequence[str]) -> Tuple[List[str], Mapping[str, object]]:
+    path = artifact_dir / "selected_features.json"
+    if not path.exists():
+        return [], {"status": "skipped", "reason": "selected_features.json not found"}
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        selected = [str(x) for x in payload]
+    else:
+        selected = [str(x) for x in payload.get("selected_features", [])]
+
+    available = set(available_features)
+    present = [name for name in selected if name in available]
+    missing = [name for name in selected if name not in available]
+    status = {
+        "status": "ok" if present else "skipped",
+        "n_features": len(present),
+        "selected_features": present,
+        "missing_features": missing,
+    }
+    if not present:
+        status["reason"] = "selected_features.json did not contain any features present in the feature pools"
+    return present, status
+
+
+def _plot_feature_distribution(
+    df: pd.DataFrame,
+    feature: str,
+    feature_index: int,
+    out_dir: Path,
+    formats: Sequence[str],
+    dpi: int,
+    random_state: int,
+) -> List[str]:
+    plot_df = df.loc[:, ["target", feature]].copy()
+    plot_df[feature] = pd.to_numeric(plot_df[feature], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    plot_df = plot_df.dropna(subset=["target", feature])
+
+    fig, ax = plt.subplots(figsize=(3.7, 2.8))
+    if len(plot_df) == 0:
+        ax.text(0.5, 0.5, "No finite values", ha="center", va="center", transform=ax.transAxes)
+    else:
+        labels = sorted(plot_df["target"].dropna().unique().tolist())
+        rng = np.random.default_rng(int(random_state) + int(feature_index))
+        positions = np.arange(len(labels), dtype=float)
+        groups = [plot_df.loc[plot_df["target"] == label, feature].to_numpy(dtype=float) for label in labels]
+
+        violin = ax.violinplot(
+            groups,
+            positions=positions,
+            widths=0.68,
+            showmeans=False,
+            showmedians=False,
+            showextrema=False,
+        )
+        for body in violin["bodies"]:
+            body.set_facecolor("#E8E8E8")
+            body.set_edgecolor("#A0A0A0")
+            body.set_linewidth(0.5)
+            body.set_alpha(0.55)
+
+        box = ax.boxplot(
+            groups,
+            positions=positions,
+            widths=0.24,
+            patch_artist=True,
+            showfliers=False,
+            medianprops={"color": "#202020", "linewidth": 0.9},
+            boxprops={"facecolor": "white", "edgecolor": "#404040", "linewidth": 0.65},
+            whiskerprops={"color": "#404040", "linewidth": 0.6},
+            capprops={"color": "#404040", "linewidth": 0.6},
+        )
+        for patch in box["boxes"]:
+            patch.set_alpha(0.82)
+
+        for pos, label, values in zip(positions, labels, groups):
+            jitter = rng.normal(0.0, 0.045, size=len(values))
+            color = LABEL_COLORS.get(int(label), "#6F6F6F") if str(label).lstrip("-").isdigit() else "#6F6F6F"
+            ax.scatter(
+                np.full(len(values), pos) + jitter,
+                values,
+                s=8,
+                marker="o",
+                c=color,
+                edgecolors="white",
+                linewidths=0.12,
+                alpha=0.55,
+                label=f"label={label}",
+                zorder=3,
+            )
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels([f"label={label}" for label in labels])
+        ax.legend(frameon=False, loc="best", handletextpad=0.25, borderpad=0.2)
+
+    ax.set_title(feature)
+    ax.set_xlabel("Target label")
+    ax.set_ylabel("Feature value")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, axis="y", linewidth=0.25, color="#D9D9D9", alpha=0.55)
+    ax.set_axisbelow(True)
+
+    stem = out_dir / f"feature_distribution_{feature_index:02d}_{_safe_feature_name(feature)}"
+    paths = _save_figure(fig, stem, formats, dpi)
+    plt.close(fig)
+    return paths
+
+
+def summarize_selected_feature_distributions(
+    df: pd.DataFrame,
+    selected_features: Sequence[str],
+) -> Dict[str, Mapping[str, object]]:
+    stats: Dict[str, Mapping[str, object]] = {}
+    if "target" not in df.columns:
+        return stats
+
+    y = pd.to_numeric(df["target"], errors="coerce")
+    for feature in selected_features:
+        values = pd.to_numeric(df.get(feature), errors="coerce").replace([np.inf, -np.inf], np.nan)
+        valid = pd.DataFrame({"target": y, "value": values}).dropna()
+        if valid.empty:
+            stats[feature] = {"status": "empty"}
+            continue
+        labels = sorted(valid["target"].astype(int).unique().tolist())
+        row: Dict[str, object] = {
+            "status": "ok",
+            "n": int(len(valid)),
+            "labels": labels,
+        }
+        for label in labels:
+            group = valid.loc[valid["target"].astype(int) == int(label), "value"].to_numpy(dtype=float)
+            row[f"label_{label}_n"] = int(len(group))
+            row[f"label_{label}_mean"] = float(np.mean(group)) if len(group) else None
+            row[f"label_{label}_median"] = float(np.median(group)) if len(group) else None
+        if len(labels) == 2:
+            lo, hi = labels[0], labels[1]
+            lo_values = valid.loc[valid["target"].astype(int) == int(lo), "value"].to_numpy(dtype=float)
+            hi_values = valid.loc[valid["target"].astype(int) == int(hi), "value"].to_numpy(dtype=float)
+            if len(lo_values) and len(hi_values):
+                row["mean_diff_label_high_minus_low"] = float(np.mean(hi_values) - np.mean(lo_values))
+                row["median_diff_label_high_minus_low"] = float(np.median(hi_values) - np.median(lo_values))
+                try:
+                    auc = float(roc_auc_score(valid["target"].astype(int), valid["value"].to_numpy(dtype=float)))
+                    row["auc"] = auc
+                    row["auc_separation"] = float(max(auc, 1.0 - auc))
+                except Exception:
+                    row["auc"] = None
+                    row["auc_separation"] = None
+        stats[feature] = row
+    return stats
+
+
+def _write_selected_feature_distribution_source(
+    out_dir: Path,
+    df: pd.DataFrame,
+    selected_features: Sequence[str],
+) -> Optional[Path]:
+    if not selected_features:
+        return None
+    columns = [c for c in ["split", "sample_name", "h5_file", "target", "start_sec", "window_index", "mode"] if c in df.columns]
+    source = df.loc[:, columns + list(selected_features)].copy()
+    path = out_dir / "selected_feature_distribution_source_data.csv"
+    source.to_csv(path, index=False)
+    return path
+
+
+def plot_selected_feature_distributions(
+    out_dir: Path,
+    df: pd.DataFrame,
+    selected_features: Sequence[str],
+    formats: Sequence[str],
+    dpi: int,
+    random_state: int,
+) -> Tuple[Dict[str, List[str]], Optional[Path]]:
+    figure_paths: Dict[str, List[str]] = {}
+    for idx, feature in enumerate(selected_features, start=1):
+        key = f"feature_distribution_{idx:02d}_{_safe_feature_name(feature)}"
+        figure_paths[key] = _plot_feature_distribution(
+            df=df,
+            feature=feature,
+            feature_index=idx,
+            out_dir=out_dir,
+            formats=formats,
+            dpi=dpi,
+            random_state=random_state,
+        )
+    source_path = _write_selected_feature_distribution_source(out_dir, df, selected_features)
+    return figure_paths, source_path
+
+
+def _plot_selected_feature_correlation_heatmap(
+    out_dir: Path,
+    df: pd.DataFrame,
+    selected_features: Sequence[str],
+    formats: Sequence[str],
+    dpi: int,
+) -> List[str]:
+    if len(selected_features) < 2:
+        return []
+    matrix = df.loc[:, list(selected_features)].apply(pd.to_numeric, errors="coerce")
+    corr = matrix.replace([np.inf, -np.inf], np.nan).corr(method="pearson")
+    if corr.empty:
+        return []
+
+    fig_size = max(3.2, 0.34 * len(selected_features) + 1.5)
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size))
+    im = ax.imshow(corr.to_numpy(dtype=float), vmin=-1, vmax=1, cmap="coolwarm")
+    ax.set_xticks(np.arange(len(corr.columns)))
+    ax.set_yticks(np.arange(len(corr.index)))
+    ax.set_xticklabels(corr.columns, rotation=45, ha="right", fontsize=6)
+    ax.set_yticklabels(corr.index, fontsize=6)
+    ax.set_title("Selected feature correlation")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Pearson r")
+    fig.tight_layout()
+    paths = _save_figure(fig, out_dir / "selected_feature_correlation_heatmap", formats, dpi)
+    plt.close(fig)
+    return paths
+
+
+def _plot_pca_loading_top_features(
+    out_dir: Path,
+    x: np.ndarray,
+    feature_cols: Sequence[str],
+    formats: Sequence[str],
+    dpi: int,
+    top_n: int = 15,
+) -> List[str]:
+    if x.shape[0] < 2 or x.shape[1] < 1:
+        return []
+    n_components = min(2, x.shape[0], x.shape[1])
+    pca = PCA(n_components=n_components, random_state=0)
+    pca.fit(x)
+    loading_strength = np.sum(np.abs(pca.components_), axis=0)
+    order = np.argsort(loading_strength)[::-1][: min(int(top_n), len(feature_cols))]
+    names = [str(feature_cols[i]) for i in order][::-1]
+    values = [float(loading_strength[i]) for i in order][::-1]
+
+    fig, ax = plt.subplots(figsize=(4.2, max(2.6, 0.22 * len(names) + 1.0)))
+    ax.barh(np.arange(len(names)), values, color="#4C78A8", height=0.68)
+    ax.set_yticks(np.arange(len(names)))
+    ax.set_yticklabels(names, fontsize=6)
+    ax.set_xlabel("|PC loading| sum")
+    ax.set_title("Top PCA loading features")
+    ax.grid(True, axis="x", linewidth=0.25, color="#D9D9D9", alpha=0.55)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    paths = _save_figure(fig, out_dir / "pca_loading_top_features", formats, dpi)
+    plt.close(fig)
+    return paths
+
+
+def _split_auc_table(df: pd.DataFrame, selected_features: Sequence[str]) -> pd.DataFrame:
+    if "split" not in df.columns or "target" not in df.columns or not selected_features:
+        return pd.DataFrame()
+    rows = []
+    for split, sub in df.groupby("split", dropna=False, sort=True):
+        y = pd.to_numeric(sub["target"], errors="coerce")
+        for feature in selected_features:
+            values = pd.to_numeric(sub.get(feature), errors="coerce").replace([np.inf, -np.inf], np.nan)
+            valid = pd.DataFrame({"target": y, "value": values}).dropna()
+            if valid["target"].nunique() < 2 or len(valid) < 3:
+                auc_sep = np.nan
+            else:
+                try:
+                    auc = float(roc_auc_score(valid["target"].astype(int), valid["value"].to_numpy(dtype=float)))
+                    auc_sep = max(auc, 1.0 - auc)
+                except Exception:
+                    auc_sep = np.nan
+            rows.append({"split": str(split), "feature": feature, "auc_separation": auc_sep})
+    return pd.DataFrame(rows)
+
+
+def _plot_feature_split_auc_heatmap(
+    out_dir: Path,
+    df: pd.DataFrame,
+    selected_features: Sequence[str],
+    formats: Sequence[str],
+    dpi: int,
+) -> Tuple[List[str], Dict[str, Dict[str, Optional[float]]]]:
+    table = _split_auc_table(df, selected_features)
+    if table.empty:
+        return [], {}
+    pivot = table.pivot(index="feature", columns="split", values="auc_separation")
+    if pivot.empty or pivot.shape[1] < 2:
+        return [], {}
+
+    fig_w = max(3.4, 0.45 * pivot.shape[1] + 2.2)
+    fig_h = max(2.6, 0.26 * pivot.shape[0] + 1.2)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    values = pivot.to_numpy(dtype=float)
+    im = ax.imshow(values, vmin=0.5, vmax=1.0, cmap="viridis")
+    ax.set_xticks(np.arange(len(pivot.columns)))
+    ax.set_xticklabels([str(c) for c in pivot.columns], rotation=0)
+    ax.set_yticks(np.arange(len(pivot.index)))
+    ax.set_yticklabels([str(i) for i in pivot.index], fontsize=6)
+    ax.set_title("Selected feature AUC by split")
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            if np.isfinite(values[i, j]):
+                ax.text(j, i, f"{values[i, j]:.2f}", ha="center", va="center", fontsize=5, color="white")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("AUC separation")
+    fig.tight_layout()
+    paths = _save_figure(fig, out_dir / "selected_feature_split_auc_heatmap", formats, dpi)
+    plt.close(fig)
+
+    summary = {
+        str(feature): {
+            str(split): (None if pd.isna(value) else float(value))
+            for split, value in row.items()
+        }
+        for feature, row in pivot.iterrows()
+    }
+    return paths, summary
+
+
+def _plot_single(
+    coords: np.ndarray,
+    labels: np.ndarray,
+    method: str,
+    dim: int,
+    out_dir: Path,
+    formats: Sequence[str],
+    dpi: int,
+    method_info: Optional[Mapping[str, object]] = None,
+) -> List[str]:
+    if dim == 2:
+        fig, ax = plt.subplots(figsize=(3.5, 3.0))
+        _plot_points(ax, coords, labels, dim=2)
+        _format_axes_2d(ax, method, method_info)
+        ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D")
+    else:
+        fig = plt.figure(figsize=(3.5, 3.1))
+        ax = fig.add_subplot(111, projection="3d")
+        _plot_points(ax, coords, labels, dim=3)
+        _format_axes_3d(ax, method, method_info)
+        ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D", pad=6)
+
+    ax.legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
+    paths = _save_figure(fig, out_dir / f"{method}_{dim}d", formats, dpi)
+    plt.close(fig)
+    return paths
+
+
+def _plot_panel(
+    embeddings: Mapping[str, Mapping[int, np.ndarray]],
+    labels: np.ndarray,
+    dim: int,
+    out_dir: Path,
+    formats: Sequence[str],
+    dpi: int,
+    method_status: Optional[Mapping[str, Mapping[str, object]]] = None,
+) -> List[str]:
+    methods = [m for m in ("pca", "tsne", "umap") if dim in embeddings.get(m, {})]
+    if not methods:
+        return []
+
+    if dim == 2:
+        fig, axes = plt.subplots(1, len(methods), figsize=(3.15 * len(methods), 2.8), squeeze=False)
+        for ax, method in zip(axes[0], methods):
+            _plot_points(ax, embeddings[method][dim], labels, dim=2)
+            _format_axes_2d(ax, method, (method_status or {}).get(method))
+            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D")
+        axes[0, -1].legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
+    else:
+        fig = plt.figure(figsize=(3.25 * len(methods), 3.0))
+        for idx, method in enumerate(methods, start=1):
+            ax = fig.add_subplot(1, len(methods), idx, projection="3d")
+            _plot_points(ax, embeddings[method][dim], labels, dim=3)
+            _format_axes_3d(ax, method, (method_status or {}).get(method))
+            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D", pad=5)
+            if idx == len(methods):
+                ax.legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
+
+    fig.tight_layout(w_pad=1.0)
+    paths = _save_figure(fig, out_dir / f"embedding_panel_{dim}d", formats, dpi)
+    plt.close(fig)
+    return paths
+
+
+def _write_source_data(
+    out_dir: Path,
+    sampled: pd.DataFrame,
+    embeddings: Mapping[str, Mapping[int, np.ndarray]],
+) -> Path:
+    columns = [c for c in ["split", "sample_name", "h5_file", "target", "start_sec", "window_index", "mode"] if c in sampled.columns]
+    source = sampled.loc[:, columns].copy()
+    for method, by_dim in embeddings.items():
+        for dim, coords in by_dim.items():
+            for idx in range(dim):
+                source[f"{method}_{dim}d_{idx + 1}"] = coords[:, idx]
+    path = out_dir / "embedding_source_data.csv"
+    source.to_csv(path, index=False)
+    return path
+
+
+def _write_report(
+    out_dir: Path,
+    summary: Mapping[str, object],
+    figure_paths: Mapping[str, List[str]],
+) -> Path:
+    lines = [
+        "# Feature Embedding Report",
+        "",
+        "This report visualizes Stage2 window features after robust median imputation and z-score scaling.",
+        "Each point is one window. Color encodes the binary target label.",
+        f"Output directory: `{out_dir.name}`.",
+        "",
+        "## Data",
+        f"- Windows plotted: {summary['n_rows']}",
+        f"- Embedding feature source: {summary.get('embedding_feature_source', 'unknown')}",
+        f"- Numeric features: {summary['n_features']}",
+        f"- Labels: {summary['label_counts']}",
+        "",
+        "## Figures",
+        "- PCA 2D/3D: linear separability and dominant variance directions.",
+        "- t-SNE 2D/3D: local neighborhood structure.",
+        "- UMAP 2D/3D: global/local manifold structure when `umap-learn` is installed.",
+        "",
+    ]
+    for key, paths in figure_paths.items():
+        if not paths:
+            continue
+        rel = [Path(p).name for p in paths]
+        lines.append(f"- {key}: " + ", ".join(rel))
+    explainer_paths = summary.get("explainer_figures", {})
+    if isinstance(explainer_paths, Mapping) and explainer_paths:
+        lines.extend(
+            [
+                "",
+                "## Feature-Space Explainability",
+            ]
+        )
+        for key, paths in explainer_paths.items():
+            if not paths:
+                continue
+            rel = [Path(p).name for p in paths]
+            lines.append(f"- {key}: " + ", ".join(rel))
+    dist_info = summary.get("selected_feature_distributions", {})
+    dist_figures = dist_info.get("figures", {}) if isinstance(dist_info, Mapping) else {}
+    if dist_figures:
+        lines.extend(
+            [
+                "",
+                "## Selected Feature Distributions",
+                "Each selected feature is plotted separately with label-colored jittered window points, a violin density envelope, and a boxplot summary.",
+            ]
+        )
+        for key, paths in dist_figures.items():
+            rel = [Path(p).name for p in paths]
+            lines.append(f"- {key}: " + ", ".join(rel))
+    lines.extend(
+        [
+            "",
+            "## Method Status",
+        ]
+    )
+    for method, info in summary["methods"].items():
+        lines.append(f"- {METHOD_TITLES.get(method, method.upper())}: {info}")
+    lines.append("")
+
+    path = out_dir / "embedding_report.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
+def run_embedding_report(
+    artifact_dir: Path | str,
+    output_dir: Optional[Path | str] = None,
+    methods: Sequence[str] = ("pca", "tsne"),
+    dims: Sequence[int] = (2, 3),
+    formats: Sequence[str] = ("png", "svg", "pdf", "tiff"),
+    max_points: int = 0,
+    random_state: int = 42,
+    perplexity: float = 30.0,
+    dpi: int = 600,
+) -> Mapping[str, object]:
+    artifact_dir = Path(artifact_dir)
+    out_dir = Path(output_dir) if output_dir is not None else artifact_dir / "feature_embedding_report"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    _set_nature_style()
+    formats = tuple(str(f).lower().strip() for f in formats if str(f).strip())
+    if not formats:
+        formats = ("png",)
+
+    df, all_feature_cols = load_feature_pools(artifact_dir)
+    selected_features, selected_status = load_selected_features(artifact_dir, all_feature_cols)
+    if selected_features:
+        feature_cols = list(selected_features)
+        embedding_feature_source = "selected_features"
+    else:
+        feature_cols = list(all_feature_cols)
+        embedding_feature_source = "all_numeric_features"
+
+    sampled, x = prepare_matrix(df, feature_cols, int(max_points), int(random_state))
+    embeddings, method_status = compute_embeddings(
+        x=x,
+        methods=methods,
+        dims=dims,
+        random_state=int(random_state),
+        perplexity=float(perplexity),
+    )
+
+    labels = sampled["target"].to_numpy()
+    figure_paths: Dict[str, List[str]] = {}
+    for method in ("pca", "tsne", "umap"):
+        for dim in sorted(embeddings.get(method, {})):
+            key = f"{method}_{dim}d"
+            figure_paths[key] = _plot_single(
+                embeddings[method][dim],
+                labels,
+                method,
+                dim,
+                out_dir,
+                formats,
+                int(dpi),
+                method_info=method_status.get(method),
+            )
+    for dim in sorted({int(d) for d in dims if int(d) in {2, 3}}):
+        figure_paths[f"embedding_panel_{dim}d"] = _plot_panel(
+            embeddings,
+            labels,
+            dim,
+            out_dir,
+            formats,
+            int(dpi),
+            method_status=method_status,
+        )
+
+    source_path = _write_source_data(out_dir, sampled, embeddings)
+    distribution_paths, distribution_source_path = plot_selected_feature_distributions(
+        out_dir=out_dir,
+        df=sampled,
+        selected_features=selected_features,
+        formats=formats,
+        dpi=int(dpi),
+        random_state=int(random_state),
+    )
+    distribution_statistics = summarize_selected_feature_distributions(sampled, selected_features)
+    split_auc_paths, split_auc_summary = _plot_feature_split_auc_heatmap(
+        out_dir=out_dir,
+        df=sampled,
+        selected_features=selected_features,
+        formats=formats,
+        dpi=int(dpi),
+    )
+    explainer_figures = {
+        "selected_feature_correlation_heatmap": _plot_selected_feature_correlation_heatmap(
+            out_dir=out_dir,
+            df=sampled,
+            selected_features=selected_features,
+            formats=formats,
+            dpi=int(dpi),
+        ),
+        "selected_feature_split_auc_heatmap": split_auc_paths,
+        "pca_loading_top_features": _plot_pca_loading_top_features(
+            out_dir=out_dir,
+            x=x,
+            feature_cols=feature_cols,
+            formats=formats,
+            dpi=int(dpi),
+        ),
+    }
+    label_counts = sampled["target"].value_counts().sort_index()
+    split_counts = sampled["split"].value_counts().sort_index() if "split" in sampled.columns else pd.Series(dtype=int)
+    summary = {
+        "n_rows": int(len(sampled)),
+        "n_rows_available": int(len(df)),
+        "max_points": int(max_points),
+        "n_features": int(len(feature_cols)),
+        "feature_columns": list(feature_cols),
+        "all_numeric_feature_count": int(len(all_feature_cols)),
+        "embedding_feature_source": embedding_feature_source,
+        "label_counts": {str(k): int(v) for k, v in label_counts.items()},
+        "split_counts": {str(k): int(v) for k, v in split_counts.items()},
+        "methods": method_status,
+        "source_data": str(source_path),
+        "figures": figure_paths,
+        "explainer_figures": explainer_figures,
+        "selected_feature_distributions": {
+            **selected_status,
+            "source_data": str(distribution_source_path) if distribution_source_path else None,
+            "figures": distribution_paths,
+            "statistics": distribution_statistics,
+            "split_auc_separation": split_auc_summary,
+        },
+    }
+    summary_path = out_dir / "embedding_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    report_path = _write_report(out_dir, summary, figure_paths)
+
+    return {
+        "output_dir": out_dir,
+        "report_path": report_path,
+        "summary_path": summary_path,
+        "source_path": source_path,
+        "summary": summary,
+    }
 
 
 if __name__ == "__main__":

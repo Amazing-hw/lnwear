@@ -286,6 +286,34 @@ def test_s08_rejects_staged_e2e_optimize_shortcut():
     assert "--hard_negative_optimize" not in output
 
 
+def test_s08_help_marks_removed_shortcuts_as_removed():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--help",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "--hard_negative_optimize" in output
+    assert "--staged_e2e_optimize" in output
+    assert "removed legacy shortcut" in output
+    assert "enable FP-sensitive train-only hard-negative mining" not in output
+    assert "run three objective-separated child pipelines" not in output
+
+
+def test_s08_source_has_no_mojibake_stop_message():
+    source = (ROOT / "s08_run_pipeline.py").read_text(encoding="utf-8")
+
+    assert "宸茶揪鍒" not in source
+    assert "锛屽仠姝" not in source
+
+
 def test_s08_with_postprocess_forwards_search_params_without_hard_negative():
     result = subprocess.run(
         [
@@ -538,6 +566,7 @@ def test_s08_postprocess_dry_run_forwards_search_budget():
 
     assert "s07_postprocess_optimize.py" in output
     assert "--search_budget 96" in output
+    assert "--warmup_frames 3" in output
 
 
 def test_prepare_valid_calibration_threshold_data_keeps_disjoint_groups_for_multi_k():
@@ -634,7 +663,7 @@ def test_default_model_search_axes_have_fine_n_estimators():
 
 
 def test_default_pipeline_search_budget_stays_deployable_and_runtime_bounded():
-    assert s05.DEFAULT_MODEL_SEARCH_SPACE["max_depth"] == [2, 3, 4]
+    assert s05.DEFAULT_MODEL_SEARCH_SPACE["max_depth"] == [2, 3, 4, 5]
 
     result = subprocess.run(
         [
@@ -660,7 +689,7 @@ def test_default_pipeline_search_budget_stays_deployable_and_runtime_bounded():
     assert '--model_search_feature_counts "18"' in output
     assert "--model_search_max_candidates 180" in output
     assert "--model_search_stage2_top_k 24" in output
-    assert '--model_search_max_depth "2,3,4"' in output
+    assert '--model_search_max_depth "2,3,4,5"' in output
     assert "--feature_search_local_swap" in output
     assert "--search_budget 240" not in output
 

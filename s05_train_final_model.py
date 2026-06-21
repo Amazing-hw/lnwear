@@ -1612,6 +1612,7 @@ def compute_threshold_curve(model, X, y, beta=0.5):
     rows = []
     for th in np.linspace(0.05, 0.95, 181):
         pred = (probs >= th).astype(int)
+        tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
         precision = float(precision_score(y, pred, zero_division=0))
         recall = float(recall_score(y, pred, zero_division=0))
         f1 = float(f1_score(y, pred, zero_division=0))
@@ -1621,8 +1622,121 @@ def compute_threshold_curve(model, X, y, beta=0.5):
             "recall": recall,
             "f1": f1,
             "fbeta": float(_fbeta(precision, recall, beta)),
+            "false_positive_rate": float(fp / (fp + tn)) if (fp + tn) else 0.0,
+            "fpr": float(fp / (fp + tn)) if (fp + tn) else 0.0,
+            "fp": int(fp),
+            "fn": int(fn),
+            "tp": int(tp),
+            "tn": int(tn),
         })
     return rows
+
+
+def export_roc_pr_curves(model, X_valid, y_valid, artifact_dir):
+    """Export ROC and Precision-Recall curves for model evaluation."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip ROC/PR plot: {e}")
+        return None
+
+    from sklearn.metrics import roc_curve, precision_recall_curve, auc as _auc_metric
+
+    y_true = np.asarray(y_valid, dtype=int)
+    probs = model.predict_proba(np.asarray(X_valid, dtype=float))[:, 1]
+    probs = np.clip(probs, 0.0, 1.0)
+    mask = np.isfinite(probs)
+    y_true = y_true[mask]
+    probs = probs[mask]
+
+    out_dir = os.path.join(str(artifact_dir), "report_plots")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "s05_roc_pr_curves.png")
+
+    unique_labels = np.unique(y_true)
+    if len(unique_labels) < 2:
+        fig = plt.figure(figsize=(12, 10), facecolor="white")
+        fig.suptitle("ROC / PR Curves", fontsize=16, weight="bold")
+        fig.text(0.5, 0.5, "Single class in validation split — cannot compute ROC/PR curves",
+                 ha="center", va="center", fontsize=13, color="#c44e52")
+        fig.tight_layout(rect=[0, 0, 1, 0.95])
+        fig.savefig(out_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[OK] s05 ROC/PR plot (single class notice) -> {out_path}")
+        return out_path
+
+    # ---- ROC ----
+    fpr, tpr, _ = roc_curve(y_true, probs)
+    roc_auc = float(_auc_metric(fpr, tpr))
+
+    # ---- PR ----
+    precision_vals, recall_vals, _ = precision_recall_curve(y_true, probs)
+    pr_auc = float(_auc_metric(recall_vals, precision_vals))
+
+    fig = plt.figure(figsize=(12, 10), facecolor="white")
+    gs = fig.add_gridspec(2, 2, hspace=0.30, wspace=0.28)
+
+    # (0,0) Full ROC
+    ax_roc = fig.add_subplot(gs[0, 0])
+    ax_roc.plot(fpr, tpr, color="#2f6f73", linewidth=2.0, label=f"XGBoost (AUC={roc_auc:.4f})")
+    ax_roc.plot([0, 1], [0, 1], color="#9aa6ac", linewidth=1.2, linestyle="--", alpha=0.7)
+    ax_roc.set_xlim(0, 1)
+    ax_roc.set_ylim(0, 1.03)
+    ax_roc.set_xlabel("False Positive Rate")
+    ax_roc.set_ylabel("True Positive Rate")
+    ax_roc.set_title("ROC Curve")
+    ax_roc.grid(alpha=0.18)
+    ax_roc.legend(frameon=False, loc="lower right")
+
+    # (0,1) Full PR
+    ax_pr = fig.add_subplot(gs[0, 1])
+    ax_pr.plot(recall_vals, precision_vals, color="#4c78a8", linewidth=2.0, label=f"XGBoost (AUC={pr_auc:.4f})")
+    # iso-F1 contours
+    f_scores = np.linspace(0.2, 0.9, 8)
+    for f_score in f_scores:
+        x_vals = np.linspace(0.01, 1, 100)
+        y_vals = f_score * x_vals / (2 * x_vals - f_score + 1e-12)
+        valid = (y_vals > 0) & (y_vals <= 1)
+        ax_pr.plot(x_vals[valid], y_vals[valid], color="#d35f2d", alpha=0.15, linewidth=0.7)
+    ax_pr.set_xlim(0, 1.03)
+    ax_pr.set_ylim(0, 1.03)
+    ax_pr.set_xlabel("Recall")
+    ax_pr.set_ylabel("Precision")
+    ax_pr.set_title("Precision-Recall Curve")
+    ax_pr.grid(alpha=0.18)
+    ax_pr.legend(frameon=False, loc="lower left")
+
+    # (1,0) Zoomed ROC
+    ax_roc_z = fig.add_subplot(gs[1, 0])
+    ax_roc_z.plot(fpr, tpr, color="#2f6f73", linewidth=2.0)
+    ax_roc_z.set_xlim(0, min(0.2, max(fpr) * 1.1 + 0.01))
+    ax_roc_z.set_ylim(0.5, 1.03)
+    ax_roc_z.set_xlabel("False Positive Rate (zoomed)")
+    ax_roc_z.set_ylabel("True Positive Rate")
+    ax_roc_z.set_title(f"ROC (FPR ≤ {min(0.2, max(fpr) * 1.1 + 0.01):.1f})")
+    ax_roc_z.grid(alpha=0.18)
+    # mark operating region
+    ax_roc_z.axhline(y=0.9, color="#9aa6ac", linewidth=0.8, linestyle=":", alpha=0.5)
+
+    # (1,1) Zoomed PR
+    ax_pr_z = fig.add_subplot(gs[1, 1])
+    ax_pr_z.plot(recall_vals, precision_vals, color="#4c78a8", linewidth=2.0)
+    ax_pr_z.set_ylim(0.5, 1.03)
+    ax_pr_z.set_xlim(max(0, min(recall_vals) * 0.95), 1.03)
+    ax_pr_z.set_xlabel("Recall (zoomed)")
+    ax_pr_z.set_ylabel("Precision")
+    ax_pr_z.set_title("PR (high-precision region)")
+    ax_pr_z.grid(alpha=0.18)
+    ax_pr_z.axhline(y=0.9, color="#9aa6ac", linewidth=0.8, linestyle=":", alpha=0.5)
+
+    fig.suptitle("ROC / PR Curves — Validation Split", fontsize=16, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] s05 ROC/PR plot -> {out_path}")
+    return out_path
 
 
 def export_training_report_plot(plot_data, artifact_dir):
@@ -1703,6 +1817,91 @@ def export_training_report_plot(plot_data, artifact_dir):
     plt.close(fig)
     print(f"[OK] s05 report plot -> {out_path}")
     return out_path
+
+
+def export_threshold_tradeoff_plot(plot_data, artifact_dir):
+    """Export threshold vs FP/recall tradeoff plot and source CSV."""
+    curve = list(plot_data.get("threshold_curve", []) or [])
+    if not curve:
+        return None
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib unavailable, skip s05 threshold tradeoff plot: {e}")
+        return None
+
+    out_dir = os.path.join(str(artifact_dir), "report_plots")
+    os.makedirs(out_dir, exist_ok=True)
+    df = pd.DataFrame(curve).copy()
+    if "false_positive_rate" not in df.columns:
+        if "fpr" in df.columns:
+            df["false_positive_rate"] = pd.to_numeric(df["fpr"], errors="coerce")
+        elif {"fp", "tn"}.issubset(df.columns):
+            fp = pd.to_numeric(df["fp"], errors="coerce").fillna(0.0)
+            tn = pd.to_numeric(df["tn"], errors="coerce").fillna(0.0)
+            denom = fp + tn
+            df["false_positive_rate"] = np.where(denom > 0, fp / denom, 0.0)
+        else:
+            df["false_positive_rate"] = np.nan
+
+    for col in ["threshold", "precision", "recall", "false_positive_rate"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    csv_path = os.path.join(out_dir, "s05_threshold_fp_recall_tradeoff.csv")
+    df.to_csv(csv_path, index=False)
+
+    th = df["threshold"].to_numpy(dtype=float)
+    precision = df["precision"].to_numpy(dtype=float)
+    recall = df["recall"].to_numpy(dtype=float)
+    fpr = df["false_positive_rate"].to_numpy(dtype=float)
+    best_th = float(plot_data.get("threshold_search", {}).get("threshold", 0.5))
+    finite_fpr = fpr[np.isfinite(fpr)]
+    fpr_ylim = min(1.0, max(0.05, float(np.max(finite_fpr)) * 1.15 if len(finite_fpr) else 0.05))
+
+    fig = plt.figure(figsize=(12, 7), facecolor="white")
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.25, 1.0], wspace=0.25)
+    ax = fig.add_subplot(gs[0, 0])
+    ax_fp = ax.twinx()
+    ax.plot(th, recall, color="#4c78a8", linewidth=2.0, label="recall")
+    ax.plot(th, precision, color="#2f6f73", linewidth=2.0, label="precision")
+    ax_fp.plot(th, fpr, color="#c44e52", linewidth=2.0, label="false positive rate")
+    ax.axvline(best_th, color="#222222", linestyle="--", linewidth=1.3, label=f"selected={best_th:.3f}")
+    ax.set_xlabel("window threshold")
+    ax.set_ylabel("precision / recall")
+    ax_fp.set_ylabel("false positive rate")
+    ax.set_ylim(0, 1.03)
+    ax_fp.set_ylim(0, fpr_ylim)
+    ax.set_title("Threshold Tradeoff")
+    ax.grid(alpha=0.18)
+    lines, labels = ax.get_legend_handles_labels()
+    lines_fp, labels_fp = ax_fp.get_legend_handles_labels()
+    ax.legend(lines + lines_fp, labels + labels_fp, frameon=False, loc="best")
+
+    ax_region = fig.add_subplot(gs[0, 1])
+    ax_region.plot(recall, fpr, color="#8172b2", linewidth=2.0)
+    ax_region.scatter(recall, fpr, s=16, color="#8172b2", alpha=0.35)
+    if len(th):
+        idx = int(np.nanargmin(np.abs(th - best_th)))
+        ax_region.scatter([recall[idx]], [fpr[idx]], s=70, color="#222222", zorder=3)
+    ax_region.set_xlabel("recall")
+    ax_region.set_ylabel("false positive rate")
+    ax_region.set_xlim(0, 1.03)
+    ax_region.set_ylim(0, fpr_ylim)
+    ax_region.set_title("Low-FP Operating Region")
+    ax_region.grid(alpha=0.18)
+
+    fig.suptitle("Window Threshold: False Positives vs Recall", fontsize=15, weight="bold")
+    fig.subplots_adjust(top=0.86, left=0.08, right=0.92, bottom=0.12, wspace=0.28)
+    fig_path = os.path.join(out_dir, "s05_threshold_fp_recall_tradeoff.png")
+    fig.savefig(fig_path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[OK] s05 threshold tradeoff plot -> {fig_path}")
+    return {"figure": fig_path, "source_data": csv_path}
 
 
 # =========================================================
@@ -2798,6 +2997,8 @@ def main(args=None):
 
 
     export_training_report_plot(config, args.artifact_dir)
+    export_threshold_tradeoff_plot(config, args.artifact_dir)
+    export_roc_pr_curves(model, X_threshold, y_threshold, args.artifact_dir)
 
 
 if __name__ == "__main__":

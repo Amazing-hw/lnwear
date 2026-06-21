@@ -3,7 +3,7 @@
 """
 主控脚本：一键运行完整训练、搜参、评估和部署导出流程。
 
-推荐一条命令（含 XGBoost 模型搜参；不含商用 baseline 对比、NPZ 缓存导出、s07 后处理搜参和 s10 泛化审计）:
+推荐一条命令（含 XGBoost 模型搜参；不含商用 baseline 对比、NPZ 缓存导出、s07 后处理搜参和泛化审计）:
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 这条命令会默认跑到 s06_cb：
@@ -22,12 +22,12 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --export_window_cache --optimize_postprocess
 
 泛化审计只读取已有评估 artifacts，不重新训练；需要时显式运行：
-    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --run_generalization_audit --stop_after s10_audit
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --run_generalization_audit --stop_after s06_audit
 
 商用 baseline 对比暂不属于默认全流程；需要时显式运行：
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_compare --stop_after s09_cmp
 
-如果 --stop_after 直接指向 s07_post/s09_cmp/s10_audit，脚本会视为显式请求并自动打开对应可选步骤。
+如果 --stop_after 直接指向 s07_post/s06_audit/s09_cmp，脚本会视为显式请求并自动打开对应可选步骤。
 
 Full optimization shortcut:
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --full_optimize
@@ -38,7 +38,7 @@ Stage2 no-IR policy:
     golden_vectors.json use only ambient, green, and ACC features.
 
 Preflight gates before a real-data run:
-    python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py s10_generalization_audit.py
+    python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py
     python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp .pytest_tmp_deploy_guard
 
 Do not pass an empty string to --model_search_feature_counts. For a fixed feature
@@ -46,7 +46,7 @@ count, pass one explicit value, for example:
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --max_features 15 --model_search_feature_counts 15
 
 用法:
-    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/s10 审计/商用对比）
+    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/泛化审计/商用对比）
     python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
     # 需要时再打开 NPZ 缓存导出和 s07 后处理搜参
@@ -71,7 +71,7 @@ count, pass one explicit value, for example:
     s06_cache: 导出 valid 逐窗缓存（默认不跑；需 --export_window_cache）
     s07_post: FP 敏感后处理搜参（默认不跑；需 --optimize_postprocess）
     s06_eval: 端到端评估
-    s10_audit: 商用泛化审计（默认不跑；需 --run_generalization_audit）
+    s06_audit: 泛化审计（默认不跑；需 --run_generalization_audit，由 s06_deploy_eval 内嵌执行）
     s06_xpt: 导出部署产物 (--export_deploy)
     s09_cmp: 我们方案 vs 商用方案对比（默认不跑；需 --commercial_compare --stop_after s09_cmp）
 """
@@ -82,6 +82,7 @@ import os
 import json
 import logging
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1102,7 +1103,7 @@ def _run(name, cmd, dry_run=False, runtime_events=None):
         _record_runtime(runtime_events, name, 0.0, dry_run=True)
         return True
     t0 = time.time()
-    rc = subprocess.call(cmd, shell=True)
+    rc = subprocess.run(shlex.split(cmd), check=False).returncode
     dt = time.time() - t0
     _record_runtime(runtime_events, name, dt, dry_run=False)
     if rc == 0:
@@ -1129,6 +1130,43 @@ def run_embedded_commercial_compare(args):
     if args.keep_window_probs:
         argv.append("--keep_window_probs")
     commercial_compare.main(argv)
+
+
+def _parse_csv_strings(value):
+    return tuple(part.strip() for part in str(value).split(",") if part.strip())
+
+
+def _parse_csv_ints(value):
+    return tuple(int(part.strip()) for part in str(value).split(",") if part.strip())
+
+
+def run_embedded_feature_embedding_report(args):
+    import s04_feature_selection as feature_selection
+
+    result = feature_selection.run_embedding_report(
+        artifact_dir=args.artifact_dir,
+        methods=_parse_csv_strings(args.embedding_methods),
+        dims=_parse_csv_ints(args.embedding_dims),
+        formats=_parse_csv_strings(args.embedding_formats),
+        max_points=args.embedding_max_points,
+        perplexity=args.embedding_perplexity,
+        random_state=args.embedding_random_state,
+        dpi=args.embedding_dpi,
+    )
+    print(f"[OK] feature embedding report -> {result['report_path']}")
+
+
+def run_embedded_generalization_audit(args):
+    import s06_deploy_eval as deploy_eval
+
+    result = deploy_eval.run_audit(
+        args.artifact_dir,
+        split=args.split,
+        method="state_machine",
+        min_support=args.audit_min_support,
+    )
+    print(f"[OK] generalization_audit -> {result['out_dir']}")
+    print(json.dumps(result["paths"], indent=2, ensure_ascii=False))
 
 
 RELIABILITY_FEATURE_HINTS = (
@@ -1984,23 +2022,215 @@ def export_deploy_cookbook(artifact_dir):
     print(f"[OK] deploy_performance_profile.json -> {profile_path}")
 
 def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
-    """生成逐样本 CSV: info, target, total_windows, correct_windows。"""
+    """生成三份逐样本 CSV，统计口径与 s06 官方准确率指标完全一致：
+
+    1. per_sample_xgboost_windows.csv   — Stage2 单窗 XGBoost 准确率
+       与 compute_window_model_metrics 一致：
+         - 跳过 fallback / Stage1 失败 / 无窗口的样本
+         - 所有通过 Stage1 的窗口全部参与，不做 warmup 跳过
+
+    2. per_sample_statemachine_windows.csv — 状态机后处理窗口准确率
+       与 compute_window_stream_metrics 一致：
+         - 跳过 fallback / Stage1 失败的样本
+         - 按 warmup_frames 跳过每条样本前 N 个窗口（消除冷启动）
+         - 逐窗比较 state[i] vs window_targets[i]
+
+    3. per_sample_final_prediction.csv  — 样本级最终预测结果
+       与 compute_sample_metrics 一致：
+         - fallback / Stage1 失败一律 pred=0 参与统计
+    """
     import os as _os
+    import json as _json
     details = _load_eval_details(artifact_dir, split, method)
     if not details:
         print("[WARN] 评估结果为空，跳过 CSV")
         return
 
-    csv_path = _os.path.join(artifact_dir, "per_sample_summary.csv")
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write("sample_name,target,total_windows,correct_windows\n")
-        for d in details:
-            wpreds = d.get("window_preds", [])
-            t = d.get("target", 0)
-            n_win = len(wpreds)
-            n_correct = sum(1 for p in wpreds if p == t) if n_win > 0 else 0
-            f.write(f"{d['sample_name']},{t},{n_win},{n_correct}\n")
-    print(f"[OK] 逐样本 CSV: {csv_path}")
+    # 读取 warmup_frames —— 与 compute_window_stream_metrics 保持一致
+    warmup_frames = 3  # 默认值，与 s06 --warmup_frames default 一致
+    eval_payload = {}
+    eval_path = _os.path.join(artifact_dir, f"end_to_end_eval_{split}_{method}.json")
+    if _os.path.exists(eval_path):
+        with open(eval_path, "r", encoding="utf-8") as f:
+            eval_payload = _json.load(f)
+        warmup_frames = int((eval_payload.get("window_stream_summary") or {}).get("warmup_frames", 3))
+
+    # ---- CSV 1: XGBoost 单窗预测 ----
+    # 与 compute_window_model_metrics 一致：跳过 fallback / Stage1 失败 / 无窗口的样本
+    rows_xgb = []
+    for d in details:
+        name = d.get("sample_name", "")
+        wpreds = d.get("window_preds", [])
+        if d.get("fallback", False) or not d.get("stage1_pass", False) or len(wpreds) == 0:
+            continue
+        wtargs = d.get("window_targets", [])
+        sample_target = int(d.get("target", 0))
+        n_win = len(wpreds)
+        n_correct = 0
+        for i in range(n_win):
+            t = int(wtargs[i]) if i < len(wtargs) else sample_target
+            if int(wpreds[i]) == t:
+                n_correct += 1
+        n_wrong = n_win - n_correct
+        acc = n_correct / n_win if n_win > 0 else 0.0
+        rows_xgb.append((name, n_win, n_correct, n_wrong, round(acc, 6)))
+
+    csv1 = _os.path.join(artifact_dir, "per_sample_xgboost_windows.csv")
+    with open(csv1, "w", encoding="utf-8") as f:
+        f.write("sample_name,total_windows,correct_windows,wrong_windows,accuracy\n")
+        for row in rows_xgb:
+            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]}\n")
+    total_xgb_wins = sum(r[1] for r in rows_xgb)
+    total_xgb_correct = sum(r[2] for r in rows_xgb)
+    total_xgb_wrong = sum(r[3] for r in rows_xgb)
+    xgb_global_acc = total_xgb_correct / total_xgb_wins if total_xgb_wins > 0 else 0.0
+    print(f"[OK] XGBoost 逐样本窗口 CSV: {csv1} "
+          f"(n_samples={len(rows_xgb)}, total_windows={total_xgb_wins}, "
+          f"global_acc={round(xgb_global_acc, 6) if total_xgb_wins > 0 else 0})")
+
+    # ---- CSV 2: 状态机后处理窗口预测 ----
+    # 与 compute_window_stream_metrics 一致：跳过 fallback / Stage1 失败样本 + warmup 跳过
+    rows_sm = []
+    for d in details:
+        name = d.get("sample_name", "")
+        states = d.get("window_states", [])
+        if d.get("fallback", False) or not d.get("stage1_pass", False) or len(states) == 0:
+            continue
+        wtargs = d.get("window_targets", [])
+        sample_target = int(d.get("target", 0))
+        # warmup_frames: 跳过前 N 个窗口，与 compute_window_stream_metrics 一致
+        start = min(int(warmup_frames), len(states))
+        n_win = len(states) - start
+        n_correct = 0
+        for i in range(start, len(states)):
+            t = int(wtargs[i]) if i < len(wtargs) else sample_target
+            if int(states[i]) == t:
+                n_correct += 1
+        n_wrong = n_win - n_correct
+        acc = n_correct / n_win if n_win > 0 else 0.0
+        rows_sm.append((name, n_win, n_correct, n_wrong, round(acc, 6)))
+
+    csv2 = _os.path.join(artifact_dir, "per_sample_statemachine_windows.csv")
+    with open(csv2, "w", encoding="utf-8") as f:
+        f.write("sample_name,total_windows,correct_windows,wrong_windows,accuracy\n")
+        for row in rows_sm:
+            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]}\n")
+    total_sm_wins = sum(r[1] for r in rows_sm)
+    total_sm_correct = sum(r[2] for r in rows_sm)
+    total_sm_wrong = sum(r[3] for r in rows_sm)
+    sm_global_acc = total_sm_correct / total_sm_wins if total_sm_wins > 0 else 0.0
+    print(f"[OK] 状态机逐样本窗口 CSV: {csv2} "
+          f"(n_samples={len(rows_sm)}, total_windows={total_sm_wins}, "
+          f"warmup_frames={warmup_frames}, "
+          f"global_acc={round(sm_global_acc, 6) if total_sm_wins > 0 else 0})")
+
+    # ---- CSV 3: 样本级最终预测 ----
+    # 与 compute_sample_metrics 一致：fallback / Stage1 失败一律 pred=0
+    rows_sample = []
+    for d in details:
+        name = d.get("sample_name", "")
+        target = int(d.get("target", 0))
+        pred = int(d.get("pred", -1))
+        is_correct = 1 if pred == target else 0
+        n_win = len(d.get("window_probs", []))
+        stage1_ok = 1 if d.get("stage1_pass", False) else 0
+        fallback = 1 if d.get("fallback", False) else 0
+        rows_sample.append((name, target, pred, is_correct, n_win, stage1_ok, fallback))
+
+    csv3 = _os.path.join(artifact_dir, "per_sample_final_prediction.csv")
+    with open(csv3, "w", encoding="utf-8") as f:
+        f.write("sample_name,target,pred,is_correct,total_windows,stage1_pass,is_fallback\n")
+        for row in rows_sample:
+            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]},{row[6]}\n")
+    total_correct = sum(r[3] for r in rows_sample)
+    sample_acc = total_correct / len(rows_sample) if rows_sample else 0.0
+    print(f"[OK] 样本级最终预测 CSV: {csv3} "
+          f"(n_samples={len(rows_sample)}, "
+          f"accuracy={round(sample_acc, 6) if rows_sample else 0})")
+
+    def _assert_equal(csv_name, field, actual, expected):
+        if expected is None:
+            return
+        assert int(actual) == int(expected), (
+            f"{csv_name} mismatch for {field}: csv={actual}, official={expected}"
+        )
+
+    def _assert_close(csv_name, field, actual, expected, tol=1e-9):
+        if expected is None:
+            return
+        assert abs(float(actual) - float(expected)) <= tol, (
+            f"{csv_name} mismatch for {field}: csv={actual}, official={expected}"
+        )
+
+    def _cm_total_errors(summary):
+        cm = (summary or {}).get("confusion_matrix") or {}
+        return int(cm.get("FP", 0)) + int(cm.get("FN", 0))
+
+    window_model_summary = eval_payload.get("window_model_summary") or {}
+    _assert_equal(
+        "per_sample_xgboost_windows.csv",
+        "total_windows",
+        total_xgb_wins,
+        window_model_summary.get("total_windows"),
+    )
+    _assert_equal(
+        "per_sample_xgboost_windows.csv",
+        "wrong_windows",
+        total_xgb_wrong,
+        _cm_total_errors(window_model_summary),
+    )
+    _assert_close(
+        "per_sample_xgboost_windows.csv",
+        "accuracy",
+        xgb_global_acc,
+        window_model_summary.get("accuracy"),
+    )
+
+    window_stream_summary = eval_payload.get("window_stream_summary") or {}
+    _assert_equal(
+        "per_sample_statemachine_windows.csv",
+        "total_windows",
+        total_sm_wins,
+        window_stream_summary.get("total_windows"),
+    )
+    _assert_equal(
+        "per_sample_statemachine_windows.csv",
+        "wrong_windows",
+        total_sm_wrong,
+        _cm_total_errors(window_stream_summary),
+    )
+    _assert_close(
+        "per_sample_statemachine_windows.csv",
+        "accuracy",
+        sm_global_acc,
+        window_stream_summary.get("accuracy"),
+    )
+    _assert_equal(
+        "per_sample_statemachine_windows.csv",
+        "warmup_frames",
+        warmup_frames,
+        window_stream_summary.get("warmup_frames"),
+    )
+
+    sample_summary = eval_payload.get("summary") or {}
+    _assert_equal(
+        "per_sample_final_prediction.csv",
+        "total_samples",
+        len(rows_sample),
+        sample_summary.get("total_samples", len(rows_sample)),
+    )
+    _assert_equal(
+        "per_sample_final_prediction.csv",
+        "wrong_samples",
+        len(rows_sample) - total_correct,
+        _cm_total_errors(sample_summary),
+    )
+    _assert_close(
+        "per_sample_final_prediction.csv",
+        "accuracy",
+        sample_acc,
+        sample_summary.get("accuracy"),
+    )
 
 
 def plot_error_samples(artifact_dir, split="test", method="state_machine",
@@ -2237,6 +2467,26 @@ def main():
                    help="s06 运行 legacy 状态机参数优化；默认不跑，需显式 --optimize")
     p.add_argument("--plot_errors", action=argparse.BooleanOptionalAction, default=True,
                    help="s06 评估后画出错误样本图 (--no-plot_errors 跳过)")
+    p.add_argument("--plot_feature_embeddings", action=argparse.BooleanOptionalAction, default=False,
+                   help="generate PCA/t-SNE/UMAP 2D/3D feature embedding report after s04_search")
+    p.add_argument("--embedding_methods", default="pca,tsne",
+                   help="comma-separated embedding methods for s04 embedding report; add umap explicitly when umap-learn is stable")
+    p.add_argument("--embedding_dims", default="2,3",
+                   help="comma-separated embedding dimensions for s04 embedding report: 2,3")
+    p.add_argument("--embedding_formats", default="png,svg,pdf,tiff",
+                   help="comma-separated figure formats for s04 embedding report")
+    p.add_argument("--embedding_max_points", type=int, default=0,
+                   help="s04 embedding report max plotted windows; 0 means all windows")
+    p.add_argument("--embedding_perplexity", type=float, default=30.0,
+                   help="s04 embedding report t-SNE perplexity before automatic small-dataset clipping")
+    p.add_argument("--embedding_random_state", type=int, default=42,
+                   help="s04 embedding report random seed")
+    p.add_argument("--embedding_dpi", type=int, default=600,
+                   help="s04 embedding report raster export DPI")
+    p.add_argument("--roc_pr_curves", action=argparse.BooleanOptionalAction, default=True,
+                   help="s05 训练后导出 ROC/PR 曲线图 (--no-roc_pr_curves 跳过)")
+    p.add_argument("--export_tree_viz", action=argparse.BooleanOptionalAction, default=True,
+                   help="s06 评估后导出 XGBoost 树特征使用图 (--no-export_tree_viz 跳过)")
     p.add_argument("--export_window_cache", action=argparse.BooleanOptionalAction, default=False,
                    help="export window-level NPZ cache for s07 postprocess optimization")
     p.add_argument("--optimize_postprocess", action=argparse.BooleanOptionalAction, default=False,
@@ -2248,11 +2498,11 @@ def main():
     p.add_argument("--auto_optimize_e2e", action="store_true",
                    help="product-metric-first automatic E2E optimization using s04/s05/s06/s07")
     p.add_argument("--accuracy_first_optimize", action="store_true",
-                   help="只优化 Stage2 raw window accuracy；除非显式指定，否则不自动打开 hard-negative、s07 后处理或 s10 审计")
+                   help="只优化 Stage2 raw window accuracy；除非显式指定，否则不自动打开 hard-negative、s07 后处理或泛化审计")
     p.add_argument("--hard_negative_optimize", action="store_true",
-                   help="enable FP-sensitive train-only hard-negative mining, cache export, s07 postprocess search, and s10 audit")
+                   help="removed legacy shortcut; use --accuracy_first_optimize, --with_postprocess, or --auto_optimize_e2e")
     p.add_argument("--staged_e2e_optimize", action="store_true",
-                   help="run three objective-separated child pipelines: accuracy-first, FP-safe hard-negative, then end-to-end postprocess")
+                   help="removed legacy shortcut; run the main flow directly or use --with_postprocess / --auto_optimize_e2e")
     p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
                    help="split used by s07 postprocess optimization")
     p.add_argument("--postprocess_fp_cost", type=float, default=1.5,
@@ -2265,6 +2515,8 @@ def main():
                    help="s07 maximum P95 first worn output latency for positive samples")
     p.add_argument("--postprocess_search_budget", type=int, default=240,
                    help="maximum s07 postprocess candidates to evaluate; <=0 keeps full grid")
+    p.add_argument("--postprocess_warmup_frames", type=int, default=3,
+                   help="s07 window-level metrics skip this many leading state-machine windows per sample")
     p.add_argument("--commercial_compare", action=argparse.BooleanOptionalAction, default=False,
                    help="run optional s09 commercial-vs-project comparison")
     p.add_argument("--commercial_split", default="test", choices=["train", "valid", "test"],
@@ -2274,9 +2526,9 @@ def main():
     p.add_argument("--keep_window_probs", action="store_true",
                    help="keep per-window probabilities in s09 commercial comparison details")
     p.add_argument("--run_generalization_audit", action=argparse.BooleanOptionalAction, default=False,
-                   help="run optional s10 generalization audit after s06_eval")
+                   help="run optional generalization audit after s06_eval")
     p.add_argument("--audit_min_support", type=int, default=10,
-                   help="minimum sample/window count before a stratum is treated as reliable in s10")
+                   help="minimum sample/window count before a stratum is treated as reliable in generalization audit")
     p.add_argument("--hard_negative_weight", type=float, default=3.0,
                    help="s05 sample weight assigned to train-only mined hard negatives")
     p.add_argument("--hard_negative_top_percentile", type=float, default=0.10,
@@ -2352,13 +2604,16 @@ def main():
         ("s03",       "特征池提取"),
         ("s04",       "稳定性特征筛选"),
         ("s04_search","候选特征子集搜索"),
+        ("s04_embed", "Feature embedding PCA/t-SNE/UMAP report"),
         ("s05",       "XGBoost 模型训练"),
+        ("s05_viz",   "ROC/PR 曲线图"),
         ("s06_opt",   "状态机参数优化"),
         ("s06_cache", "导出 valid 逐窗 NPZ 缓存"),
         ("s06_replay_cache", "导出 replay 逐窗 NPZ 缓存"),
         ("s07_post",  "FP 敏感后处理搜参"),
         ("s06_eval",  "端到端评估"),
-        ("s10_audit", "泛化审计"),
+        ("s06_tree_viz", "XGBoost 树特征使用图"),
+        ("s06_audit", "泛化审计"),
         ("s06_xpt",   "导出部署产物"),
         ("s06_feat",  "导出特征提取脚本"),
         ("s06_plot",  "画错误样本图"),
@@ -2367,8 +2622,12 @@ def main():
     ]
 
     skip_set = {s.strip() for s in args.skip.split(",") if s.strip()}
+    if "s10_audit" in skip_set:
+        skip_set.add("s06_audit")
     raw_stop_after = args.stop_after
     stop_after = "s09_cmp" if raw_stop_after == "commercial_compare" else raw_stop_after
+    if stop_after == "s10_audit":
+        stop_after = "s06_audit"
     step_keys = [key for key, _ in all_steps]
     if stop_after not in step_keys:
         print(f"[ERROR] unknown --stop_after={raw_stop_after!r}; choose one of: {','.join(step_keys + ['commercial_compare'])}")
@@ -2386,9 +2645,12 @@ def main():
     if stop_after == "s09_cmp" and "s09_cmp" not in skip_set and not args.commercial_compare:
         args.commercial_compare = True
         auto_enabled.append("--commercial_compare")
-    if stop_after == "s10_audit" and "s10_audit" not in skip_set and not args.run_generalization_audit:
+    if stop_after == "s06_audit" and "s06_audit" not in skip_set and not args.run_generalization_audit:
         args.run_generalization_audit = True
         auto_enabled.append("--run_generalization_audit")
+    if stop_after == "s04_embed" and "s04_embed" not in skip_set and not args.plot_feature_embeddings:
+        args.plot_feature_embeddings = True
+        auto_enabled.append("--plot_feature_embeddings")
     if auto_enabled:
         print("[auto] enabled for --stop_after target: " + ", ".join(auto_enabled))
 
@@ -2466,6 +2728,21 @@ def main():
             f'--subset_search_max_features {args.max_features} '
             f'--n_workers {args.n_workers}'
         )
+
+    # s04_embed: publication-style feature-space embedding report for PPT/manuscript figures.
+    if "s04_embed" not in skip_set and args.plot_feature_embeddings:
+        commands["s04_embed"] = (
+            f'__feature_embedding_report__ '
+            f'--methods "{args.embedding_methods}" '
+            f'--dims "{args.embedding_dims}" '
+            f'--formats "{args.embedding_formats}" '
+            f'--max_points {args.embedding_max_points} '
+            f'--perplexity {args.embedding_perplexity} '
+            f'--random_state {args.embedding_random_state} '
+            f'--dpi {args.embedding_dpi}'
+        )
+    elif "s04_embed" not in skip_set:
+        print("(s04_embed: --no-plot_feature_embeddings skipped)")
 
     # s05
     if "s05" not in skip_set:
@@ -2574,17 +2851,16 @@ def main():
             f'--window_output_root window_outputs'
         )
 
-    # s10_audit: read-only commercial generalization audit over existing artifacts.
-    if "s10_audit" not in skip_set and args.run_generalization_audit:
-        commands["s10_audit"] = (
-            f'"{PYTHON}" "{_script_path("s10_generalization_audit")}" '
-            f'--artifact_dir "{args.artifact_dir}" '
+    # s06_audit: read-only generalization audit over existing artifacts.
+    if "s06_audit" not in skip_set and args.run_generalization_audit:
+        commands["s06_audit"] = (
+            f'__generalization_audit__ '
             f'--split {args.split} '
             f'--method state_machine '
             f'--min_support {args.audit_min_support}'
         )
-    elif "s10_audit" not in skip_set:
-        print("(s10_audit: --no-run_generalization_audit skipped)")
+    elif "s06_audit" not in skip_set:
+        print("(s06_audit: --no-run_generalization_audit skipped)")
 
     # s07_post: tune the richer FP-sensitive state machine on cached windows.
     if "s07_post" not in skip_set and args.optimize_postprocess:
@@ -2598,6 +2874,7 @@ def main():
             f'--max_false_worn_event_rate {args.max_false_worn_event_rate} '
             f'--max_first_worn_output_p95_sec {args.max_first_worn_output_p95_sec} '
             f'--search_budget {args.postprocess_search_budget} '
+            f'--warmup_frames {args.postprocess_warmup_frames} '
             f'--n_workers {args.n_workers} '
             f'--replay_split {args.split}'
         )
@@ -2644,6 +2921,18 @@ def main():
     elif "s06_cb" not in skip_set:
         print("(s06_cb: --no-export_deploy_cookbook 跳过)")
 
+    # s05_viz — ROC/PR curves (embedded)
+    if "s05_viz" not in skip_set and args.roc_pr_curves:
+        commands["s05_viz"] = "__s05_viz__"
+    elif "s05_viz" not in skip_set:
+        print("(s05_viz: --no-roc_pr_curves 跳过)")
+
+    # s06_tree_viz — XGBoost tree feature usage (embedded)
+    if "s06_tree_viz" not in skip_set and args.export_tree_viz:
+        commands["s06_tree_viz"] = "__s06_tree_viz__"
+    elif "s06_tree_viz" not in skip_set:
+        print("(s06_tree_viz: --no-export_tree_viz 跳过)")
+
     # ── 执行 ──
     print("=" * 70)
     print(" 手表佩戴活体检测 — 全流程")
@@ -2673,7 +2962,13 @@ def main():
         if cmd is None:
             continue  # optional step not requested
 
-        if args.dry_run and cmd in {"__plot__", "__extractor__", "__cookbook__", "__commercial_compare__"}:
+        special_cmd = (
+            cmd in {"__plot__", "__extractor__", "__cookbook__", "__commercial_compare__",
+                    "__s05_viz__", "__s06_tree_viz__"}
+            or str(cmd).startswith("__feature_embedding_report__")
+            or str(cmd).startswith("__generalization_audit__")
+        )
+        if args.dry_run and special_cmd:
             print(f"\n[RUN] {display_name}")
             print(f"  {cmd}")
             print("  (dry-run, skipped)")
@@ -2738,7 +3033,78 @@ def main():
             print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
             if key == stop_after:
                 stopped_at = key
-                print(f"\n[STOP] 宸茶揪鍒?--stop_after={stop_after}锛屽仠姝?")
+                print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
+                break
+            continue
+
+        if str(cmd).startswith("__feature_embedding_report__"):
+            t0 = time.time()
+            run_embedded_feature_embedding_report(args)
+            dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
+            completed_keys.add(key)
+            print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
+            if key == stop_after:
+                stopped_at = key
+                print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
+                break
+            continue
+
+        if str(cmd).startswith("__generalization_audit__"):
+            t0 = time.time()
+            run_embedded_generalization_audit(args)
+            dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
+            completed_keys.add(key)
+            print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
+            if key == stop_after:
+                stopped_at = key
+                print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
+                break
+            continue
+
+        if cmd == "__s05_viz__":
+            t0 = time.time()
+            _bundle_path = os.path.join(args.artifact_dir, "model_bundle.pkl")
+            _valid_csv = os.path.join(args.artifact_dir, "feature_pool_valid.csv")
+            if os.path.exists(_bundle_path) and os.path.exists(_valid_csv):
+                import pandas as _pd
+                _bundle = joblib.load(_bundle_path)
+                _model = _bundle.get("model") or _bundle.get("raw_model")
+                _feat = list(_bundle["feature_names"])
+                _fill = _bundle.get("fill_values", {})
+                _df = _pd.read_csv(_valid_csv)
+                _y = _df["target"].values.astype(int)
+                _X = _df[_feat].fillna({f: _fill.get(f, 0.0) for f in _feat}).values.astype(float)
+                import s05_train_final_model as _s05
+                _s05.export_roc_pr_curves(_model, _X, _y, args.artifact_dir)
+            else:
+                print(f"[WARN] skip s05_viz: need model_bundle.pkl and feature_pool_valid.csv")
+            dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
+            completed_keys.add(key)
+            print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
+            if key == stop_after:
+                stopped_at = key
+                print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
+                break
+            continue
+
+        if cmd == "__s06_tree_viz__":
+            t0 = time.time()
+            _bundle_path2 = os.path.join(args.artifact_dir, "model_bundle.pkl")
+            if os.path.exists(_bundle_path2):
+                import s06_deploy_eval as _s06
+                _s06.export_tree_feature_usage_plot(args.artifact_dir)
+            else:
+                print("[WARN] skip s06_tree_viz: model_bundle.pkl not found")
+            dt = time.time() - t0
+            _record_runtime(runtime_events, display_name, dt, dry_run=False)
+            completed_keys.add(key)
+            print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
+            if key == stop_after:
+                stopped_at = key
+                print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
                 break
             continue
 

@@ -133,9 +133,10 @@ def test_generalization_audit_exports_strata_and_action_items(tmp_path):
     result = subprocess.run(
         [
             sys.executable,
-            str(ROOT / "s10_generalization_audit.py"),
+            str(ROOT / "s06_deploy_eval.py"),
             "--artifact_dir",
             str(tmp_path),
+            "--generalization_audit",
             "--split",
             "test",
             "--method",
@@ -157,6 +158,8 @@ def test_generalization_audit_exports_strata_and_action_items(tmp_path):
         "window_strata.csv",
         "sample_strata.csv",
         "action_items.csv",
+        "audit_ranked_error_bars.png",
+        "audit_latency_distribution.png",
     ]:
         assert (out_dir / name).exists()
 
@@ -185,7 +188,7 @@ def test_generalization_audit_exports_strata_and_action_items(tmp_path):
 
 
 def test_sample_latency_can_be_derived_from_state_windows():
-    from s10_generalization_audit import summarize_sample_metrics
+    from s06_deploy_eval import summarize_sample_metrics
 
     metrics = summarize_sample_metrics(pd.DataFrame([
         {
@@ -223,7 +226,7 @@ def test_s08_dry_run_can_insert_generalization_audit_after_eval():
             "--dry_run",
             "--run_generalization_audit",
             "--stop_after",
-            "s10_audit",
+            "s06_audit",
         ],
         cwd=str(ROOT),
         text=True,
@@ -233,14 +236,15 @@ def test_s08_dry_run_can_insert_generalization_audit_after_eval():
 
     output = result.stdout + result.stderr
     eval_pos = output.index("s06_deploy_eval.py")
-    audit_pos = output.index("s10_generalization_audit.py")
+    assert "s10_generalization_audit.py" not in output
+    audit_pos = output.index("__generalization_audit__")
     assert eval_pos < audit_pos
     assert "--split test" in output
     assert "--method state_machine" in output
 
 
 def test_audit_action_items_include_quality_aware_threshold_and_search_stability():
-    from s10_generalization_audit import build_action_items
+    from s06_deploy_eval import build_action_items
 
     window_strata = pd.DataFrame([
         {
@@ -302,7 +306,7 @@ def test_audit_action_items_include_quality_aware_threshold_and_search_stability
 
 
 def test_audit_bins_green_reliability_features_and_flags_fp_clusters():
-    from s10_generalization_audit import build_action_items, build_strata
+    from s06_deploy_eval import build_action_items, build_strata
 
     window_df = pd.DataFrame([
         {

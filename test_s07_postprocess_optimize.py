@@ -117,6 +117,66 @@ def test_s07_window_accuracy_uses_per_window_targets_from_cache():
     assert metrics["window_accuracy"] == 1.0
 
 
+def test_s07_window_accuracy_can_skip_state_machine_warmup_windows():
+    cache = {
+        "sample_name": "warmup-pos",
+        "target": 1,
+        "window_end_sec": np.array([1.0, 2.0, 3.0]),
+        "stage1_enabled": np.array([1, 1, 1]),
+        "prob_raw": np.array([0.9, 0.9, 0.9]),
+        "quality": np.ones(3),
+        "stride_sec": 1.0,
+        "window_targets": np.array([1, 1, 1]),
+    }
+    params = {
+        "ema_alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.5,
+        "K_on": 3,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+    }
+
+    _details, cold_metrics = s07.evaluate_postprocess_on_caches(
+        [cache], params, warmup_frames=0)
+    _details, warm_metrics = s07.evaluate_postprocess_on_caches(
+        [cache], params, warmup_frames=2)
+
+    assert cold_metrics["window_accuracy"] == 1 / 3
+    assert warm_metrics["window_accuracy"] == 1.0
+    assert warm_metrics["skipped_warmup_windows"] == 2
+
+
+def test_s07_postprocess_handles_empty_window_cache_without_unbound_state():
+    params = {
+        "ema_alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.5,
+        "K_on": 1,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+    }
+    cache = {
+        "sample_name": "empty",
+        "target": 1,
+        "window_end_sec": np.array([], dtype=float),
+        "stage1_enabled": np.array([], dtype=int),
+        "prob_raw": np.array([], dtype=float),
+        "quality": np.array([], dtype=float),
+        "stride_sec": 1.0,
+        "window_targets": np.array([], dtype=int),
+    }
+
+    detail = s07.run_postprocess_on_cache(cache, params)
+
+    assert detail["pred"] == 0
+    assert detail["states"] == []
+    assert detail["scores"] == []
+    assert detail["window_targets"] == []
+
+
 def test_s07_postprocess_state_machine_matches_s06_leaky_counter_semantics():
     probs = [0.8, 0.8, 0.6, 0.8, 0.8]
     params = {
