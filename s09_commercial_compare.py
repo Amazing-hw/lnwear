@@ -281,7 +281,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
             mode = detect_green_mode(ppg)
             for idx in range(ppg.shape[0]):
                 raw_window = ppg[idx]
-                window_25, ppg_src_fs = _prewindow_to_25hz(sample, raw_window, window_sec=window_sec)
+                window_25, ppg_src_fs = _prewindow_to_25hz(sample, raw_window, window_sec=COMMERCIAL_WIN_SEC)
                 enabled = _commercial_stage1_window_pass(raw_window, dc_threshold, ppg_src_fs)
                 base["stage2_enabled_flags"].append(int(enabled))
                 if not enabled:
@@ -291,7 +291,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
                     ir, ambient, g1, g2, g3 = get_channels_from_window(window_25, mode)
                     acc_seg = None
                     if acc is not None and is_prewindowed_signal(acc) and idx < acc.shape[0]:
-                        acc_seg, _ = _prewindow_to_25hz(sample, acc[idx], window_sec=window_sec)
+                        acc_seg, _ = _prewindow_to_25hz(sample, acc[idx], window_sec=COMMERCIAL_WIN_SEC)
                     base["features"].append(extract_8_commercial_features(ir, ambient, g1, g2, g3, acc_seg))
                 except Exception:
                     base["features"].append(None)
@@ -590,7 +590,7 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
     )
     probs = np.zeros(n_steps, dtype=float)
     window_preds = np.zeros(n_steps, dtype=int)
-    flags = []
+    flags = [0] * n_steps
     valid_indices = []
     feature_vectors = []
 
@@ -604,7 +604,7 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
         enabled, last_s1_step = _advance_stage1_gate_to_step(
             gate, ir_5hz, s1_win, s1_stride, last_s1_step, target_s1_step
         )
-        flags.append(int(enabled))
+        flags[step] = int(enabled)
         if not enabled:
             continue
         try:

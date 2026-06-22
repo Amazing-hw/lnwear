@@ -1145,13 +1145,13 @@ def run_embedded_feature_embedding_report(args):
 
     result = feature_selection.run_embedding_report(
         artifact_dir=args.artifact_dir,
-        methods=_parse_csv_strings(args.embedding_methods),
-        dims=_parse_csv_ints(args.embedding_dims),
-        formats=_parse_csv_strings(args.embedding_formats),
-        max_points=args.embedding_max_points,
-        perplexity=args.embedding_perplexity,
-        random_state=args.embedding_random_state,
-        dpi=args.embedding_dpi,
+        methods=_parse_csv_strings("pca,tsne"),
+        dims=_parse_csv_ints("2,3"),
+        formats=_parse_csv_strings("png,svg,pdf,tiff"),
+        max_points=0,
+        perplexity=30.0,
+        random_state=42,
+        dpi=600,
     )
     print(f"[OK] feature embedding report -> {result['report_path']}")
 
@@ -2465,28 +2465,7 @@ def main():
                    help="s06 导出部署产物 (--no-export_deploy 跳过)")
     p.add_argument("--optimize", action=argparse.BooleanOptionalAction, default=False,
                    help="s06 运行 legacy 状态机参数优化；默认不跑，需显式 --optimize")
-    p.add_argument("--plot_errors", action=argparse.BooleanOptionalAction, default=True,
-                   help="s06 评估后画出错误样本图 (--no-plot_errors 跳过)")
-    p.add_argument("--plot_feature_embeddings", action=argparse.BooleanOptionalAction, default=False,
-                   help="generate PCA/t-SNE/UMAP 2D/3D feature embedding report after s04_search")
-    p.add_argument("--embedding_methods", default="pca,tsne",
-                   help="comma-separated embedding methods for s04 embedding report; add umap explicitly when umap-learn is stable")
-    p.add_argument("--embedding_dims", default="2,3",
-                   help="comma-separated embedding dimensions for s04 embedding report: 2,3")
-    p.add_argument("--embedding_formats", default="png,svg,pdf,tiff",
-                   help="comma-separated figure formats for s04 embedding report")
-    p.add_argument("--embedding_max_points", type=int, default=0,
-                   help="s04 embedding report max plotted windows; 0 means all windows")
-    p.add_argument("--embedding_perplexity", type=float, default=30.0,
-                   help="s04 embedding report t-SNE perplexity before automatic small-dataset clipping")
-    p.add_argument("--embedding_random_state", type=int, default=42,
-                   help="s04 embedding report random seed")
-    p.add_argument("--embedding_dpi", type=int, default=600,
-                   help="s04 embedding report raster export DPI")
-    p.add_argument("--roc_pr_curves", action=argparse.BooleanOptionalAction, default=True,
-                   help="s05 训练后导出 ROC/PR 曲线图 (--no-roc_pr_curves 跳过)")
-    p.add_argument("--export_tree_viz", action=argparse.BooleanOptionalAction, default=True,
-                   help="s06 评估后导出 XGBoost 树特征使用图 (--no-export_tree_viz 跳过)")
+    # 图表分析均为默认行为，无需 CLI 配置
     p.add_argument("--export_window_cache", action=argparse.BooleanOptionalAction, default=False,
                    help="export window-level NPZ cache for s07 postprocess optimization")
     p.add_argument("--optimize_postprocess", action=argparse.BooleanOptionalAction, default=False,
@@ -2648,9 +2627,6 @@ def main():
     if stop_after == "s06_audit" and "s06_audit" not in skip_set and not args.run_generalization_audit:
         args.run_generalization_audit = True
         auto_enabled.append("--run_generalization_audit")
-    if stop_after == "s04_embed" and "s04_embed" not in skip_set and not args.plot_feature_embeddings:
-        args.plot_feature_embeddings = True
-        auto_enabled.append("--plot_feature_embeddings")
     if auto_enabled:
         print("[auto] enabled for --stop_after target: " + ", ".join(auto_enabled))
 
@@ -2729,20 +2705,18 @@ def main():
             f'--n_workers {args.n_workers}'
         )
 
-    # s04_embed: publication-style feature-space embedding report for PPT/manuscript figures.
-    if "s04_embed" not in skip_set and args.plot_feature_embeddings:
+    # s04_embed: 特征空间嵌入可视化报告（默认自动生成）
+    if "s04_embed" not in skip_set:
         commands["s04_embed"] = (
             f'__feature_embedding_report__ '
-            f'--methods "{args.embedding_methods}" '
-            f'--dims "{args.embedding_dims}" '
-            f'--formats "{args.embedding_formats}" '
-            f'--max_points {args.embedding_max_points} '
-            f'--perplexity {args.embedding_perplexity} '
-            f'--random_state {args.embedding_random_state} '
-            f'--dpi {args.embedding_dpi}'
+            f'--methods "pca,tsne" '
+            f'--dims "2,3" '
+            f'--formats "png,svg,pdf,tiff" '
+            f'--max_points 0 '
+            f'--perplexity 30.0 '
+            f'--random_state 42 '
+            f'--dpi 600'
         )
-    elif "s04_embed" not in skip_set:
-        print("(s04_embed: --no-plot_feature_embeddings skipped)")
 
     # s05
     if "s05" not in skip_set:
@@ -2903,11 +2877,9 @@ def main():
     elif "s09_cmp" not in skip_set:
         print("(商业窗口级对比: --no-commercial_compare skipped; output window_level_compare.csv when enabled)")
 
-    # s06_plot (纯 Python 调用，非子进程)
-    if "s06_plot" not in skip_set and args.plot_errors:
-        commands["s06_plot"] = "__plot__"  # 特殊标记
-    elif "s06_plot" not in skip_set:
-        print("(s06_plot: --no-plot_errors 跳过)")
+    # s06_plot (纯 Python 调用，非子进程，默认自动生成)
+    if "s06_plot" not in skip_set:
+        commands["s06_plot"] = "__plot__"
 
     # s06_feat (纯 Python 调用)
     if "s06_feat" not in skip_set and args.export_deploy_cookbook:
@@ -2921,17 +2893,13 @@ def main():
     elif "s06_cb" not in skip_set:
         print("(s06_cb: --no-export_deploy_cookbook 跳过)")
 
-    # s05_viz — ROC/PR curves (embedded)
-    if "s05_viz" not in skip_set and args.roc_pr_curves:
+    # s05_viz — ROC/PR curves (embedded, 默认自动生成)
+    if "s05_viz" not in skip_set:
         commands["s05_viz"] = "__s05_viz__"
-    elif "s05_viz" not in skip_set:
-        print("(s05_viz: --no-roc_pr_curves 跳过)")
 
-    # s06_tree_viz — XGBoost tree feature usage (embedded)
-    if "s06_tree_viz" not in skip_set and args.export_tree_viz:
+    # s06_tree_viz — XGBoost tree feature usage (embedded, 默认自动生成)
+    if "s06_tree_viz" not in skip_set:
         commands["s06_tree_viz"] = "__s06_tree_viz__"
-    elif "s06_tree_viz" not in skip_set:
-        print("(s06_tree_viz: --no-export_tree_viz 跳过)")
 
     # ── 执行 ──
     print("=" * 70)

@@ -1,8 +1,8 @@
-# Wearing Liveness Detection Pipeline
+# 手表佩戴/活体检测流水线
 
-这是一个面向手表佩戴/活体检测的训练、评估和部署导出流水线。项目把原始 H5 中的 PPG/ACC 信号处理成 Stage2 窗口级特征，用 XGBoost 训练窗口模型，再用端到端评估和可选的状态机后处理控制误触发、响应时延和部署复杂度。
+本项目是一个面向手表佩戴/活体检测的训练、评估和部署导出流水线。把原始 H5 中的 PPG/ACC 信号处理成 Stage2 窗口级特征，用 XGBoost 训练窗口模型，再用端到端评估和可选的状态机后处理控制误触发、响应时延和部署复杂度。
 
-当前推荐入口是：
+当前推荐入口：
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
@@ -26,15 +26,15 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 
 ```text
 原始 H5
-  -> s01 数据扫描与 train/valid/test 切分
-  -> s02 Stage1 IR DC/ACDC 固定阈值门控
-  -> s03 Stage2 特征池提取
-  -> s04 稳定性特征筛选与候选子集搜索
-  -> s05 XGBoost 训练、校准、阈值选择、模型搜索
-  -> s06 部署式端到端评估与部署产物导出
-  -> s07 可选：基于窗口 NPZ 的后处理状态机搜索
-  -> s09 可选：商业 AdaBoost baseline 对比
-  -> s06 可选：泛化审计
+  → s01 数据扫描与 train/valid/test 切分
+  → s02 Stage1 IR DC/ACDC 固定阈值门控
+  → s03 Stage2 特征池提取
+  → s04 稳定性特征筛选与候选子集搜索
+  → s05 XGBoost 训练、校准、阈值选择、模型搜索
+  → s06 部署式端到端评估与部署产物导出
+  → s07 可选：基于窗口 NPZ 的后处理状态机搜索
+  → s09 可选：商业 AdaBoost baseline 对比
+  → s06 可选：泛化审计
 ```
 
 ### Stage1
@@ -60,8 +60,16 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 默认会运行：
 
 ```text
-s01 -> s02 -> s03 -> s04 -> s04_search -> s05 -> s05_viz -> s06_eval -> s06_tree_viz -> s06_xpt -> s06_feat -> s06_plot -> s06_cb
+s01 → s02 → s03 → s04 → s04_search → s04_embed → s05 → s05_viz → s06_eval → s06_tree_viz → s06_xpt → s06_feat → s06_plot → s06_cb
 ```
+
+其中：
+- `s04_embed` 自动生成特征嵌入可视化报告（PCA / t-SNE 2D/3D 图、特征分布图、相关性热力图等）
+- `s05_viz` 自动生成 ROC/PR 曲线、阈值选择图、FP-Recall 权衡图
+- `s06_plot` 自动画出错误样本的时序分析图
+- `s06_tree_viz` 自动生成 XGBoost 树结构特征使用分析图
+
+以上图表分析均为流水线默认输出，无需额外 CLI 参数。
 
 默认关键参数：
 
@@ -85,7 +93,6 @@ stop_after:                    s06_cb
 默认不会运行：
 
 ```text
-s04_embed                      s04 内嵌 PCA/t-SNE/UMAP feature embedding report
 s06_cache / s06_replay_cache   逐窗 NPZ 缓存导出
 s07_post                       后处理状态机搜索
 s06_audit                      s06 内嵌泛化审计
@@ -108,6 +115,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 - 先优化 Stage2 单窗口准确率。
 - 保留复杂度受限的 XGBoost 搜参。
 - 不自动跑后处理搜索，避免把窗口模型问题藏在状态机里。
+- 自动输出全部图表分析结果。
 - 适合第一次训练、检查数据质量、做基线、交付第一版部署产物。
 
 ### 使用 `--with_postprocess`：只加后处理搜索
@@ -156,8 +164,8 @@ ranking_objective:        balanced
 threshold_objective:      precision_constrained
 threshold_min_precision:  0.97   # 未手动传参时
 model_search_fp_cost:     4.0    # 未手动传参时
-fp_cost_weight:           >=0.35 # 未手动传参时
-postprocess_fp_cost:      >=4.0  # 未手动传参时
+fp_cost_weight:           ≥0.35  # 未手动传参时
+postprocess_fp_cost:      ≥4.0   # 未手动传参时
 ```
 
 auto 结束后会写：
@@ -207,7 +215,7 @@ python s08_run_pipeline.py \
 
 这会保留你手动指定的 `0.995` 和 `5.0`。
 
-## 5. 场景化 CLI
+## 5. 场景化使用方式
 
 ### 5.1 只预览命令
 
@@ -239,6 +247,9 @@ artifacts/deploy_xgboost.json
 artifacts/deploy_cookbook.json
 artifacts/golden_vectors.json
 artifacts/deploy_package/
+artifacts/report_plots/                  # 全部图表自动生成
+artifacts/feature_embedding_report/      # 特征嵌入可视化报告
+artifacts/error_plots/                  # 错误样本时序图
 ```
 
 ### 5.3 快速检查到某一步
@@ -325,7 +336,7 @@ python s08_run_pipeline.py \
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
-  --skip s01,s02,s03,s04,s04_search,s05 \
+  --skip s01,s02,s03,s04,s04_search,s04_embed,s05 \
   --export_window_cache \
   --optimize_postprocess \
   --postprocess_split valid \
@@ -425,74 +436,6 @@ python s08_run_pipeline.py \
   --stop_after s09_cmp
 ```
 
-### 5.13 PPT / paper feature embedding figures
-
-This step generates publication-style 2D and 3D PCA/t-SNE figures from extracted window-level feature rows. If `selected_features.json` exists, the embedding uses the selected features; otherwise it falls back to all numeric feature-pool columns. UMAP is optional and should be enabled explicitly when `umap-learn` is installed and stable in the current environment.
-
-```bash
-python s08_run_pipeline.py \
-  --dataset_dir dataset \
-  --artifact_dir artifacts \
-  --plot_feature_embeddings \
-  --stop_after s04_embed
-```
-
-Enable UMAP explicitly:
-
-```bash
-python s08_run_pipeline.py \
-  --artifact_dir artifacts \
-  --skip s01,s02,s03,s04,s04_search \
-  --plot_feature_embeddings \
-  --embedding_methods pca,tsne,umap \
-  --stop_after s04_embed
-```
-
-If `feature_pool_train.csv`, `feature_pool_valid.csv`, and `feature_pool_test.csv` already exist, reuse them directly:
-
-```bash
-python s08_run_pipeline.py \
-  --artifact_dir artifacts \
-  --skip s01,s02,s03,s04,s04_search \
-  --stop_after s04_embed
-```
-
-Output directory:
-
-```text
-artifacts/feature_embedding_report/
-  embedding_report.md
-  embedding_summary.json
-  embedding_source_data.csv
-  selected_feature_distribution_source_data.csv
-  pca_2d / pca_3d in png, svg, pdf, tiff
-  tsne_2d / tsne_3d in png, svg, pdf, tiff
-  umap_2d / umap_3d in png, svg, pdf, tiff  (requires umap-learn)
-  embedding_panel_2d / embedding_panel_3d
-  selected_feature_correlation_heatmap
-  selected_feature_split_auc_heatmap
-  pca_loading_top_features
-  feature_distribution_01_<feature> ... one figure per selected feature
-```
-
-Useful options:
-
-```bash
-# Use all windows, default
---embedding_max_points 0
-
-# Speed up exploratory plotting with stratified sampling
---embedding_max_points 5000
-
-# Export only PPT-friendly PNG and vector SVG
---embedding_formats png,svg
-
-# PCA only, fast smoke test
---embedding_methods pca
-```
-
-UMAP is optional because it requires `umap-learn`. If requested and the package is missing, the report still writes PCA/t-SNE figures and records the UMAP skip reason in `embedding_summary.json`.
-
 ## 6. `s08_run_pipeline.py` 步骤控制
 
 可用 `--stop_after`：
@@ -540,7 +483,6 @@ python s08_run_pipeline.py \
 
 - `--stop_after s06_cache`、`s06_replay_cache` 或 `s07_post` 会按需打开 `--export_window_cache`。
 - `--stop_after s07_post` 会按需打开 `--optimize_postprocess`。
-- `--stop_after s04_embed` 会按需打开 `--plot_feature_embeddings`。
 - `--stop_after s06_audit` 会按需打开 `--run_generalization_audit`。
 - `--stop_after s09_cmp` 会按需打开 `--commercial_compare`。
 
@@ -791,6 +733,19 @@ artifacts/
   report_plots/s06_deploy_report.png
   report_plots/s06_tree_feature_usage.png
   error_plots/
+
+  feature_embedding_report/
+  feature_embedding_report/embedding_report.md
+  feature_embedding_report/embedding_summary.json
+  feature_embedding_report/embedding_source_data.csv
+  feature_embedding_report/pca_2d / pca_3d (png, svg, pdf, tiff)
+  feature_embedding_report/tsne_2d / tsne_3d (png, svg, pdf, tiff)
+  feature_embedding_report/umap_2d / umap_3d (png, svg, pdf, tiff, 需 umap-learn)
+  feature_embedding_report/embedding_panel_2d / embedding_panel_3d
+  feature_embedding_report/selected_feature_correlation_heatmap
+  feature_embedding_report/selected_feature_split_auc_heatmap
+  feature_embedding_report/pca_loading_top_features
+  feature_embedding_report/feature_distribution_XX_特征名 (每个入选特征一张)
 ```
 
 重要文件解释：
@@ -804,9 +759,9 @@ artifacts/
 - `postprocess_opt/postprocess_replay_valid_to_test.json`：后处理在 valid 选参、test replay 的结果。
 - `auto_optimize/auto_optimization_summary.json`：仅 `--auto_optimize_e2e` 写入的自动选择摘要。
 
-## 10. 图片输出说明
+## 10. 图片输出说明（全部默认自动生成）
 
-流水线会在各阶段自动生成以下分析图，全部输出到 `report_plots/` 子目录及对应模块目录。
+流水线会在各阶段自动生成以下分析图，全部输出到 `report_plots/` 子目录及对应模块目录，无需额外 CLI 参数。
 
 ### 10.1 Stage1 门控散点图
 
@@ -826,7 +781,7 @@ artifacts/
 | 图片 | 说明 |
 |---|---|
 | `report_plots/s05_training_report.png` | 三栏：上图全宽阈值选择曲线（precision/recall/F-beta/F1 vs 阈值，虚线标出选中阈值），左下三组验证指标 precision/recall 柱状，右下校准方法信息框 |
-| `report_plots/s05_threshold_fp_recall_tradeoff.png` | 低误判上线用阈值权衡图：左侧展示 threshold vs precision/recall/false-positive-rate，右侧展示 recall vs false-positive-rate，并标出当前选中阈值。同步导出 `s05_threshold_fp_recall_tradeoff.csv` |
+| `report_plots/s05_threshold_fp_recall_tradeoff.png` | 低误判上线用阈值权衡图：左侧展示 threshold vs precision/recall/false-positive-rate，右侧展示 recall vs false-positive-rate，并标出当前选中阈值。同步导出 CSV |
 | `report_plots/s05_roc_pr_curves.png` | 四栏 2×2：左上完整 ROC 曲线（FPR vs TPR, AUC 标注），右上完整 PR 曲线（Recall vs Precision, iso-F1 等高虚线），左下放大 ROC（FPR 0-0.2），右下放大 PR（高精度区域）。数据来自 valid 分割 |
 
 ### 10.4 部署评估报告图（s06）
@@ -835,7 +790,7 @@ artifacts/
 |---|---|
 | `report_plots/s06_deploy_report.png` | 六栏 2×3 仪表盘：左上 Stage 漏斗（输入→Stage1通过→正类），中上样本混淆矩阵热力图，右上窗口概率分布直方图（红=target0，绿=target1），左下 sample/window-model/state-stream 三项指标柱状对比，中下 Top 误报样本概率横向柱状，右下 Stage1 分层错误 FP/FN 柱状 |
 | `report_plots/s06_tree_feature_usage.png` | 四栏 2×2 XGBoost 树结构分析：左上特征分裂次数柱状（Top 15），右上特征平均 Gain 柱状（Top 15），左下特征平均 Cover 柱状（Top 15），右下各树节点数分布直方图 + 总节点数/均值/中位数标注 |
-| `error_plots/{sample_name}.png` | 仅对预测错误的样本逐一样本生成 4 行时序图：①真实标签、②窗口级 XGBoost 概率、③状态机 EMA Score、④状态机最终输出标签。可透过 `--no-plot_errors` 跳过 |
+| `error_plots/{样本名}.png` | 仅对预测错误的样本逐一样本生成 4 行时序图：①真实标签、②窗口级 XGBoost 概率、③状态机 EMA Score、④状态机最终输出标签 |
 
 ### 10.5 后处理搜索图（s07）
 
@@ -848,10 +803,10 @@ artifacts/
 | 图片 | 说明 |
 |---|---|
 | `generalization_audit/audit_strata_heatmap.png` | 按维度×层级分别展示 accuracy/precision/recall/fp_rate 的热力图（红-绿渐变），低支持度层级加灰色横线标记。截断至 Top 50 层级 |
-| `generalization_audit/audit_ranked_error_bars.png` | 按 window/sample 分层把 FP/FN 错误数排序展示，优先暴露最需要补数、加 hard negative 或单独调阈值的 stratum。同步导出 `audit_ranked_error_bars.csv` |
-| `generalization_audit/audit_latency_distribution.png` | 正样本 first-worn 输出延迟分布与负样本 false-worn 风险摘要，用于同时检查出值速度和误戴风险。同步导出 `audit_latency_distribution.csv` |
+| `generalization_audit/audit_ranked_error_bars.png` | 按 window/sample 分层把 FP/FN 错误数排序展示，优先暴露最需要补数、加 hard negative 或单独调阈值的 stratum。同步导出 CSV |
+| `generalization_audit/audit_latency_distribution.png` | 正样本 first-worn 输出延迟分布与负样本 false-worn 风险摘要，用于同时检查出值速度和误戴风险。同步导出 CSV |
 
-### 10.7 特征嵌入可视化（s04_embed）
+### 10.7 特征嵌入可视化（s04_embed，默认自动生成）
 
 | 图片 | 说明 |
 |---|---|
@@ -866,7 +821,9 @@ artifacts/
 | `feature_embedding_report/selected_feature_correlation_heatmap.{png,...}` | 入选特征 Pearson 相关性热图，用于检查冗余和特征簇 |
 | `feature_embedding_report/selected_feature_split_auc_heatmap.{png,...}` | 入选特征在 train/valid/test 各 split 的单变量 AUC separation 热图，用于检查分布漂移和泛化稳定性 |
 | `feature_embedding_report/pca_loading_top_features.{png,...}` | PCA 前两主成分 loading 贡献最高的特征条形图，用于解释降维分离来源 |
-| `feature_embedding_report/feature_distribution_{idx}_{name}.{png,...}` | 每个入选特征在 target=0/1 两类的分布对比箱线图 + 散点覆盖，Nature 期刊风格 (7pt 字体, 600 DPI) |
+| `feature_embedding_report/feature_distribution_{序号}_{特征名}.{png,...}` | 每个入选特征在 target=0/1 两类的分布对比箱线图 + 散点覆盖 |
+
+UMAP 需安装 `umap-learn` 包。如未安装，报告仍会输出 PCA 和 t-SNE 图，并在 `embedding_summary.json` 中记录 UMAP 跳过原因。
 
 ### 10.8 商业对比图（s09）
 
@@ -997,7 +954,7 @@ python s08_run_pipeline.py \
 python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q
 ```
 
-模型搜索和 CLI 配置测试：
+模型搜索和配置测试：
 
 ```bash
 python -m pytest test_model_search_config.py -q
@@ -1071,7 +1028,7 @@ s07_postprocess_optimize.py
 
 ### 不加 auto 时为什么没有 `auto_optimize/`
 
-这是预期行为。`auto_optimize/` 只由 `--auto_optimize_e2e` 写入。默认流程只生成常规训练、评估和部署产物。
+这是预期行为。`auto_optimize/` 只由 `--auto_optimize_e2e` 写入。默认流程只生成常规训练、评估、部署产物和图表。
 
 ### `feature_dict[name]` 报 `list indices must be integers or slices, not str`
 

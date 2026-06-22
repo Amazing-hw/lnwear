@@ -140,20 +140,24 @@ def assert_bundle_ok(bundle):
     """校验模型包完整性"""
     needed = ["feature_names", "fill_values", "scaler", "model", "threshold", "meta"]
     for k in needed:
-        assert k in bundle, f"model_bundle missing key: {k}"
+        if k not in bundle:
+            raise ValueError(f"model_bundle missing key: {k}")
 
     miss = [c for c in bundle["feature_names"] if c not in bundle["fill_values"]]
-    assert not miss, f"fill_values missing for: {miss[:5]} ..."
+    if miss:
+        raise ValueError(f"fill_values missing for: {miss[:5]} ...")
     assert_no_stage2_ir_features(bundle["feature_names"], "model_bundle.pkl feature_names")
 
     for k in ["fs_ppg", "win_sec", "step_sec"]:
-        assert k in bundle["meta"], f"meta missing: {k}"
+        if k not in bundle["meta"]:
+            raise ValueError(f"meta missing: {k}")
 
 
 def apply_preprocess(feat_dict_list, bundle=None):
     """列对齐 + inf处理 + 缺失填充 + clip（与训练侧 s05 一致）"""
     b = bundle if bundle is not None else _BUNDLE
-    assert b is not None, "must call load_bundle() first"
+    if b is None:
+        raise RuntimeError("must call load_bundle() first")
 
     feature_names = b["feature_names"]
     fill_values = b["fill_values"]

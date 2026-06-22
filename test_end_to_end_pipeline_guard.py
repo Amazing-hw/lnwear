@@ -92,7 +92,6 @@ def test_s08_synthetic_grouped_h5_smoke_exports_consistent_deploy_artifacts(tmp_
             "--max_features",
             "10",
             "--skip_vif",
-            "--no-plot_errors",
         ],
         cwd=str(ROOT),
         text=True,
