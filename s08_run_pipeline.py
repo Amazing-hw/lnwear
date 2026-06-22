@@ -1147,7 +1147,7 @@ def run_embedded_feature_embedding_report(args):
         artifact_dir=args.artifact_dir,
         methods=_parse_csv_strings("pca,tsne"),
         dims=_parse_csv_ints("2,3"),
-        formats=_parse_csv_strings("png,svg,pdf,tiff"),
+        formats=_parse_csv_strings("png"),
         max_points=0,
         perplexity=30.0,
         random_state=42,
