@@ -13,7 +13,11 @@ import pandas as pd
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, confusion_matrix)
 
-from s06_deploy_eval import WearStateMachine, sample_pred_from_states
+from s06_deploy_eval import (
+    WearStateMachine,
+    default_t_on_candidates,
+    sample_pred_from_states,
+)
 
 REQUIRED_NPZ_KEYS = [
     "sample_name", "target", "window_start_sec", "window_end_sec",
@@ -310,10 +314,10 @@ def metrics_satisfy_constraints(metrics, constraints):
 # Grid Search
 # =========================================================
 
-def iter_param_grid():
+def iter_param_grid(model_threshold=0.5):
     for ema_alpha in [0.2, 0.4, 0.6]:
         for median_k in [1, 3]:
-            for T_on in [0.55, 0.70, 0.85]:
+            for T_on in default_t_on_candidates(model_threshold):
                 for T_off in [0.20, 0.35, 0.50]:
                     if T_on <= T_off:
                         continue
@@ -373,6 +377,18 @@ def select_postprocess_search_grid(grid, search_budget=240):
             break
         add(params)
     return selected[:budget]
+
+
+def infer_model_threshold_from_caches(caches, default=0.5):
+    values = []
+    for cache in caches:
+        try:
+            values.append(float(cache.get("model_threshold", default)))
+        except Exception:
+            continue
+    if not values:
+        return float(default)
+    return float(np.median(np.asarray(values, dtype=float)))
 
 
 def _params_label(p):
@@ -601,11 +617,13 @@ def main():
         )
 
     # Grid search (parallel)
-    full_grid = list(iter_param_grid())
+    model_threshold = infer_model_threshold_from_caches(caches)
+    full_grid = list(iter_param_grid(model_threshold=model_threshold))
     grid = select_postprocess_search_grid(full_grid, search_budget=args.search_budget)
     print(
         f"Searching {len(grid)} parameter combinations "
-        f"(full_grid={len(full_grid)}, search_budget={args.search_budget})..."
+        f"(full_grid={len(full_grid)}, search_budget={args.search_budget}, "
+        f"model_threshold={model_threshold:.4f})..."
     )
     n_workers = max(1, int(args.n_workers))
     t0 = time.time()

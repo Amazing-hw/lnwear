@@ -566,7 +566,7 @@ def test_s08_postprocess_dry_run_forwards_search_budget():
 
     assert "s07_postprocess_optimize.py" in output
     assert "--search_budget 96" in output
-    assert "--warmup_frames 3" in output
+    assert "--warmup_frames 5" in output
 
 
 def test_prepare_valid_calibration_threshold_data_keeps_disjoint_groups_for_multi_k():

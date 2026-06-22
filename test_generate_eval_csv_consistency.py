@@ -75,6 +75,7 @@ def _base_payload() -> dict:
         },
         "window_stream_summary": {
             "warmup_frames": 1,
+            "skipped_warmup_windows": 1,
             "total_windows": 2,
             "accuracy": 1.0,
             "confusion_matrix": {"TN": 0, "FP": 0, "FN": 0, "TP": 2},
@@ -90,15 +91,21 @@ def test_generate_eval_csv_matches_official_metric_summaries(tmp_path):
 
     xgb = pd.read_csv(tmp_path / "per_sample_xgboost_windows.csv")
     sm = pd.read_csv(tmp_path / "per_sample_statemachine_windows.csv")
+    sm_detail = pd.read_csv(tmp_path / "statemachine_window_details.csv")
     sample = pd.read_csv(tmp_path / "per_sample_final_prediction.csv")
 
     assert xgb["total_windows"].sum() == 3
     assert xgb["correct_windows"].sum() == 3
     assert set(xgb["sample_name"]) == {"mixed-pass"}
 
+    assert sm["raw_windows"].sum() == 3
+    assert sm["skipped_warmup_windows"].sum() == 1
     assert sm["total_windows"].sum() == 2
     assert sm["correct_windows"].sum() == 2
+    assert sm["output_valid_windows"].sum() == 2
     assert set(sm["sample_name"]) == {"mixed-pass"}
+    assert sm_detail["output_valid"].tolist() == [0, 1, 1]
+    assert sm_detail["state_output"].isna().tolist() == [True, False, False]
 
     assert len(sample) == 4
     assert sample["is_correct"].sum() == 3

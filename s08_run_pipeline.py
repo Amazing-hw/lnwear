@@ -2047,13 +2047,13 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
         return
 
     # 读取 warmup_frames —— 与 compute_window_stream_metrics 保持一致
-    warmup_frames = 3  # 默认值，与 s06 --warmup_frames default 一致
+    warmup_frames = 5  # 默认值 K_on，确保状态机预填充充分
     eval_payload = {}
     eval_path = _os.path.join(artifact_dir, f"end_to_end_eval_{split}_{method}.json")
     if _os.path.exists(eval_path):
         with open(eval_path, "r", encoding="utf-8") as f:
             eval_payload = _json.load(f)
-        warmup_frames = int((eval_payload.get("window_stream_summary") or {}).get("warmup_frames", 3))
+        warmup_frames = int((eval_payload.get("window_stream_summary") or {}).get("warmup_frames", 5))
 
     # ---- CSV 1: XGBoost 单窗预测 ----
     # 与 compute_window_model_metrics 一致：跳过 fallback / Stage1 失败 / 无窗口的样本
@@ -2089,8 +2089,11 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
           f"global_acc={round(xgb_global_acc, 6) if total_xgb_wins > 0 else 0})")
 
     # ---- CSV 2: 状态机后处理窗口预测 ----
-    # 与 compute_window_stream_metrics 一致：跳过 fallback / Stage1 失败样本 + warmup 跳过
+    # 与 compute_window_stream_metrics 一致：
+    #   前 warmup_frames 窗只预热状态机，不对外输出有效状态，也不计入准确率
+    #   后续窗逐窗比较 state[i] vs window_targets[i]
     rows_sm = []
+    rows_sm_detail = []
     for d in details:
         name = d.get("sample_name", "")
         states = d.get("window_states", [])
@@ -2098,30 +2101,44 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
             continue
         wtargs = d.get("window_targets", [])
         sample_target = int(d.get("target", 0))
-        # warmup_frames: 跳过前 N 个窗口，与 compute_window_stream_metrics 一致
-        start = min(int(warmup_frames), len(states))
-        n_win = len(states) - start
+        skipped = min(max(0, int(warmup_frames)), len(states))
+        raw_win = len(states)
+        n_win = raw_win - skipped
         n_correct = 0
-        for i in range(start, len(states)):
+        for i in range(skipped, raw_win):
             t = int(wtargs[i]) if i < len(wtargs) else sample_target
             if int(states[i]) == t:
                 n_correct += 1
+        for i in range(raw_win):
+            t = int(wtargs[i]) if i < len(wtargs) else sample_target
+            output_valid = 1 if i >= skipped else 0
+            state_internal = int(states[i])
+            state_output = state_internal if output_valid else ""
+            is_correct = int(state_internal == t) if output_valid else ""
+            rows_sm_detail.append((
+                name, i, t, state_internal, state_output, output_valid, is_correct
+            ))
         n_wrong = n_win - n_correct
         acc = n_correct / n_win if n_win > 0 else 0.0
-        rows_sm.append((name, n_win, n_correct, n_wrong, round(acc, 6)))
+        rows_sm.append((name, raw_win, skipped, n_win, n_correct, n_wrong, round(acc, 6)))
 
     csv2 = _os.path.join(artifact_dir, "per_sample_statemachine_windows.csv")
     with open(csv2, "w", encoding="utf-8") as f:
-        f.write("sample_name,total_windows,correct_windows,wrong_windows,accuracy\n")
+        f.write("sample_name,raw_windows,skipped_warmup_windows,total_windows,output_valid_windows,correct_windows,wrong_windows,accuracy\n")
         for row in rows_sm:
-            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]}\n")
-    total_sm_wins = sum(r[1] for r in rows_sm)
-    total_sm_correct = sum(r[2] for r in rows_sm)
-    total_sm_wrong = sum(r[3] for r in rows_sm)
+            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[3]},{row[4]},{row[5]},{row[6]}\n")
+    csv2_detail = _os.path.join(artifact_dir, "statemachine_window_details.csv")
+    with open(csv2_detail, "w", encoding="utf-8") as f:
+        f.write("sample_name,window_index,target,state_internal,state_output,output_valid,is_correct\n")
+        for row in rows_sm_detail:
+            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]},{row[6]}\n")
+    total_sm_wins = sum(r[3] for r in rows_sm)
+    total_sm_correct = sum(r[4] for r in rows_sm)
+    total_sm_wrong = sum(r[5] for r in rows_sm)
     sm_global_acc = total_sm_correct / total_sm_wins if total_sm_wins > 0 else 0.0
     print(f"[OK] 状态机逐样本窗口 CSV: {csv2} "
           f"(n_samples={len(rows_sm)}, total_windows={total_sm_wins}, "
-          f"warmup_frames={warmup_frames}, "
+          f"warmup_frames={warmup_frames} skipped, "
           f"global_acc={round(sm_global_acc, 6) if total_sm_wins > 0 else 0})")
 
     # ---- CSV 3: 样本级最终预测 ----
@@ -2494,7 +2511,7 @@ def main():
                    help="s07 maximum P95 first worn output latency for positive samples")
     p.add_argument("--postprocess_search_budget", type=int, default=240,
                    help="maximum s07 postprocess candidates to evaluate; <=0 keeps full grid")
-    p.add_argument("--postprocess_warmup_frames", type=int, default=3,
+    p.add_argument("--postprocess_warmup_frames", type=int, default=5,
                    help="s07 window-level metrics skip this many leading state-machine windows per sample")
     p.add_argument("--commercial_compare", action=argparse.BooleanOptionalAction, default=False,
                    help="run optional s09 commercial-vs-project comparison")

@@ -164,6 +164,54 @@ def test_wear_state_machine_first_window_respects_quality():
     assert score == 0.0
 
 
+def test_default_postprocess_threshold_allows_sustained_low_confidence_positive():
+    cfg = dict(s06.DEFAULT_POSTPROCESS_CONFIG)
+    cfg.update({
+        "alpha": 1.0,
+        "median_k": 1,
+        "K_on": 2,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+        "sample_pred_strategy": "any_worn_after_warmup",
+    })
+
+    final, states, _preds, scores = s06.apply_postprocess(
+        [0.60] * 6,
+        [{}] * 6,
+        "state_machine",
+        cfg,
+        model_threshold=0.5,
+    )
+
+    assert final == 1
+    assert states[-1] == 1
+    assert max(scores) == 0.60
+
+
+def test_explicit_high_t_on_is_preserved_for_conservative_configs():
+    cfg = dict(s06.DEFAULT_POSTPROCESS_CONFIG)
+    cfg.update({
+        "alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.70,
+        "K_on": 2,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+        "sample_pred_strategy": "any_worn_after_warmup",
+    })
+
+    final, states, _preds, _scores = s06.apply_postprocess(
+        [0.66] * 6,
+        [{}] * 6,
+        "state_machine",
+        cfg,
+        model_threshold=0.5,
+    )
+
+    assert final == 0
+    assert states == [0, 0, 0, 0, 0, 0]
+
+
 def test_s07_any_worn_strategy_keeps_positive_sample_after_late_drop():
     cache = {
         "sample_name": "late-drop-pos",

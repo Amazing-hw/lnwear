@@ -3076,21 +3076,24 @@ def _plot_single(
     formats: Sequence[str],
     dpi: int,
     method_info: Optional[Mapping[str, object]] = None,
+    title_suffix: str = "",
+    filename_suffix: str = "",
 ) -> List[str]:
+    title = f"{METHOD_TITLES.get(method, method.upper())} {dim}D{title_suffix}"
     if dim == 2:
         fig, ax = plt.subplots(figsize=(3.5, 3.0))
         _plot_points(ax, coords, labels, dim=2)
         _format_axes_2d(ax, method, method_info)
-        ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D")
+        ax.set_title(title)
     else:
         fig = plt.figure(figsize=(3.5, 3.1))
         ax = fig.add_subplot(111, projection="3d")
         _plot_points(ax, coords, labels, dim=3)
         _format_axes_3d(ax, method, method_info)
-        ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D", pad=6)
+        ax.set_title(title, pad=6)
 
     ax.legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
-    paths = _save_figure(fig, out_dir / f"{method}_{dim}d", formats, dpi)
+    paths = _save_figure(fig, out_dir / f"{method}_{dim}d{filename_suffix}", formats, dpi)
     plt.close(fig)
     return paths
 
@@ -3103,6 +3106,8 @@ def _plot_panel(
     formats: Sequence[str],
     dpi: int,
     method_status: Optional[Mapping[str, Mapping[str, object]]] = None,
+    title_suffix: str = "",
+    filename_suffix: str = "",
 ) -> List[str]:
     methods = [m for m in ("pca", "tsne", "umap") if dim in embeddings.get(m, {})]
     if not methods:
@@ -3113,7 +3118,7 @@ def _plot_panel(
         for ax, method in zip(axes[0], methods):
             _plot_points(ax, embeddings[method][dim], labels, dim=2)
             _format_axes_2d(ax, method, (method_status or {}).get(method))
-            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D")
+            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D{title_suffix}")
         axes[0, -1].legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
     else:
         fig = plt.figure(figsize=(3.25 * len(methods), 3.0))
@@ -3121,12 +3126,12 @@ def _plot_panel(
             ax = fig.add_subplot(1, len(methods), idx, projection="3d")
             _plot_points(ax, embeddings[method][dim], labels, dim=3)
             _format_axes_3d(ax, method, (method_status or {}).get(method))
-            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D", pad=5)
+            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D{title_suffix}", pad=5)
             if idx == len(methods):
                 ax.legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
 
     fig.tight_layout(w_pad=1.0)
-    paths = _save_figure(fig, out_dir / f"embedding_panel_{dim}d", formats, dpi)
+    paths = _save_figure(fig, out_dir / f"embedding_panel_{dim}d{filename_suffix}", formats, dpi)
     plt.close(fig)
     return paths
 
@@ -3143,6 +3148,22 @@ def _write_source_data(
             for idx in range(dim):
                 source[f"{method}_{dim}d_{idx + 1}"] = coords[:, idx]
     path = out_dir / "embedding_source_data.csv"
+    source.to_csv(path, index=False)
+    return path
+
+
+def _write_source_data_balanced(
+    out_dir: Path,
+    sampled: pd.DataFrame,
+    embeddings: Mapping[str, Mapping[int, np.ndarray]],
+) -> Path:
+    columns = [c for c in ["split", "sample_name", "h5_file", "target", "start_sec", "window_index", "mode"] if c in sampled.columns]
+    source = sampled.loc[:, columns].copy()
+    for method, by_dim in embeddings.items():
+        for dim, coords in by_dim.items():
+            for idx in range(dim):
+                source[f"{method}_{dim}d_{idx + 1}"] = coords[:, idx]
+    path = out_dir / "embedding_source_data_balanced.csv"
     source.to_csv(path, index=False)
     return path
 
@@ -3169,13 +3190,27 @@ def _write_report(
         "- PCA 2D/3D: linear separability and dominant variance directions.",
         "- t-SNE 2D/3D: local neighborhood structure.",
         "- UMAP 2D/3D: global/local manifold structure when `umap-learn` is installed.",
+        "- `*_balanced`: 正样本随机降采样至与负样本同等数量后的降维图，用于消除类别比例失调对视觉判断的影响。",
         "",
     ]
+    balanced_keys = set()
     for key, paths in figure_paths.items():
         if not paths:
             continue
         rel = [Path(p).name for p in paths]
-        lines.append(f"- {key}: " + ", ".join(rel))
+        if "_balanced" in key:
+            balanced_keys.add(key)
+        else:
+            lines.append(f"- {key}: " + ", ".join(rel))
+    if balanced_keys:
+        lines.extend(["", "### Balanced (正样本降采样至与负样本同数量)", ""])
+        bal_info = summary.get("balanced", {})
+        if bal_info.get("status") == "ok":
+            lines.append(f"- n_neg={bal_info.get('n_neg')}, n_pos_downsampled={bal_info.get('n_pos_downsampled')}, n_total={bal_info.get('n_total_balanced')}")
+        for key in sorted(balanced_keys):
+            paths = figure_paths[key]
+            rel = [Path(p).name for p in paths]
+            lines.append(f"- {key}: " + ", ".join(rel))
     explainer_paths = summary.get("explainer_figures", {})
     if isinstance(explainer_paths, Mapping) and explainer_paths:
         lines.extend(
@@ -3215,6 +3250,50 @@ def _write_report(
     path = out_dir / "embedding_report.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def _balance_by_target(
+    sampled: pd.DataFrame,
+    x: np.ndarray,
+    feature_cols: Sequence[str],
+    random_state: int,
+) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, object]]:
+    """将正样本随机降采样到与负样本同等数量，返回平衡后的 DataFrame 和特征矩阵。
+
+    负样本 (target=0) 全部保留，正样本 (target=1) 随机降采样至负样本数量。
+    对平衡后的数据重新做中位数填充和 z-score 标准化。
+    """
+    if "target" not in sampled.columns:
+        return sampled, x, {"status": "skipped", "reason": "no target column"}
+
+    neg_mask = sampled["target"] == 0
+    pos_mask = sampled["target"] == 1
+    n_neg = int(neg_mask.sum())
+    n_pos = int(pos_mask.sum())
+
+    if n_neg == 0 or n_pos == 0:
+        return sampled, x, {"status": "skipped", "reason": f"single class: neg={n_neg}, pos={n_pos}"}
+
+    if n_pos <= n_neg:
+        return sampled, x, {"status": "skipped", "reason": f"pos({n_pos}) <= neg({n_neg}), already balanced"}
+
+    rng = np.random.default_rng(int(random_state))
+    pos_indices = np.where(pos_mask)[0]
+    keep_pos = rng.choice(pos_indices, size=n_neg, replace=False)
+    keep_idx = np.sort(np.concatenate([np.where(neg_mask)[0], keep_pos]))
+    balanced = sampled.iloc[keep_idx].reset_index(drop=True)
+
+    raw = balanced.loc[:, list(feature_cols)].replace([np.inf, -np.inf], np.nan)
+    imputed = SimpleImputer(strategy="median").fit_transform(raw)
+    scaled = StandardScaler().fit_transform(imputed)
+
+    return balanced, scaled, {
+        "status": "ok",
+        "n_neg": n_neg,
+        "n_pos_original": n_pos,
+        "n_pos_downsampled": n_neg,
+        "n_total_balanced": n_neg * 2,
+    }
 
 
 def run_embedding_report(
@@ -3281,6 +3360,53 @@ def run_embedding_report(
             method_status=method_status,
         )
 
+    # ── 平衡版本：正样本随机降采样至与负样本同等数量 ──
+    balanced_sampled, balanced_x, balance_info = _balance_by_target(
+        sampled, x, feature_cols, int(random_state)
+    )
+    if balance_info.get("status") == "ok":
+        balanced_embeddings, balanced_method_status = compute_embeddings(
+            x=balanced_x,
+            methods=methods,
+            dims=dims,
+            random_state=int(random_state),
+            perplexity=float(perplexity),
+        )
+        balanced_labels = balanced_sampled["target"].to_numpy()
+        _bal_suffix = " (balanced)"
+        for method in ("pca", "tsne", "umap"):
+            for dim in sorted(balanced_embeddings.get(method, {})):
+                key = f"{method}_{dim}d_balanced"
+                figure_paths[key] = _plot_single(
+                    balanced_embeddings[method][dim],
+                    balanced_labels,
+                    method,
+                    dim,
+                    out_dir,
+                    formats,
+                    int(dpi),
+                    method_info=balanced_method_status.get(method),
+                    title_suffix=_bal_suffix,
+                    filename_suffix="_balanced",
+                )
+        for dim in sorted({int(d) for d in dims if int(d) in {2, 3}}):
+            figure_paths[f"embedding_panel_{dim}d_balanced"] = _plot_panel(
+                balanced_embeddings,
+                balanced_labels,
+                dim,
+                out_dir,
+                formats,
+                int(dpi),
+                method_status=balanced_method_status,
+                title_suffix=_bal_suffix,
+                filename_suffix="_balanced",
+            )
+        # 平衡版的 source data
+        _write_source_data_balanced(out_dir, balanced_sampled, balanced_embeddings)
+    else:
+        balanced_embeddings = {}
+        balanced_method_status = balance_info
+
     source_path = _write_source_data(out_dir, sampled, embeddings)
     distribution_paths, distribution_source_path = plot_selected_feature_distributions(
         out_dir=out_dir,
@@ -3328,6 +3454,15 @@ def run_embedding_report(
         "label_counts": {str(k): int(v) for k, v in label_counts.items()},
         "split_counts": {str(k): int(v) for k, v in split_counts.items()},
         "methods": method_status,
+        "balanced": {
+            "status": balance_info.get("status", "skipped"),
+            "n_neg": balance_info.get("n_neg"),
+            "n_pos_original": balance_info.get("n_pos_original"),
+            "n_pos_downsampled": balance_info.get("n_pos_downsampled"),
+            "n_total_balanced": balance_info.get("n_total_balanced"),
+            "methods": balanced_method_status,
+            "source_data_balanced": str(out_dir / "embedding_source_data_balanced.csv"),
+        },
         "source_data": str(source_path),
         "figures": figure_paths,
         "explainer_figures": explainer_figures,

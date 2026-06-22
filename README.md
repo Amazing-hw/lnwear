@@ -810,14 +810,23 @@ artifacts/
 
 | 图片 | 说明 |
 |---|---|
-| `feature_embedding_report/pca_2d.{png,svg,pdf,tiff}` | PCA 2D 散点图 |
-| `feature_embedding_report/pca_3d.{png,svg,pdf,tiff}` | PCA 3D 散点图 |
-| `feature_embedding_report/tsne_2d.{png,svg,pdf,tiff}` | t-SNE 2D 散点图 |
-| `feature_embedding_report/tsne_3d.{png,svg,pdf,tiff}` | t-SNE 3D 散点图 |
-| `feature_embedding_report/umap_2d.{png,svg,pdf,tiff}` | UMAP 2D 散点图（需 umap-learn） |
-| `feature_embedding_report/umap_3d.{png,svg,pdf,tiff}` | UMAP 3D 散点图（需 umap-learn） |
-| `feature_embedding_report/embedding_panel_2d.{png,...}` | PCA+t-SNE+UMAP 并排 2D 面板 |
-| `feature_embedding_report/embedding_panel_3d.{png,...}` | PCA+t-SNE+UMAP 并排 3D 面板 |
+| `feature_embedding_report/pca_2d.{png,svg,pdf,tiff}` | PCA 2D 散点图（全部数据） |
+| `feature_embedding_report/pca_3d.{png,svg,pdf,tiff}` | PCA 3D 散点图（全部数据） |
+| `feature_embedding_report/tsne_2d.{png,svg,pdf,tiff}` | t-SNE 2D 散点图（全部数据） |
+| `feature_embedding_report/tsne_3d.{png,svg,pdf,tiff}` | t-SNE 3D 散点图（全部数据） |
+| `feature_embedding_report/umap_2d.{png,svg,pdf,tiff}` | UMAP 2D 散点图（全部数据，需 umap-learn） |
+| `feature_embedding_report/umap_3d.{png,svg,pdf,tiff}` | UMAP 3D 散点图（全部数据，需 umap-learn） |
+| `feature_embedding_report/pca_2d_balanced.{png,...}` | PCA 2D 散点图（正样本降采样至与负样本同数量） |
+| `feature_embedding_report/pca_3d_balanced.{png,...}` | PCA 3D 散点图（正负样本平衡） |
+| `feature_embedding_report/tsne_2d_balanced.{png,...}` | t-SNE 2D 散点图（正负样本平衡） |
+| `feature_embedding_report/tsne_3d_balanced.{png,...}` | t-SNE 3D 散点图（正负样本平衡） |
+| `feature_embedding_report/umap_2d_balanced.{png,...}` | UMAP 2D 散点图（正负样本平衡，需 umap-learn） |
+| `feature_embedding_report/umap_3d_balanced.{png,...}` | UMAP 3D 散点图（正负样本平衡，需 umap-learn） |
+| `feature_embedding_report/embedding_panel_2d.{png,...}` | PCA+t-SNE+UMAP 并排 2D 面板（全部数据） |
+| `feature_embedding_report/embedding_panel_3d.{png,...}` | PCA+t-SNE+UMAP 并排 3D 面板（全部数据） |
+| `feature_embedding_report/embedding_panel_2d_balanced.{png,...}` | PCA+t-SNE+UMAP 并排 2D 面板（正负样本平衡） |
+| `feature_embedding_report/embedding_panel_3d_balanced.{png,...}` | PCA+t-SNE+UMAP 并排 3D 面板（正负样本平衡） |
+| `feature_embedding_report/embedding_source_data_balanced.csv` | 平衡版本的降维坐标和元数据 |
 | `feature_embedding_report/selected_feature_correlation_heatmap.{png,...}` | 入选特征 Pearson 相关性热图，用于检查冗余和特征簇 |
 | `feature_embedding_report/selected_feature_split_auc_heatmap.{png,...}` | 入选特征在 train/valid/test 各 split 的单变量 AUC separation 热图，用于检查分布漂移和泛化稳定性 |
 | `feature_embedding_report/pca_loading_top_features.{png,...}` | PCA 前两主成分 loading 贡献最高的特征条形图，用于解释降维分离来源 |

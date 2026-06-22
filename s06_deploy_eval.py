@@ -87,6 +87,43 @@ DEFAULT_SKIP_INITIAL_WINDOWS = 3
 DEFAULT_USE_STAGE2_IR = False
 
 
+def _dedupe_sorted(values):
+    out = []
+    for value in sorted(float(v) for v in values):
+        value = round(value, 6)
+        if not out or abs(out[-1] - value) > 1e-9:
+            out.append(value)
+    return out
+
+
+def default_t_on_candidates(model_threshold=0.5):
+    threshold = float(model_threshold)
+    raw = [
+        threshold + 0.02,
+        threshold + 0.05,
+        threshold + 0.10,
+        0.55,
+        0.70,
+        0.85,
+    ]
+    return _dedupe_sorted(min(0.95, max(0.05, v)) for v in raw)
+
+
+def resolve_postprocess_thresholds(cfg, model_threshold=0.5):
+    """Resolve state-machine thresholds, deriving defaults from model threshold."""
+    cfg = cfg or {}
+    model_threshold = float(model_threshold)
+    t_on = float(cfg.get("T_on", DEFAULT_POSTPROCESS_CONFIG["T_on"]))
+    t_off = float(cfg.get("T_off", DEFAULT_POSTPROCESS_CONFIG["T_off"]))
+
+    if abs(t_on - float(DEFAULT_POSTPROCESS_CONFIG["T_on"])) < 1e-9 and model_threshold < t_on:
+        t_on = float(min(0.95, max(0.50, model_threshold + 0.05)))
+    if abs(t_off - float(DEFAULT_POSTPROCESS_CONFIG["T_off"])) < 1e-9:
+        t_off = float(min(t_on - 0.05, max(0.10, model_threshold - 0.20)))
+
+    return t_on, t_off
+
+
 def resolve_use_stage2_ir(bundle, requested=None):
     # Legacy CLI compatibility only. Stage2 model features are always
     # ambient/green/ACC; IR is reserved for Stage1 gating.
@@ -381,10 +418,11 @@ def apply_postprocess(window_probs, quality_metas, method, cfg, model_threshold)
     probs_for_state = causal_median_filter_1d(probs, cfg.get("median_k", 1))
 
     if method == "state_machine":
+        _t_on, _t_off = resolve_postprocess_thresholds(cfg, model_threshold)
         sm = WearStateMachine(
             alpha=cfg.get("alpha", 0.4),
-            T_on=cfg.get("T_on", 0.75),
-            T_off=cfg.get("T_off", 0.35),
+            T_on=_t_on,
+            T_off=_t_off,
             K_on=cfg.get("K_on", DEFAULT_POSTPROCESS_CONFIG["K_on"]),
             K_off=cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]),
             cooldown_sec=cfg.get("cooldown_sec", DEFAULT_POSTPROCESS_CONFIG["cooldown_sec"]),
@@ -1491,14 +1529,17 @@ def export_window_error_analysis(report, artifact_dir, split, method):
     return out_csv, out_json
 
 
-def compute_window_stream_metrics(results, cfg, warmup_frames=0):
-    """
-    Window 级（流式状态机）：state[i] vs target。
-    warmup_frames: 跳过前 N 个窗，消除状态机冷启动 K_on 滞后的影响。
-    """
+def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold=None):
+    """Window-level streaming state metrics: state[i] vs target after warmup."""
     y_true, y_pred = [], []
     samples_with_no_windows = 0
     skipped_windows = 0
+
+    # 对齐 T_on / T_off：当 cfg 中的值与默认值相同时，从模型阈值推导
+    if model_threshold is None:
+        model_threshold = float(_BUNDLE.get("threshold", 0.5)) if _BUNDLE is not None else 0.5
+    _t_on, _t_off = resolve_postprocess_thresholds(cfg, model_threshold)
+
     for r in results:
         probs = r.get("window_probs", [])
         qm = r.get("quality_metas", [])
@@ -1506,28 +1547,31 @@ def compute_window_stream_metrics(results, cfg, warmup_frames=0):
             samples_with_no_windows += 1
             continue
 
+        sample_target = int(r["target"])
+        window_targets = r.get("window_targets", [])
+        qt = _BUNDLE.get("quality_thresholds") if _BUNDLE is not None else None
+
+        # 全程运行状态机，使其积累 EMA 和 on/off count
+        sample_states = []
+        sample_targets = []
+        probs_for_state = causal_median_filter_1d(probs, cfg.get("median_k", DEFAULT_POSTPROCESS_CONFIG["median_k"]))
         sm = WearStateMachine(
             alpha=cfg.get("alpha", 0.4),
-            T_on=cfg.get("T_on", 0.75),
-            T_off=cfg.get("T_off", 0.35),
+            T_on=_t_on,
+            T_off=_t_off,
             K_on=cfg.get("K_on", DEFAULT_POSTPROCESS_CONFIG["K_on"]),
             K_off=cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]),
             cooldown_sec=cfg.get("cooldown_sec", DEFAULT_POSTPROCESS_CONFIG["cooldown_sec"]),
         )
-        sample_target = int(r["target"])
-        window_targets = r.get("window_targets", [])
-        qt = _BUNDLE.get("quality_thresholds") if _BUNDLE is not None else None
-        # 先把所有窗的 state 跑出来，再按 warmup_frames 裁剪
-        sample_states = []
-        sample_targets = []
-        probs_for_state = causal_median_filter_1d(probs, cfg.get("median_k", DEFAULT_POSTPROCESS_CONFIG["median_k"]))
         for i, p in enumerate(probs_for_state):
             meta_i = qm[i] if i < len(qm) else None
             q = compute_quality(meta_i, thresholds=qt) if meta_i else 1.0
             state, _ = sm.update(p, quality=q)
             sample_states.append(int(state))
             sample_targets.append(int(_safe_list_get(window_targets, i, sample_target)))
-        start = min(warmup_frames, len(sample_states))
+
+        # Warmup windows are excluded from this state-machine metric.
+        start = min(max(0, int(warmup_frames)), len(sample_states))
         skipped_windows += start
         for t, s in zip(sample_targets[start:], sample_states[start:]):
             y_true.append(t)
@@ -1864,10 +1908,12 @@ def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
                 "window_states": [],
             })
             continue
+        model_threshold = float(_BUNDLE.get("threshold", 0.5)) if _BUNDLE is not None else 0.5
+        _t_on, _t_off = resolve_postprocess_thresholds(postprocess_cfg, model_threshold)
         sm = WearStateMachine(
             alpha=postprocess_cfg.get("alpha", 0.4),
-            T_on=postprocess_cfg.get("T_on", 0.75),
-            T_off=postprocess_cfg.get("T_off", 0.35),
+            T_on=_t_on,
+            T_off=_t_off,
             K_on=postprocess_cfg.get("K_on", 5),
             K_off=postprocess_cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]),
         )
@@ -1949,10 +1995,11 @@ def predict_sample(sample, model, scaler, selected_features,
     if postprocess_cfg is None:
         postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
 
+    _t_on, _t_off = resolve_postprocess_thresholds(postprocess_cfg, model_threshold)
     sm = WearStateMachine(
         alpha=postprocess_cfg.get("alpha", 0.4),
-        T_on=postprocess_cfg.get("T_on", 0.75),
-        T_off=postprocess_cfg.get("T_off", 0.35),
+        T_on=_t_on,
+        T_off=_t_off,
         K_on=postprocess_cfg.get("K_on", DEFAULT_POSTPROCESS_CONFIG["K_on"]),
         K_off=postprocess_cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]),
     )
@@ -2570,6 +2617,7 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
                 ("state_1→0", "IF score < T_off for K_off consecutive updates AND cooldown expired THEN state=0"),
                 ("cooldown", "After flip, wait cooldown_sec before next flip allowed"),
                 ("leakage_decay", "on_count/off_count decrement by 1 when threshold not met (soft reset)"),
+                ("warmup_output_policy", "During warmup_frames, update score/counts normally but publish output_valid=false; do not substitute raw model predictions"),
                 ("final_prediction", "sample prediction follows sample_pred_strategy"),
             ])),
         ])),
@@ -2937,7 +2985,7 @@ def main(args=None):
     parser.add_argument("--n_workers", type=int,
                         default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                         help="并行 worker 数")
-    parser.add_argument("--warmup_frames", type=int, default=3,
+    parser.add_argument("--warmup_frames", type=int, default=5,
                         help="窗口级指标跳过每条样本前 N 个窗（消除状态机冷启动偏差）")
     parser.add_argument("--optimize_thresholds", type=str, default="",
                         help="对一组候选窗口阈值在缓存 probs 上做窗口级指标扫描（如 '0.3,0.4,0.5,0.6'），输出 P/R/F0.5/F1 表。不修改 bundle.threshold；建议结合此扫描手选/重训。")
@@ -3063,7 +3111,8 @@ def main(args=None):
     )
     window_model_summary = compute_window_model_metrics(results)
     window_stream_summary = compute_window_stream_metrics(
-        results, postprocess_cfg, warmup_frames=args.warmup_frames
+        results, postprocess_cfg, warmup_frames=args.warmup_frames,
+        model_threshold=bundle["threshold"],
     )
     stage1_target1_summary = summarize_stage1_target1_pass_rate(results)
 

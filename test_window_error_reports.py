@@ -84,6 +84,36 @@ def test_window_stream_metrics_uses_per_window_targets_for_grouped_h5():
     assert metrics["accuracy"] == 1.0
 
 
+def test_window_stream_metrics_reports_state_machine_output_after_warmup():
+    results = [
+        {
+            "sample_name": "warmup_raw_only_positive",
+            "target": 1,
+            "stage1_pass": True,
+            "fallback": False,
+            "window_probs": [0.60, 0.60, 0.60],
+            "window_preds": [1, 1, 1],
+            "window_targets": [1, 1, 1],
+            "quality_metas": [{}, {}, {}],
+        }
+    ]
+    cfg = {
+        "alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.70,
+        "T_off": 0.30,
+        "K_on": 2,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+    }
+
+    metrics = s06.compute_window_stream_metrics(results, cfg, warmup_frames=2)
+
+    assert metrics["total_windows"] == 1
+    assert metrics["confusion_matrix"] == {"TN": 0, "FP": 0, "FN": 1, "TP": 0}
+    assert metrics["skipped_warmup_windows"] == 2
+
+
 def test_postprocess_replay_records_valid_selection_and_test_metrics():
     valid_cache = {
         "sample_name": "valid-pos",
