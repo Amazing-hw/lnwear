@@ -148,6 +148,51 @@ def test_s07_window_accuracy_can_skip_state_machine_warmup_windows():
     assert warm_metrics["skipped_warmup_windows"] == 2
 
 
+def test_wear_state_machine_first_window_respects_quality():
+    sm = s06.WearStateMachine(
+        alpha=0.4,
+        T_on=0.7,
+        T_off=0.3,
+        K_on=1,
+        K_off=1,
+        cooldown_sec=0.0,
+    )
+
+    state, score = sm.update(0.95, quality=0.0, stride_sec=1.0)
+
+    assert state == 0
+    assert score == 0.0
+
+
+def test_s07_any_worn_strategy_keeps_positive_sample_after_late_drop():
+    cache = {
+        "sample_name": "late-drop-pos",
+        "target": 1,
+        "window_end_sec": np.arange(1, 7, dtype=float),
+        "stage1_enabled": np.ones(6, dtype=int),
+        "prob_raw": np.array([0.9, 0.9, 0.9, 0.1, 0.1, 0.1]),
+        "quality": np.ones(6),
+        "stride_sec": 1.0,
+        "window_targets": np.ones(6, dtype=int),
+    }
+    params = {
+        "ema_alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.5,
+        "K_on": 2,
+        "K_off": 2,
+        "cooldown_sec": 0.0,
+        "sample_pred_strategy": "any_worn_after_warmup",
+        "sample_pred_warmup_frames": 0,
+    }
+
+    detail = s07.run_postprocess_on_cache(cache, params)
+
+    assert detail["states"] == [0, 1, 1, 1, 0, 0]
+    assert detail["pred"] == 1
+
+
 def test_s07_postprocess_handles_empty_window_cache_without_unbound_state():
     params = {
         "ema_alpha": 1.0,

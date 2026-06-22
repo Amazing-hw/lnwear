@@ -13,7 +13,7 @@ import pandas as pd
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, confusion_matrix)
 
-from s06_deploy_eval import WearStateMachine
+from s06_deploy_eval import WearStateMachine, sample_pred_from_states
 
 REQUIRED_NPZ_KEYS = [
     "sample_name", "target", "window_start_sec", "window_end_sec",
@@ -121,10 +121,15 @@ def run_postprocess_on_cache(cache, params):
         if first_output_sec is not None and time_to_correct_sec is None and state == int(cache["target"]):
             time_to_correct_sec = decision_time
         states.append(int(state))
+    pred = sample_pred_from_states(
+        states,
+        strategy=params.get("sample_pred_strategy", "final_state"),
+        warmup_frames=params.get("sample_pred_warmup_frames", 0),
+    )
     return {
         "sample_name": cache["sample_name"],
         "target": int(cache["target"]),
-        "pred": int(state),
+        "pred": int(pred),
         "states": states,
         "window_targets": np.asarray(
             cache.get("window_targets", np.full(len(states), int(cache["target"]))),
@@ -325,6 +330,8 @@ def iter_param_grid():
                                     "K_on": K_on,
                                     "K_off": K_off,
                                     "cooldown_sec": cooldown_sec,
+                                    "sample_pred_strategy": "any_worn_after_warmup",
+                                    "sample_pred_warmup_frames": 0,
                                 }
 
 
@@ -384,6 +391,8 @@ def metrics_with_params(metrics, params):
         "param_K_on": int(params["K_on"]),
         "param_K_off": int(params["K_off"]),
         "param_cooldown_sec": float(params.get("cooldown_sec", 0.0)),
+        "param_sample_pred_strategy": str(params.get("sample_pred_strategy", "final_state")),
+        "param_sample_pred_warmup_frames": int(params.get("sample_pred_warmup_frames", 0)),
     })
     return out
 
@@ -409,6 +418,8 @@ def build_replay_report(best_params, selection_split, selection_caches,
             "K_on": int(best_params["K_on"]),
             "K_off": int(best_params["K_off"]),
             "cooldown_sec": float(best_params.get("cooldown_sec", 0.0)),
+            "sample_pred_strategy": str(best_params.get("sample_pred_strategy", "final_state")),
+            "sample_pred_warmup_frames": int(best_params.get("sample_pred_warmup_frames", 0)),
         },
         "selection": {
             "split": selection_split,
@@ -438,6 +449,8 @@ def _best_params_from_search_row(best):
         "K_on": int(best["param_K_on"]),
         "K_off": int(best["param_K_off"]),
         "cooldown_sec": float(best.get("param_cooldown_sec", 0.0)),
+        "sample_pred_strategy": str(best.get("param_sample_pred_strategy", "final_state")),
+        "sample_pred_warmup_frames": int(best.get("param_sample_pred_warmup_frames", 0)),
     }
 
 
@@ -452,6 +465,8 @@ def write_optimized_config(best, out_dir, split, constraints):
         "K_on": int(best["param_K_on"]),
         "K_off": int(best["param_K_off"]),
         "cooldown_sec": float(best.get("param_cooldown_sec", 0.0)),
+        "sample_pred_strategy": str(best.get("param_sample_pred_strategy", "final_state")),
+        "sample_pred_warmup_frames": int(best.get("param_sample_pred_warmup_frames", 0)),
     }
     metric_keys = [
         "sample_accuracy", "sample_precision", "sample_recall", "sample_f1",

@@ -45,7 +45,6 @@ from s03_extract_feature_pool import (
     preprocess_signal,
     robust_mad,
     safe_corr,
-    stage1_ambient_check,
     stage1_sample_pass,
     validate_h5_file,
 )
@@ -338,18 +337,56 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
 
 def collect_commercial_training_windows(samples, dc_threshold: float):
     X, y = [], []
+    diag = {
+        "total_samples": len(samples),
+        "fallback_samples": 0,
+        "stage1_pass_windows": 0,
+        "stage1_fail_windows": 0,
+        "extract_error_windows": 0,
+        "invalid_feature_windows": 0,
+        "valid_windows": 0,
+    }
     for sample in samples:
         result = infer_one_sample_commercial(sample, dc_threshold)
         if result.get("fallback"):
+            diag["fallback_samples"] += 1
             continue
-        for feature_vec in result.get("features", []):
+        enabled_flags = result.get("stage2_enabled_flags", [])
+        for idx, feature_vec in enumerate(result.get("features", [])):
+            stage2_enabled = enabled_flags[idx] if idx < len(enabled_flags) else False
+            if not stage2_enabled:
+                diag["stage1_fail_windows"] += 1
+                continue
+            diag["stage1_pass_windows"] += 1
             if feature_vec is None:
+                diag["extract_error_windows"] += 1
                 continue
             if len(feature_vec) == len(COMMERCIAL_FEATURE_NAMES) and np.isfinite(feature_vec).all():
                 X.append(feature_vec)
                 y.append(result["target"])
+                diag["valid_windows"] += 1
+            else:
+                diag["invalid_feature_windows"] += 1
     if not X:
-        raise RuntimeError("commercial baseline has no valid training windows")
+        msg_lines = [
+            "commercial baseline has no valid training windows",
+            f"  total samples: {diag['total_samples']}",
+            f"  fallback/load-failure samples: {diag['fallback_samples']}",
+            f"  Stage1-passed windows: {diag['stage1_pass_windows']}",
+            f"  Stage1-failed windows: {diag['stage1_fail_windows']}",
+            f"  feature extraction errors: {diag['extract_error_windows']}",
+            f"  invalid (shape/NaN) features: {diag['invalid_feature_windows']}",
+            f"  valid windows collected: {diag['valid_windows']}",
+            f"  dc_threshold used: {dc_threshold}",
+            "",
+            "常见原因与排查:",
+            "  1. IR DC 值过低 — 尝试降低 --commercial_dc_threshold（当前 {:.1e}）".format(float(dc_threshold)),
+            "  2. 训练集样本数不足或全部加载失败 — 检查 splits.json 中 train split 是否包含有效 H5",
+            "  3. 窗口太短无法提取 8 个商业特征 — 确认 window_sec >= 5 且 PPG 采样率 100Hz",
+            "  4. 若项目流水线 (s01-s06) 正常运行但 s09 报此错，说明 DC 阈值对商业 baseline 偏严",
+            "     （项目 Stage1 同时检查 AC/DC 比值且有训练宽松阈值，商业 baseline 仅检查 DC）",
+        ]
+        raise RuntimeError("\n".join(msg_lines))
     return np.asarray(X, dtype=float), np.asarray(y, dtype=int)
 
 
@@ -456,8 +493,9 @@ def _load_deploy_extractor(artifact_dir: Path):
             "deploy_feature_extractor.py not found. Run s07 through the deploy export step first."
         )
     spec = importlib.util.spec_from_file_location("deploy_feature_extractor_runtime", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load deploy feature extractor from {path}")
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
     spec.loader.exec_module(module)
     return module, path
 

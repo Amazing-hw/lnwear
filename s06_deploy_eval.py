@@ -75,6 +75,8 @@ DEFAULT_POSTPROCESS_CONFIG = {
     "K_on": 5,
     "K_off": 3,
     "cooldown_sec": 5,
+    "sample_pred_strategy": "final_state",
+    "sample_pred_warmup_frames": 0,
 }
 
 STAGE1_PRIMITIVE_SEC = 1.0
@@ -212,14 +214,21 @@ class WearStateMachine:
         self.cooldown_sec = cooldown_sec  # 翻转后最小冷却秒数
 
         self.state = 0
-        self.score = 0.0
+        self.score = None  # 延迟初始化：首次 update() 用第一个窗的概率值初始化
         self.on_count = 0
         self.off_count = 0
         self._steps_since_flip = 999  # 距离上次翻转的步数（初始大值允许首次翻转）
 
     def update(self, p, quality=1.0, stride_sec=1.0):
-        eff_alpha = self.alpha * quality
-        self.score = eff_alpha * p + (1 - eff_alpha) * self.score
+        q = float(np.clip(quality, 0.0, 1.0))
+        eff_alpha = self.alpha * q
+        if self.score is None:
+            # 首个窗口：用质量调制后的概率值初始化 EMA，消除从 0 起步的冷启动偏差
+            # 佩戴样本 (p≈0.9) 首次 score 直接越过 T_on，开始计 K_on
+            # 非佩戴样本 (p≈0.1) 首次 score 直接低于 T_off，开始计 K_off
+            self.score = q * float(p)
+        else:
+            self.score = eff_alpha * p + (1 - eff_alpha) * self.score
         self._steps_since_flip += 1
 
         cooldown_steps = int(self.cooldown_sec / stride_sec) if stride_sec > 0 else self.cooldown_sec
@@ -260,6 +269,29 @@ def causal_median_filter_1d(x, k):
         lo = max(0, i - k + 1)
         out[i] = float(np.median(x[lo:i + 1]))
     return out
+
+
+def sample_pred_from_states(states, strategy="final_state", warmup_frames=0):
+    """Convert streaming states into one sample-level prediction."""
+    if states is None:
+        states = []
+    states = [int(s) for s in list(states)]
+    if not states:
+        return 0
+
+    strategy = str(strategy or "final_state")
+    start = min(max(0, int(warmup_frames or 0)), len(states))
+    scored_states = states[start:]
+
+    if strategy in {"final_state", "last_state"}:
+        return int(states[-1])
+    if strategy in {"any_worn", "any_worn_after_warmup"}:
+        return int(any(s == 1 for s in scored_states))
+    if strategy in {"majority_state", "majority_state_after_warmup"}:
+        if not scored_states:
+            return 0
+        return int(float(np.mean(scored_states)) >= 0.5)
+    raise ValueError(f"unknown sample_pred_strategy: {strategy}")
 
 
 def _quality_soft(violation_ratio, floor=0.5):
@@ -365,7 +397,11 @@ def apply_postprocess(window_probs, quality_metas, method, cfg, model_threshold)
             state, score = sm.update(p, quality=q)
             states.append(int(state))
             scores.append(float(score))
-        final_pred = int(states[-1])
+        final_pred = sample_pred_from_states(
+            states,
+            strategy=cfg.get("sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]),
+            warmup_frames=cfg.get("sample_pred_warmup_frames", DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"]),
+        )
         return final_pred, states, window_preds, scores
 
     if method == "mean_vote":
@@ -1955,7 +1991,11 @@ def predict_sample(sample, model, scaler, selected_features,
     elif method == "prob_mean":
         final_pred = int(np.mean(probs) >= model_threshold)
     elif method == "state_machine":
-        final_pred = int(states[-1]) if states else 0
+        final_pred = sample_pred_from_states(
+            states,
+            strategy=postprocess_cfg.get("sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]),
+            warmup_frames=postprocess_cfg.get("sample_pred_warmup_frames", DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"]),
+        )
     else:
         final_pred = int(np.mean(probs) >= model_threshold)
 
@@ -2519,14 +2559,18 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
                 ("K_on", int(postprocess_cfg.get("K_on", 5))),
                 ("K_off", int(postprocess_cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]))),
                 ("cooldown_sec", float(postprocess_cfg.get("cooldown_sec", DEFAULT_POSTPROCESS_CONFIG["cooldown_sec"]))),
+                ("sample_pred_strategy", str(postprocess_cfg.get(
+                    "sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]))),
+                ("sample_pred_warmup_frames", int(postprocess_cfg.get(
+                    "sample_pred_warmup_frames", DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"]))),
             ])),
             ("formula", OrderedDict([
-                ("score_update", "score = alpha * quality * p + (1 - alpha * quality) * score"),
+                ("score_update", "first score = quality * p; later score = alpha * quality * p + (1 - alpha * quality) * score"),
                 ("state_0→1", "IF score > T_on for K_on consecutive updates AND cooldown expired THEN state=1"),
                 ("state_1→0", "IF score < T_off for K_off consecutive updates AND cooldown expired THEN state=0"),
                 ("cooldown", "After flip, wait cooldown_sec before next flip allowed"),
                 ("leakage_decay", "on_count/off_count decrement by 1 when threshold not met (soft reset)"),
-                ("final_prediction", "state machine final state"),
+                ("final_prediction", "sample prediction follows sample_pred_strategy"),
             ])),
         ])),
         ("quality_scoring", OrderedDict([
@@ -2582,6 +2626,10 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
             ("K_on", int(postprocess_cfg.get("K_on", 5))),
             ("K_off", int(postprocess_cfg.get("K_off", DEFAULT_POSTPROCESS_CONFIG["K_off"]))),
             ("cooldown_sec", float(postprocess_cfg.get("cooldown_sec", DEFAULT_POSTPROCESS_CONFIG["cooldown_sec"]))),
+            ("sample_pred_strategy", str(postprocess_cfg.get(
+                "sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]))),
+            ("sample_pred_warmup_frames", int(postprocess_cfg.get(
+                "sample_pred_warmup_frames", DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"]))),
         ])),
         ("bundle_fingerprint", bundle.get("fingerprint", {})),
     ])
