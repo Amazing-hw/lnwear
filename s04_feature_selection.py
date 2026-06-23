@@ -2511,7 +2511,14 @@ def load_feature_pools(artifact_dir: Path) -> Tuple[pd.DataFrame, List[str]]:
         path = artifact_dir / filename
         if not path.exists():
             continue
-        df = pd.read_csv(path)
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:
+            raise ValueError(
+                f"failed to read {path}: {exc}. "
+                "The feature_pool CSV is malformed or partially written; "
+                "rerun s03_extract_feature_pool.py for this artifact_dir."
+            ) from exc
         if len(df) == 0:
             continue
         df = df.copy()

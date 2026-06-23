@@ -1143,17 +1143,22 @@ def _parse_csv_ints(value):
 def run_embedded_feature_embedding_report(args):
     import s04_feature_selection as feature_selection
 
-    result = feature_selection.run_embedding_report(
-        artifact_dir=args.artifact_dir,
-        methods=_parse_csv_strings("pca,tsne"),
-        dims=_parse_csv_ints("2,3"),
-        formats=_parse_csv_strings("png"),
-        max_points=0,
-        perplexity=30.0,
-        random_state=42,
-        dpi=600,
-    )
+    try:
+        result = feature_selection.run_embedding_report(
+            artifact_dir=args.artifact_dir,
+            methods=_parse_csv_strings("pca,tsne"),
+            dims=_parse_csv_ints("2,3"),
+            formats=_parse_csv_strings("png"),
+            max_points=0,
+            perplexity=30.0,
+            random_state=42,
+            dpi=600,
+        )
+    except Exception as exc:
+        print(f"[WARN] skip feature embedding report: {exc}")
+        return None
     print(f"[OK] feature embedding report -> {result['report_path']}")
+    return result
 
 
 def run_embedded_generalization_audit(args):

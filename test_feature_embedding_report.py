@@ -1,6 +1,7 @@
 import json
 import sys
 import types
+from argparse import Namespace
 from pathlib import Path
 
 import numpy as np
@@ -220,3 +221,41 @@ def test_embedding_report_exports_umap_when_dependency_is_available(tmp_path, mo
     assert (out_dir / "umap_2d.png").exists()
     assert (out_dir / "umap_3d.png").exists()
     assert output["summary"]["methods"]["umap"]["status"] == "ok"
+
+
+def test_load_feature_pools_reports_bad_csv_file(tmp_path):
+    import s04_feature_selection as report
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    _write_feature_pool(artifact_dir, "train", 0.0)
+    (artifact_dir / "feature_pool_valid.csv").write_text(
+        "sample_name,target,feat_a\n"
+        "ok,1,0.5\n"
+        "bad,0,0.1,extra\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="feature_pool_valid.csv"):
+        report.load_feature_pools(artifact_dir)
+
+
+def test_s08_embedding_report_warning_does_not_abort_pipeline(tmp_path, capsys):
+    import s08_run_pipeline as pipeline
+
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    _write_feature_pool(artifact_dir, "train", 0.0)
+    (artifact_dir / "feature_pool_valid.csv").write_text(
+        "sample_name,target,feat_a\n"
+        "ok,1,0.5\n"
+        "bad,0,0.1,extra\n",
+        encoding="utf-8",
+    )
+    args = Namespace(artifact_dir=str(artifact_dir))
+
+    pipeline.run_embedded_feature_embedding_report(args)
+
+    output = capsys.readouterr().out
+    assert "[WARN] skip feature embedding report" in output
+    assert "feature_pool_valid.csv" in output
