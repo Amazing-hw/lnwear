@@ -3079,18 +3079,24 @@ def _plot_single(
     title_suffix: str = "",
     filename_suffix: str = "",
 ) -> List[str]:
-    title = f"{METHOD_TITLES.get(method, method.upper())} {dim}D{title_suffix}"
+    n_total = int(coords.shape[0])
+    n_pos = int(np.sum(labels == 1))
+    n_neg = int(np.sum(labels == 0))
+    title = (
+        f"{METHOD_TITLES.get(method, method.upper())} {dim}D{title_suffix}\n"
+        f"(n={n_total}, pos={n_pos}, neg={n_neg})"
+    )
     if dim == 2:
         fig, ax = plt.subplots(figsize=(3.5, 3.0))
         _plot_points(ax, coords, labels, dim=2)
         _format_axes_2d(ax, method, method_info)
-        ax.set_title(title)
+        ax.set_title(title, fontsize=8)
     else:
         fig = plt.figure(figsize=(3.5, 3.1))
         ax = fig.add_subplot(111, projection="3d")
         _plot_points(ax, coords, labels, dim=3)
         _format_axes_3d(ax, method, method_info)
-        ax.set_title(title, pad=6)
+        ax.set_title(title, pad=8, fontsize=8)
 
     ax.legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
     paths = _save_figure(fig, out_dir / f"{method}_{dim}d{filename_suffix}", formats, dpi)
@@ -3113,12 +3119,16 @@ def _plot_panel(
     if not methods:
         return []
 
+    n_total = int(labels.shape[0])
+    n_pos = int(np.sum(labels == 1))
+    n_neg = int(np.sum(labels == 0))
+    count_str = f"n={n_total} pos={n_pos} neg={n_neg}"
     if dim == 2:
         fig, axes = plt.subplots(1, len(methods), figsize=(3.15 * len(methods), 2.8), squeeze=False)
         for ax, method in zip(axes[0], methods):
             _plot_points(ax, embeddings[method][dim], labels, dim=2)
             _format_axes_2d(ax, method, (method_status or {}).get(method))
-            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D{title_suffix}")
+            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 2D{title_suffix}\n({count_str})", fontsize=8)
         axes[0, -1].legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
     else:
         fig = plt.figure(figsize=(3.25 * len(methods), 3.0))
@@ -3126,7 +3136,7 @@ def _plot_panel(
             ax = fig.add_subplot(1, len(methods), idx, projection="3d")
             _plot_points(ax, embeddings[method][dim], labels, dim=3)
             _format_axes_3d(ax, method, (method_status or {}).get(method))
-            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D{title_suffix}", pad=5)
+            ax.set_title(f"{METHOD_TITLES.get(method, method.upper())} 3D{title_suffix}\n({count_str})", pad=6, fontsize=8)
             if idx == len(methods):
                 ax.legend(frameon=False, loc="best", handletextpad=0.3, borderpad=0.2)
 

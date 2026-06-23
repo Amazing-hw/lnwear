@@ -27,6 +27,8 @@ REQUIRED_NPZ_KEYS = [
     "skip_initial_windows",
 ]
 
+DEFAULT_WARMUP_FRAMES = 5
+
 
 def _scalar(value):
     arr = np.asarray(value)
@@ -583,7 +585,7 @@ def main():
     parser.add_argument("--n_workers", type=int, default=4)
     parser.add_argument("--search_budget", type=int, default=240,
                         help="maximum postprocess candidates to evaluate; <=0 keeps the full grid")
-    parser.add_argument("--warmup_frames", type=int, default=3,
+    parser.add_argument("--warmup_frames", type=int, default=DEFAULT_WARMUP_FRAMES,
                         help="skip the first N state-machine windows when computing window-level postprocess metrics")
     parser.add_argument("--replay_split", type=str, default="",
                         help="optional split to replay the selected postprocess params on, e.g. test")

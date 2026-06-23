@@ -91,6 +91,10 @@ def test_s07_zero_budget_keeps_full_grid():
     assert s07.select_postprocess_search_grid(full_grid, search_budget=0) == full_grid
 
 
+def test_s07_default_warmup_matches_deploy_eval_default():
+    assert s07.DEFAULT_WARMUP_FRAMES == 5
+
+
 def test_s07_window_accuracy_uses_per_window_targets_from_cache():
     cache = {
         "sample_name": "mixed-record",
