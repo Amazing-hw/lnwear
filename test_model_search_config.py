@@ -1270,6 +1270,68 @@ def test_s09_builds_window_metric_comparison_rows():
     assert rows[-1]["metric"] == "total_windows"
 
 
+def test_s09_builds_accuracy_scope_rows():
+    report = {
+        "commercial": {
+            "summary": {"accuracy": 0.91},
+            "window_model_summary": {"accuracy": 0.84},
+            "window_stream_summary": {"accuracy": 0.79},
+        },
+        "project": {
+            "summary": {"accuracy": 0.95},
+            "window_model_summary": {"accuracy": 0.89},
+            "window_stream_summary": {"accuracy": 0.86},
+        },
+        "metric_deltas_project_minus_commercial": {
+            "summary": {"accuracy": 0.04},
+            "window_model_summary": {"accuracy": 0.05},
+            "window_stream_summary": {"accuracy": 0.07},
+        },
+    }
+
+    rows = s09.build_accuracy_scope_rows(report)
+
+    assert [row["scope"] for row in rows] == [
+        "summary",
+        "window_model_summary",
+        "window_stream_summary",
+    ]
+    assert rows[0]["commercial_accuracy"] == pytest.approx(0.91)
+    assert rows[1]["project_accuracy"] == pytest.approx(0.89)
+    assert rows[2]["delta_project_minus_commercial"] == pytest.approx(0.07)
+
+
+def test_s09_print_accuracy_scope_comparison_prints_three_scopes(capsys):
+    report = {
+        "commercial": {
+            "summary": {"accuracy": 0.91},
+            "window_model_summary": {"accuracy": 0.84},
+            "window_stream_summary": {"accuracy": 0.79},
+        },
+        "project": {
+            "summary": {"accuracy": 0.95},
+            "window_model_summary": {"accuracy": 0.89},
+            "window_stream_summary": {"accuracy": 0.86},
+        },
+        "metric_deltas_project_minus_commercial": {
+            "summary": {"accuracy": 0.04},
+            "window_model_summary": {"accuracy": 0.05},
+            "window_stream_summary": {"accuracy": 0.07},
+        },
+    }
+
+    s09.print_accuracy_scope_comparison(report)
+    out = capsys.readouterr().out
+
+    assert "[Accuracy compare]" in out
+    assert "sample" in out
+    assert "window_model" in out
+    assert "window_stream" in out
+    assert "commercial=0.9100" in out
+    assert "project=0.9500" in out
+    assert "delta=0.0400" in out
+
+
 def test_s08_full_optimize_enables_cache_and_postprocess_search():
     result = subprocess.run(
         [

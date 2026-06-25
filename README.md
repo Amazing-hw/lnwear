@@ -671,6 +671,12 @@ python s09_commercial_compare.py \
   --fp_cost 4.0
 ```
 
+输出重点：
+- `commercial_compare/commercial_comparison_report.json`：商业 AdaBoost 与当前部署模型的完整对比报告。
+- `commercial_compare/window_level_compare.csv`：逐指标对比 sample、window model、streaming window 三个口径。
+- `commercial_compare/accuracy_scope_compare.csv`：只抽取三种口径的 accuracy，便于快速检查口径差异。
+- `commercial_compare/commercial_compare_summary.png`：左上为 sample-level 指标，右上为 streaming window 指标。
+
 `s06_deploy_eval.py` 也内嵌泛化审计入口，用于读取已有评估产物并输出分层审计结果：
 
 ```bash
@@ -838,7 +844,7 @@ UMAP 需安装 `umap-learn` 包。如未安装，报告仍会输出 PCA 和 t-SN
 
 | 图片 | 说明 |
 |---|---|
-| `commercial_compare/commercial_compare_summary.png` | 2×2 对比：左上 Sample 指标柱状对比，右上 Window 指标柱状对比，左下商业方案混淆矩阵，右下部署方案混淆矩阵 |
+| `commercial_compare/commercial_compare_summary.png` | 2×2 对比：左上 Sample 指标柱状对比，右上 Streaming window 指标柱状对比，左下商业方案混淆矩阵，右下部署方案混淆矩阵 |
 | `commercial_compare/commercial_compare_probabilities.png` | 1×2 窗口概率直方图：左为商业 AdaBoost，右为部署 XGBoost，红=target0，绿=target1 |
 | `commercial_compare/commercial_compare_disagreements.png` | 水平柱状：配对的 6 类样本结果（both correct / ours only / commercial only / both wrong / 各方案专属 FP），标注每类样本数 |
 

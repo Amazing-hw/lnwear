@@ -56,6 +56,8 @@ from s06_deploy_eval import (
     Stage1StreamingGate,
     _advance_stage1_gate_to_step,
     apply_postprocess,
+    compute_window_model_metrics,
+    compute_window_stream_metrics,
     get_deploy_stage1_threshold,
     load_bundle,
     resolve_use_stage2_ir,
@@ -245,8 +247,25 @@ def _slice_acc(acc_25, start, size):
 
 
 def _prewindow_to_25hz(sample, window, window_sec):
-    native_25hz = _is_25hz_sample(sample) or int(window.shape[0]) == int(round(float(window_sec) * FEATURE_FS))
-    if native_25hz:
+    n_samples = int(window.shape[0])
+    # Detect native 25 Hz by matching against common window lengths:
+    #   3s @ 25Hz = 75,  5s @ 25Hz = 125,  3s @ 100Hz = 300,  5s @ 100Hz = 500
+    # Also check the sample name hint and the caller-expected length.
+    looks_25hz = (
+        _is_25hz_sample(sample)
+        or n_samples == int(round(float(window_sec) * FEATURE_FS))
+        or (n_samples <= 200 and n_samples > 0 and n_samples % FEATURE_FS == 0)
+    )
+    looks_100hz = (
+        n_samples == int(round(float(window_sec) * 100))
+        or (n_samples > 200 and n_samples % 100 == 0)
+    )
+    if looks_25hz and not looks_100hz:
+        return np.asarray(window, dtype=np.float64), 25
+    if looks_100hz and not looks_25hz:
+        return _downsample_ppg(np.asarray(window, dtype=np.float64), src_fs=100, tgt_fs=FEATURE_FS), 100
+    # Ambiguous: fall back to the caller-expected length check
+    if n_samples >= int(round(float(window_sec) * FEATURE_FS)):
         return np.asarray(window, dtype=np.float64), 25
     return _downsample_ppg(np.asarray(window, dtype=np.float64), src_fs=100, tgt_fs=FEATURE_FS), 100
 
@@ -436,6 +455,8 @@ def _finalize_commercial_results(raw_results, threshold: float):
             "fallback_reason": raw.get("fallback_reason"),
             "window_probs": probs,
             "window_preds": window_preds,
+            "window_states": [],
+            "window_scores": [],
             "stage2_enabled_flags": list(raw.get("stage2_enabled_flags", [])),
             "n_windows": int(len(probs)),
         })
@@ -456,6 +477,57 @@ def window_metrics_from_details(details, count_key: str = "total_windows"):
     return _metrics(y_true, y_pred, count_key=count_key)
 
 
+def _apply_state_machine_to_details(details, threshold: float, postprocess_cfg):
+    cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
+    if postprocess_cfg:
+        cfg.update(postprocess_cfg)
+    for detail in details:
+        probs = [float(p) for p in detail.get("window_probs", [])]
+        if detail.get("fallback") or not detail.get("stage1_pass", False) or len(probs) == 0:
+            detail["pred"] = 0
+            detail["window_states"] = []
+            detail["window_scores"] = []
+            continue
+        pred, states, _window_preds, scores = apply_postprocess(
+            probs,
+            [{} for _ in probs],
+            "state_machine",
+            cfg,
+            threshold,
+        )
+        detail["pred"] = int(pred)
+        detail["window_states"] = [int(s) for s in states]
+        detail["window_scores"] = [float(s) for s in scores]
+    return cfg
+
+
+def _build_eval_payload(details, postprocess_cfg, model_threshold, warmup_frames=5):
+    cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
+    if postprocess_cfg:
+        cfg.update(postprocess_cfg)
+    try:
+        warmup_frames = max(0, int(warmup_frames))
+    except (TypeError, ValueError):
+        warmup_frames = 5
+    summary = metrics_from_details(details)
+    window_model_summary = compute_window_model_metrics(details)
+    window_stream_summary = compute_window_stream_metrics(
+        details,
+        cfg,
+        warmup_frames=warmup_frames,
+        model_threshold=model_threshold,
+    )
+    return {
+        "summary": summary,
+        "window_model_summary": window_model_summary,
+        "window_stream_summary": window_stream_summary,
+        # Backward-compatible aliases for existing report consumers.
+        "sample_metrics": summary,
+        "window_metrics": window_model_summary,
+        "details": details,
+    }
+
+
 def select_commercial_threshold(raw_valid_results, fp_cost: float = 1.5):
     best = {"threshold": 0.5, "score": -np.inf, "metrics": None}
     thresholds = np.linspace(0.05, 0.95, 91)
@@ -471,15 +543,16 @@ def select_commercial_threshold(raw_valid_results, fp_cost: float = 1.5):
     return best
 
 
-def evaluate_commercial_model(model, threshold: float, dc_threshold: float, samples):
+def evaluate_commercial_model(model, threshold: float, dc_threshold: float, samples, warmup_frames: int = 5):
     raw = [infer_one_sample_commercial(sample, dc_threshold) for sample in samples]
     raw = _attach_commercial_probs(raw, model)
     details = _finalize_commercial_results(raw, threshold)
-    return {
-        "sample_metrics": metrics_from_details(details),
-        "window_metrics": window_metrics_from_details(details),
-        "details": details,
+    postprocess_cfg = {
+        "sample_pred_warmup_frames": DEFAULT_POSTPROCESS_CONFIG["K_on"],
+        "sample_pred_strategy": "final_state",
     }
+    _apply_state_machine_to_details(details, threshold, postprocess_cfg)
+    return _build_eval_payload(details, postprocess_cfg, threshold, warmup_frames=warmup_frames)
 
 
 def _load_deploy_extractor(artifact_dir: Path):
@@ -496,7 +569,13 @@ def _load_deploy_extractor(artifact_dir: Path):
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load deploy feature extractor from {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise ImportError(
+            f"Failed to execute deploy feature extractor from {path}: {exc}\n"
+            "The generated script may be corrupted. Re-run s08 --export_deploy to regenerate it."
+        ) from exc
     return module, path
 
 
@@ -514,14 +593,22 @@ def load_project_artifacts(artifact_dir: Path, method: str = "state_machine"):
         raise ValueError("deploy extractor FEATURE_ORDER does not match model_bundle feature_names")
 
     with open(threshold_path, "r", encoding="utf-8") as f:
-        stage1_threshold = get_deploy_stage1_threshold(json.load(f))
+        try:
+            stage1_threshold = get_deploy_stage1_threshold(json.load(f))
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise ValueError(
+                f"Failed to parse stage1_threshold.json ({threshold_path}): {exc}"
+            ) from exc
 
     postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
     final_config_path = artifact_dir / "final_model_config.json"
     if final_config_path.exists():
-        with open(final_config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        postprocess_cfg.update(config.get("postprocess", {}))
+        try:
+            with open(final_config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            postprocess_cfg.update(config.get("postprocess", {}))
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[WARN] Failed to read final_model_config.json, using defaults: {exc}")
 
     return {
         "bundle": bundle,
@@ -704,7 +791,7 @@ def _finalize_project_detail(base, method, postprocess_cfg, model_threshold):
 
 def evaluate_project_pipeline(samples, artifacts, window_sec=None, stride_sec=None,
                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
-                              use_stage2_ir=None):
+                              use_stage2_ir=None, warmup_frames: int = 5):
     details = [
         infer_one_sample_project(
             sample,
@@ -716,11 +803,12 @@ def evaluate_project_pipeline(samples, artifacts, window_sec=None, stride_sec=No
         )
         for sample in samples
     ]
-    return {
-        "sample_metrics": metrics_from_details(details),
-        "window_metrics": window_metrics_from_details(details),
-        "details": details,
-    }
+    return _build_eval_payload(
+        details,
+        artifacts.get("postprocess_cfg", {}),
+        float(artifacts["bundle"]["threshold"]),
+        warmup_frames=warmup_frames,
+    )
 
 
 def _prob_stats(detail):
@@ -779,7 +867,7 @@ def build_comparison_report(commercial_eval, project_eval, metadata):
             })
 
     metric_deltas = {}
-    for scope in ("sample_metrics", "window_metrics"):
+    for scope in ("summary", "window_model_summary", "window_stream_summary", "sample_metrics", "window_metrics"):
         metric_deltas[scope] = {}
         for key in ("accuracy", "precision", "recall", "f1"):
             metric_deltas[scope][key] = float(project_eval[scope][key] - commercial_eval[scope][key])
@@ -815,6 +903,59 @@ def build_window_metric_comparison_rows(report):
             "delta_project_minus_commercial": delta,
         })
     return rows
+
+
+def build_accuracy_scope_rows(report):
+    scope_specs = [
+        ("summary", "sample"),
+        ("window_model_summary", "window_model"),
+        ("window_stream_summary", "window_stream"),
+    ]
+    rows = []
+    for scope, label in scope_specs:
+        commercial = report["commercial"].get(scope, {})
+        project = report["project"].get(scope, {})
+        deltas = report["metric_deltas_project_minus_commercial"].get(scope, {})
+        rows.append({
+            "scope": scope,
+            "label": label,
+            "commercial_accuracy": float(commercial.get("accuracy", 0.0)),
+            "project_accuracy": float(project.get("accuracy", 0.0)),
+            "delta_project_minus_commercial": float(
+                deltas.get("accuracy", project.get("accuracy", 0.0) - commercial.get("accuracy", 0.0))
+            ),
+        })
+    return rows
+
+
+def export_accuracy_scope_csv(report, out_dir: Path):
+    out_path = Path(out_dir) / "accuracy_scope_compare.csv"
+    rows = build_accuracy_scope_rows(report)
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "scope",
+                "label",
+                "commercial_accuracy",
+                "project_accuracy",
+                "delta_project_minus_commercial",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    return str(out_path)
+
+
+def print_accuracy_scope_comparison(report):
+    print("\n[Accuracy compare]")
+    for row in build_accuracy_scope_rows(report):
+        print(
+            f"  {row['label']:<13} "
+            f"commercial={row['commercial_accuracy']:.4f}  "
+            f"project={row['project_accuracy']:.4f}  "
+            f"delta={row['delta_project_minus_commercial']:.4f}"
+        )
 
 
 def export_window_metric_comparison_csv(report, out_dir: Path):
@@ -860,8 +1001,8 @@ def plot_summary(report, out_dir: Path):
     fig.suptitle("Commercial Baseline vs Deployed XGBoost", fontsize=16, fontweight="bold", x=0.03, ha="left")
 
     ax = axes[0, 0]
-    b1 = ax.bar(x - width / 2, [commercial["sample_metrics"][m] for m in metrics], width, label="Commercial", color=PLOT_COLORS["commercial"])
-    b2 = ax.bar(x + width / 2, [project["sample_metrics"][m] for m in metrics], width, label="Deployed", color=PLOT_COLORS["ours"])
+    b1 = ax.bar(x - width / 2, [commercial["summary"][m] for m in metrics], width, label="Commercial", color=PLOT_COLORS["commercial"])
+    b2 = ax.bar(x + width / 2, [project["summary"][m] for m in metrics], width, label="Deployed", color=PLOT_COLORS["ours"])
     ax.set_ylim(0, 1.08)
     ax.set_xticks(x, [m.upper() for m in metrics])
     ax.set_title("Sample-level metrics", fontsize=11, fontweight="bold")
@@ -871,17 +1012,17 @@ def plot_summary(report, out_dir: Path):
     _annotate_bars(ax, b2)
 
     ax = axes[0, 1]
-    b1 = ax.bar(x - width / 2, [commercial["window_metrics"][m] for m in metrics], width, label="Commercial", color=PLOT_COLORS["commercial"])
-    b2 = ax.bar(x + width / 2, [project["window_metrics"][m] for m in metrics], width, label="Deployed", color=PLOT_COLORS["ours"])
+    b1 = ax.bar(x - width / 2, [commercial["window_stream_summary"][m] for m in metrics], width, label="Commercial", color=PLOT_COLORS["commercial"])
+    b2 = ax.bar(x + width / 2, [project["window_stream_summary"][m] for m in metrics], width, label="Deployed", color=PLOT_COLORS["ours"])
     ax.set_ylim(0, 1.08)
     ax.set_xticks(x, [m.upper() for m in metrics])
-    ax.set_title("Window-level metrics", fontsize=11, fontweight="bold")
+    ax.set_title("Streaming window metrics", fontsize=11, fontweight="bold")
     ax.grid(axis="y", alpha=0.2)
     _annotate_bars(ax, b1)
     _annotate_bars(ax, b2)
 
-    _draw_confusion(axes[1, 0], commercial["sample_metrics"]["confusion_matrix"], "Commercial sample confusion")
-    _draw_confusion(axes[1, 1], project["sample_metrics"]["confusion_matrix"], "Deployed sample confusion")
+    _draw_confusion(axes[1, 0], commercial["summary"]["confusion_matrix"], "Commercial sample confusion")
+    _draw_confusion(axes[1, 1], project["summary"]["confusion_matrix"], "Deployed sample confusion")
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(out_path, bbox_inches="tight")
@@ -983,6 +1124,8 @@ def main(argv=None):
     parser.add_argument("--stride_sec", type=float, default=1.0, help="Deployed XGBoost stride seconds.")
     parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,
                         help="drop this many leading project Stage2 windows per sample")
+    parser.add_argument("--warmup_frames", type=int, default=5,
+                        help="streaming window metrics skip this many leading state-machine windows per sample")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction, default=None,
                         help="whether project Stage2 uses IR; defaults to model bundle metadata")
     parser.add_argument("--keep_window_probs", action="store_true")
@@ -1015,6 +1158,7 @@ def main(argv=None):
         commercial_threshold,
         args.commercial_dc_threshold,
         eval_samples,
+        warmup_frames=args.warmup_frames,
     )
 
     artifacts = load_project_artifacts(artifact_dir, method=args.method)
@@ -1025,6 +1169,7 @@ def main(argv=None):
         stride_sec=args.stride_sec,
         skip_initial_windows=args.skip_initial_windows,
         use_stage2_ir=args.use_stage2_ir,
+        warmup_frames=args.warmup_frames,
     )
 
     metadata = {
@@ -1037,6 +1182,7 @@ def main(argv=None):
             "features": COMMERCIAL_FEATURE_NAMES,
             "model": "AdaBoostClassifier(n_estimators=16, max_depth=5)",
             "threshold": float(commercial_threshold),
+            "warmup_frames": int(args.warmup_frames),
             "threshold_selection": threshold_selection,
             "train_summary": commercial_train,
         },
@@ -1050,6 +1196,7 @@ def main(argv=None):
             "window_sec": float(args.window_sec if args.window_sec is not None else artifacts["bundle"]["meta"]["win_sec"]),
             "stride_sec": float(args.stride_sec),
             "skip_initial_windows": int(args.skip_initial_windows),
+            "warmup_frames": int(args.warmup_frames),
             "use_stage2_ir": bool(resolve_use_stage2_ir(artifacts["bundle"], args.use_stage2_ir)),
             "postprocess": artifacts["postprocess_cfg"],
             "method": args.method,
@@ -1059,8 +1206,10 @@ def main(argv=None):
     report = build_comparison_report(commercial_eval, project_eval, metadata)
     plot_paths = export_comparison_plots(report, out_dir)
     window_compare_path = export_window_metric_comparison_csv(report, out_dir)
+    accuracy_scope_path = export_accuracy_scope_csv(report, out_dir)
     report["metadata"]["plot_paths"] = plot_paths
     report["metadata"]["window_level_compare_csv"] = window_compare_path
+    report["metadata"]["accuracy_scope_compare_csv"] = accuracy_scope_path
     report["metadata"]["elapsed_sec"] = float(time.time() - t0)
 
     if not args.keep_window_probs:
@@ -1072,11 +1221,13 @@ def main(argv=None):
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print("\n[Commercial sample]", commercial_eval["sample_metrics"])
-    print("[Project sample]   ", project_eval["sample_metrics"])
-    print("[Delta sample]     ", report["metric_deltas_project_minus_commercial"]["sample_metrics"])
+    print("\n[Commercial sample]", commercial_eval["summary"])
+    print("[Project sample]   ", project_eval["summary"])
+    print("[Delta sample]     ", report["metric_deltas_project_minus_commercial"]["summary"])
+    print_accuracy_scope_comparison(report)
     print(f"\n[OK] report: {report_path}")
     print(f"[OK] window_level_compare.csv: {window_compare_path}")
+    print(f"[OK] accuracy_scope_compare.csv: {accuracy_scope_path}")
     for name, path in plot_paths.items():
         print(f"[OK] {name}: {path}")
 

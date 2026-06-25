@@ -1125,6 +1125,7 @@ def run_embedded_commercial_compare(args):
         "--window_sec", str(args.window_sec),
         "--stride_sec", str(args.stride_sec),
         "--skip_initial_windows", str(args.skip_initial_windows),
+        "--warmup_frames", str(args.postprocess_warmup_frames),
         "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir",
     ]
     if args.keep_window_probs:
@@ -2897,7 +2898,7 @@ def main():
     if "s09_cmp" not in skip_set and args.commercial_compare:
         commands["s09_cmp"] = "__commercial_compare__"
     elif "s09_cmp" not in skip_set:
-        print("(商业窗口级对比: --no-commercial_compare skipped; output window_level_compare.csv when enabled)")
+        print("(商业窗口级对比: --no-commercial_compare skipped; outputs window_level_compare.csv and accuracy_scope_compare.csv when enabled)")
 
     # s06_plot (纯 Python 调用，非子进程，默认自动生成)
     if "s06_plot" not in skip_set:
