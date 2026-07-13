@@ -317,6 +317,7 @@ def plot_stage1_scatter(df_train, df_valid, deploy_dc, deploy_acdc, out_path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from scientific_figures import save_scientific_figure
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -328,24 +329,24 @@ def plot_stage1_scatter(df_train, df_valid, deploy_dc, deploy_acdc, out_path):
         t0 = df[df["target"] == 0]
         t1 = df[df["target"] == 1]
 
-        ax.scatter(t0["dc"], t0["ac_dc_ratio"], c="red", s=8, alpha=0.4,
+        ax.scatter(t0["dc"], t0["ac_dc_ratio"], c="#4C78A8", s=8, alpha=0.4,
                    label="target=0 (not-worn)", edgecolors="none")
-        ax.scatter(t1["dc"], t1["ac_dc_ratio"], c="green", s=8, alpha=0.6,
+        ax.scatter(t1["dc"], t1["ac_dc_ratio"], c="#E07B53", s=8, alpha=0.6,
                    label="target=1 (worn)", edgecolors="none")
 
         # 阈值线
-        ax.axvline(x=deploy_dc, color="blue", linestyle="--", linewidth=1.5,
+        ax.axvline(x=deploy_dc, color="#2A9D8F", linestyle="--", linewidth=1.5,
                    label=f"dc={deploy_dc:.1e}")
-        ax.axhline(y=deploy_acdc, color="blue", linestyle="--", linewidth=1.5,
+        ax.axhline(y=deploy_acdc, color="#2A9D8F", linestyle="--", linewidth=1.5,
                    label=f"ac/dc={deploy_acdc:.4f}")
 
         # 标注通过区域
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
         ax.fill_between([deploy_dc, xlim[1]], 0, deploy_acdc,
-                        alpha=0.05, color="blue")
+                        alpha=0.05, color="#2A9D8F")
         ax.text(deploy_dc * 1.05, deploy_acdc * 0.5, "PASS",
-                fontsize=14, color="blue", alpha=0.3, weight="bold")
+                fontsize=14, color="#2A9D8F", alpha=0.5, weight="bold")
 
         ax.set_xlabel("DC")
         ax.set_ylabel("AC/DC Ratio")
@@ -357,9 +358,29 @@ def plot_stage1_scatter(df_train, df_valid, deploy_dc, deploy_acdc, out_path):
     fig.suptitle(f"Stage1 IR Threshold: DC > {deploy_dc:.1e},  AC/DC < {deploy_acdc:.4f}",
                  fontsize=13)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    source_rows = []
+    for split_name, frame in (("train", df_train), ("valid", df_valid)):
+        for row in frame[["target", "dc", "ac_dc_ratio"]].to_dict("records"):
+            source_rows.append({"split": split_name, **row})
+    artifact_dir = os.path.dirname(os.fspath(out_path))
+    outputs = save_scientific_figure(
+        fig, out_path, source_data=source_rows,
+        core_conclusion="The fixed Stage1 IR gate is visualized against train and validation distributions without tuning on test.",
+        panel_map={"a": "Train IR DC versus AC/DC.", "b": "Validation IR DC versus AC/DC."},
+        inputs=[
+            path for path in [
+                os.path.join(artifact_dir, "stage1_train_windows.csv"),
+                os.path.join(artifact_dir, "stage1_valid_windows.csv"),
+            ] if os.path.isfile(path)
+        ],
+        split="train_valid",
+        n_definition="one Stage1 decision window per source row",
+        statistics={"threshold": "fixed deployment gate", "interval": "none"},
+        reviewer_risks=["Window observations are correlated within samples."],
+    )
     plt.close(fig)
     print(f"散点图已保存: {out_path}")
+    return outputs
 
 
 # =========================================================

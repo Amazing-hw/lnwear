@@ -15,9 +15,11 @@
 import os
 import json
 import argparse
+import hashlib
 import logging
 import joblib
 from itertools import product
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -33,8 +35,16 @@ from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, Stratifi
 from s03_extract_feature_pool import filter_stage2_ir_features, is_stage2_ir_feature
 from s04_feature_selection import (
     filter_features_for_deployment,
+    is_deployment_allowed_feature,
     summarize_deployment_feature_costs,
+    validate_feature_pool_frames,
 )
+from stage2_feature_catalog import (
+    FEATURE_POOL_VERSION,
+    is_model_candidate,
+)
+from manual_feature_selection import load_manual_selection_workbook
+from scientific_figures import save_scientific_figure
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -57,6 +67,139 @@ def enforce_no_stage2_ir_features(feature_names, context):
     return filtered
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_manual_feature_selection(manual_path, ranking_path, df_train, df_valid):
+    """Validate a frozen manual feature list without filtering or reordering it."""
+    manual_path = Path(manual_path)
+    ranking_path = Path(ranking_path)
+    if not manual_path.exists():
+        raise ValueError(
+            f"manual feature file missing: {manual_path}; "
+            "manual mode does not fall back to automatic selection."
+        )
+    if not ranking_path.exists():
+        raise ValueError(
+            f"full ranking file missing: {ranking_path}; run s04 before manual training."
+        )
+
+    if manual_path.suffix.lower() == ".xlsx":
+        selected, provenance = load_manual_selection_workbook(
+            manual_path,
+            ranking_path,
+            train_columns=set(df_train.columns),
+            valid_columns=set(df_valid.columns),
+        )
+        frozen_path = manual_path.parent / "manual_selected_features.json"
+        frozen_payload = {
+            "schema_version": 1,
+            "feature_pool_version": FEATURE_POOL_VERSION,
+            "ranking_source": ranking_path.name,
+            "selected_features": selected,
+            "selection_notes": {},
+            "selection_provenance": provenance,
+        }
+        tmp_path = frozen_path.with_suffix(frozen_path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(frozen_payload, handle, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, frozen_path)
+        provenance["frozen_manual_feature_file"] = str(frozen_path.resolve())
+        provenance["frozen_manual_feature_file_sha256"] = _sha256_file(frozen_path)
+        return selected, provenance
+
+    validate_feature_pool_frames(df_train, df_valid)
+    with manual_path.open("r", encoding="utf-8") as handle:
+        manual = json.load(handle)
+    with ranking_path.open("r", encoding="utf-8") as handle:
+        ranking_payload = json.load(handle)
+    if not isinstance(manual, dict):
+        raise ValueError("manual feature file must be a JSON object")
+    if int(manual.get("schema_version", -1)) != 1:
+        raise ValueError("manual feature file schema_version must be 1")
+    if str(manual.get("feature_pool_version", "")) != FEATURE_POOL_VERSION:
+        raise ValueError(
+            f"manual feature file feature_pool_version must be {FEATURE_POOL_VERSION}; "
+            "rerun s03-s04 and review the new ranking."
+        )
+
+    selected = manual.get("selected_features")
+    if (
+        not isinstance(selected, list)
+        or not selected
+        or any(not isinstance(name, str) or not name.strip() for name in selected)
+    ):
+        raise ValueError("manual selected_features must be a non-empty string array")
+    selected = [name.strip() for name in selected]
+    duplicates = sorted({name for name in selected if selected.count(name) > 1})
+    if duplicates:
+        raise ValueError("manual selected_features contains duplicate entries: " + ", ".join(duplicates))
+
+    if not isinstance(ranking_payload, dict):
+        raise ValueError("feature_ranking_full.json must be a versioned JSON object")
+    if str(ranking_payload.get("feature_pool_version", "")) != FEATURE_POOL_VERSION:
+        raise ValueError(
+            f"feature_ranking_full.json version does not match {FEATURE_POOL_VERSION}; rerun s04."
+        )
+    ranking = ranking_payload.get("ranking")
+    if not isinstance(ranking, list):
+        raise ValueError("feature_ranking_full.json missing ranking array")
+    ranking_by_feature = {
+        str(item.get("feature")): item
+        for item in ranking
+        if isinstance(item, dict) and item.get("feature")
+    }
+
+    errors = []
+    for name in selected:
+        if not is_model_candidate(name):
+            errors.append(f"{name}: unknown Stage2 catalog feature")
+            continue
+        record = ranking_by_feature.get(name)
+        if record is None:
+            errors.append(f"{name}: absent from feature_ranking_full.json")
+        elif not bool(record.get("eligible_for_manual_selection", False)):
+            reason = record.get("ineligible_reasons") or record.get("removed_reason") or "not eligible"
+            errors.append(f"{name}: {reason}")
+        if name not in df_train.columns:
+            errors.append(f"{name}: missing from feature_pool_train.csv")
+        if name not in df_valid.columns:
+            errors.append(f"{name}: missing from feature_pool_valid.csv")
+        if is_stage2_ir_feature(name):
+            errors.append(f"{name}: IR-derived Stage2 features are forbidden")
+        if not is_deployment_allowed_feature(name):
+            errors.append(f"{name}: not allowed by the deployment feature policy")
+    if errors:
+        raise ValueError("manual feature selection validation failed: " + "; ".join(errors))
+
+    notes = manual.get("selection_notes", {})
+    if notes is None:
+        notes = {}
+    if not isinstance(notes, dict):
+        raise ValueError("selection_notes must be a JSON object when present")
+    invalid_note_keys = sorted(set(map(str, notes)) - set(selected))
+    if invalid_note_keys:
+        raise ValueError(
+            "selection_notes references unselected features: " + ", ".join(invalid_note_keys)
+        )
+
+    provenance = {
+        "feature_selection_mode": "manual",
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "manual_feature_file": str(manual_path.resolve()),
+        "manual_feature_file_sha256": _sha256_file(manual_path),
+        "ranking_source": str(ranking_path.resolve()),
+        "ranking_source_sha256": _sha256_file(ranking_path),
+        "selection_notes": {str(key): str(value) for key, value in notes.items()},
+    }
+    return selected, provenance
+
+
 DEFAULT_XGB_PARAMS = {
     "n_estimators": 40,
     "max_depth": 3,
@@ -70,6 +213,122 @@ DEFAULT_XGB_PARAMS = {
     "eval_metric": "logloss",
     "random_state": 42,
 }
+
+
+def select_model_candidate(records, max_nodes=500, max_fpr=0.01):
+    """Select one validation candidate under explicit deployment constraints."""
+    leaderboard = []
+    eligible = []
+    for source in records:
+        record = dict(source)
+        reasons = []
+        if not bool(record.get("finite_predictions", True)):
+            reasons.append("non_finite_predictions")
+        nodes = int(record.get("total_nodes", 0) or 0)
+        if int(max_nodes) > 0 and nodes > int(max_nodes):
+            reasons.append("node_budget")
+        record["rejection_reasons"] = reasons
+        record["node_budget_pass"] = "node_budget" not in reasons
+        record["finite_predictions_pass"] = "non_finite_predictions" not in reasons
+        record["fpr_constraint_pass"] = float(record.get("valid_fp_rate", 1.0)) <= float(max_fpr)
+        leaderboard.append(record)
+        if not reasons:
+            eligible.append(record)
+    if not eligible:
+        raise ValueError("no model candidate has finite predictions within the node budget")
+
+    feasible = [record for record in eligible if record["fpr_constraint_pass"]]
+    if feasible:
+        selected = min(
+            feasible,
+            key=lambda record: (
+                -float(record.get("valid_accuracy", 0.0)),
+                float(record.get("valid_fp_rate", 1.0)),
+                -float(record.get("valid_recall", 0.0)),
+                int(record.get("total_nodes", 0) or 0),
+                float(record.get("cv_accuracy_std", float("inf"))),
+                str(record.get("candidate", "")),
+            ),
+        )
+        accepted = True
+        status = "deployment_candidate"
+        reason = "max_valid_accuracy_within_fpr_and_node_constraints"
+    else:
+        selected = min(
+            eligible,
+            key=lambda record: (
+                float(record.get("valid_fp_rate", 1.0)),
+                -float(record.get("valid_accuracy", 0.0)),
+                -float(record.get("valid_recall", 0.0)),
+                int(record.get("total_nodes", 0) or 0),
+                float(record.get("cv_accuracy_std", float("inf"))),
+                str(record.get("candidate", "")),
+            ),
+        )
+        accepted = False
+        status = "analysis_only"
+        reason = "no_candidate_met_valid_fpr_constraint"
+    leaderboard.sort(key=lambda record: record.get("candidate") != selected.get("candidate"))
+    return {
+        "selected_candidate": str(selected.get("candidate")),
+        "deployment_acceptance": accepted,
+        "status": status,
+        "selection_reason": reason,
+        "max_nodes": int(max_nodes),
+        "max_valid_fp_rate": float(max_fpr),
+        "leaderboard": leaderboard,
+    }
+
+
+def accept_hard_negative_candidate(reference, candidate, tolerance=1e-12):
+    """Accept train-OOF hard-negative retraining only without valid regression."""
+    reference_accuracy = float(reference.get("valid_accuracy", 0.0))
+    candidate_accuracy = float(candidate.get("valid_accuracy", 0.0))
+    reference_fpr = float(reference.get("valid_fp_rate", 1.0))
+    candidate_fpr = float(candidate.get("valid_fp_rate", 1.0))
+    if candidate_accuracy < reference_accuracy - float(tolerance):
+        accepted = False
+        reason = "valid_accuracy_decreased"
+    elif candidate_fpr > reference_fpr + float(tolerance):
+        accepted = False
+        reason = "valid_false_positive_rate_increased"
+    else:
+        accepted = True
+        reason = "accuracy_not_lower_and_fpr_not_higher"
+    return {
+        "accepted": accepted,
+        "reason": reason,
+        "reference_candidate": str(reference.get("candidate")),
+        "hard_negative_candidate": str(candidate.get("candidate")),
+        "selected_candidate": str(
+            candidate.get("candidate") if accepted else reference.get("candidate")
+        ),
+        "valid_accuracy_delta": candidate_accuracy - reference_accuracy,
+        "valid_fp_rate_delta": candidate_fpr - reference_fpr,
+    }
+
+
+def _candidate_record(name, model, metrics):
+    cm = metrics.get("confusion_matrix") or {}
+    tn = int(cm.get("TN", 0))
+    fp = int(cm.get("FP", 0))
+    return {
+        "candidate": str(name),
+        "valid_accuracy": float(metrics.get("accuracy", 0.0)),
+        "valid_fp_rate": float(fp / max(tn + fp, 1)),
+        "valid_recall": float(metrics.get("recall", 0.0)),
+        "total_nodes": int(count_xgb_nodes(model)),
+        "cv_accuracy_std": 0.0,
+        "finite_predictions": True,
+    }
+
+
+def _atomic_json_dump(payload, path):
+    path = Path(path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
 
 MODEL_SEARCH_PARAM_KEYS = [
     "n_estimators",
@@ -689,7 +948,8 @@ def build_model_search_grid(args, scale_pos_weight=1.0):
     random_state = int(getattr(args, "model_search_random_state", 42))
     total_combinations = _model_search_combo_count(axes)
     if max_candidates > 0 and total_combinations > max_candidates:
-        rng = np.random.RandomState(random_state)
+        random_state_class = getattr(np.random, "RandomState")
+        rng = random_state_class(random_state)
         combo_indices = sorted(
             rng.choice(total_combinations, size=max_candidates, replace=False).tolist()
         )
@@ -1319,6 +1579,71 @@ def train_xgb_with_params(params, X_train, y_train, sample_weight=None):
     return model
 
 
+def _finite_float_or_none(value):
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value):
+        return None
+    return value
+
+
+def score_fixed_params_with_train_cv(args, X_train, y_train, groups, params,
+                                     sample_weight=None, total_nodes=None):
+    """Score one fixed feature set with train-only CV, without touching valid/test."""
+    cv_splits, cv_meta = build_repeated_group_cv_splits(
+        y_train,
+        groups=groups,
+        n_folds=args.model_search_cv_folds,
+        n_repeats=args.model_search_cv_repeats,
+        random_state=args.model_search_random_state,
+    )
+    fold_metrics = []
+    for train_idx, valid_idx in cv_splits:
+        if len(train_idx) == 0 or len(valid_idx) == 0:
+            continue
+        sw_fold = sample_weight[train_idx] if sample_weight is not None else None
+        fold_model = train_xgb_with_params(
+            params,
+            X_train[train_idx],
+            y_train[train_idx],
+            sample_weight=sw_fold,
+        )
+        fold_metrics.append(evaluate_accuracy_first_threshold(
+            fold_model,
+            X_train[valid_idx],
+            y_train[valid_idx],
+        ))
+    cv_summary = summarize_cv_metrics(fold_metrics)
+    if total_nodes is None:
+        final_model = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
+        total_nodes = count_xgb_nodes(final_model)
+    total_nodes = int(total_nodes)
+    mean_accuracy = float(cv_summary.get("mean_cv_accuracy") or 0.0)
+    mean_fp_rate = float(cv_summary.get("mean_cv_fp_rate") or 0.0)
+    max_model_nodes = int(args.max_model_nodes)
+    size_ratio = float(total_nodes) / float(max(max_model_nodes, 1)) if max_model_nodes > 0 else 0.0
+    eligible = not (max_model_nodes > 0 and total_nodes > max_model_nodes)
+    score = (
+        mean_accuracy
+        - float(args.model_search_fp_cost) * mean_fp_rate
+        - float(args.model_search_size_cost) * size_ratio
+    ) if eligible else float("-inf")
+    return {
+        "score": float(score),
+        "selection_metric": "train_cv_fixed_params_score",
+        "cv_summary": cv_summary,
+        "cv_split": cv_meta,
+        "total_nodes": int(total_nodes),
+        "eligible": bool(eligible),
+        "fp_rate": float(mean_fp_rate),
+        "size_ratio": float(size_ratio),
+    }
+
+
 def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y_select,
                                              scale_pos_weight=1.0, sample_weight=None):
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
@@ -1662,7 +1987,7 @@ def export_roc_pr_curves(model, X_valid, y_valid, artifact_dir):
         fig.text(0.5, 0.5, "Single class in validation split — cannot compute ROC/PR curves",
                  ha="center", va="center", fontsize=13, color="#c44e52")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
-        fig.savefig(out_path, dpi=180, bbox_inches="tight")
+        fig.savefig(out_path, dpi=600, bbox_inches="tight")
         plt.close(fig)
         print(f"[OK] s05 ROC/PR plot (single class notice) -> {out_path}")
         return out_path
@@ -1733,7 +2058,7 @@ def export_roc_pr_curves(model, X_valid, y_valid, artifact_dir):
 
     fig.suptitle("ROC / PR Curves — Validation Split", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] s05 ROC/PR plot -> {out_path}")
     return out_path
@@ -1813,7 +2138,7 @@ def export_training_report_plot(plot_data, artifact_dir):
 
     fig.suptitle("Training and Threshold Report", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] s05 report plot -> {out_path}")
     return out_path
@@ -1898,10 +2223,38 @@ def export_threshold_tradeoff_plot(plot_data, artifact_dir):
     fig.suptitle("Window Threshold: False Positives vs Recall", fontsize=15, weight="bold")
     fig.subplots_adjust(top=0.86, left=0.08, right=0.92, bottom=0.12, wspace=0.28)
     fig_path = os.path.join(out_dir, "s05_threshold_fp_recall_tradeoff.png")
-    fig.savefig(fig_path, dpi=180, bbox_inches="tight")
+    scientific = save_scientific_figure(
+        fig,
+        fig_path,
+        source_data=df,
+        source_data_path=csv_path,
+        inputs=[csv_path],
+        core_conclusion=(
+            "The selected validation threshold balances window accuracy, recall, "
+            "precision, and false-positive risk."
+        ),
+        panel_map={
+            "a": "Precision, recall, and false-positive rate across thresholds.",
+            "b": "Recall versus false-positive rate in the operating region.",
+        },
+        split="valid",
+        n_definition=f"{len(df)} threshold candidates on the valid threshold split",
+        statistics={
+            "metric": "window classification metrics",
+            "selected_threshold": best_th,
+            "interval": "none",
+        },
+        reviewer_risks=["Threshold is selected on valid and must remain frozen for test."],
+        test_read_only=False,
+    )
     plt.close(fig)
     print(f"[OK] s05 threshold tradeoff plot -> {fig_path}")
-    return {"figure": fig_path, "source_data": csv_path}
+    return {
+        "figure": str(scientific["png"]),
+        "source_data": str(scientific["source_data"]),
+        "manifest": str(scientific["manifest"]),
+        "qa": str(scientific["qa"]),
+    }
 
 
 # =========================================================
@@ -1991,17 +2344,18 @@ def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
     except Exception:
         pass
 
-    def sha256_head(path, head_bytes=4 * 1024 * 1024):
-        """对前 4MB 做 hash，避免大 CSV 全读。"""
+    def sha256_file(path):
+        """Stream the complete file so provenance also detects tail changes."""
         if not os.path.exists(path):
             return None
         h = hashlib.sha256()
         with open(path, "rb") as f:
-            h.update(f.read(head_bytes))
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
         return h.hexdigest()
 
-    info["splits_sha256_head"] = sha256_head(splits_path)
-    info["feature_pool_train_sha256_head"] = sha256_head(feature_pool_path)
+    info["splits_sha256"] = sha256_file(splits_path)
+    info["feature_pool_train_sha256"] = sha256_file(feature_pool_path)
 
     # git sha（如果可用）
     try:
@@ -2033,7 +2387,8 @@ def _compute_scale_pos_weight(args, neg_count, pos_count, p_train_pos):
 
 
 def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
-                 calibration_threshold_split, scale_pos_weight, clip_bounds_cache=None):
+                 calibration_threshold_split, scale_pos_weight, clip_bounds_cache=None,
+                 train_cv_feature_score=False):
     """用 top-k 特征训练并返回完整结果。
 
     返回 dict: model, search_summary, search_records, features, fill_values,
@@ -2116,12 +2471,35 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
         _record.setdefault("deployment_feature_cost_summary", summarize_deployment_feature_costs(features))
 
     total_nodes = count_xgb_nodes(raw_model)
-    best_score = float(model_search_summary.get("best", {}).get("score", float("-inf")))
+    best_score = _finite_float_or_none((model_search_summary.get("best") or {}).get("score"))
+    if best_score is None:
+        best_score = float("-inf")
     valid_default = eval_model(raw_model, X_valid, y_valid, threshold=0.5)
     valid_acc = float(valid_default.get("accuracy", 0.0))
+    if args.model_search and getattr(args, "model_search_strategy", "single_split") == "staged_group_cv":
+        selection_score = best_score
+        selection_metric = "train_cv_model_search_score"
+    else:
+        selection_score = valid_acc
+        selection_metric = "valid_accuracy"
+    if train_cv_feature_score:
+        fixed_cv = score_fixed_params_with_train_cv(
+            args,
+            X_train,
+            y_train,
+            train_groups,
+            build_default_xgb_params(scale_pos_weight=scale_pos_weight),
+            total_nodes=total_nodes,
+        )
+        selection_score = float(fixed_cv["score"])
+        selection_metric = fixed_cv["selection_metric"]
+        model_search_summary["feature_set_train_cv"] = fixed_cv
+    model_search_summary["feature_set_selection_metric"] = selection_metric
+    model_search_summary["feature_set_selection_score"] = float(selection_score)
 
     logger.info(f"  [k={k}] features={len(features)} nodes={total_nodes} "
-                f"valid_acc={valid_acc:.4f} search_score={best_score:.4f}")
+                f"valid_acc={valid_acc:.4f} search_score={best_score:.4f} "
+                f"selection_metric={selection_metric} selection_score={selection_score:.4f}")
 
     return {
         "k": k, "features": list(features), "model": raw_model,
@@ -2129,6 +2507,8 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
         "X_valid": X_valid, "y_valid": y_valid, "df_calib": df_calib,
         "search_summary": model_search_summary, "search_records": model_search_records,
         "valid_acc": valid_acc, "search_score": best_score,
+        "feature_set_selection_metric": selection_metric,
+        "feature_set_selection_score": float(selection_score),
         "total_nodes": total_nodes,
     }
 
@@ -2192,8 +2572,29 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
         )
 
     original_model_search = bool(args.model_search)
+    use_train_cv_quick_score = (
+        original_model_search
+        and getattr(args, "model_search_strategy", "single_split") == "staged_group_cv"
+    )
     best_quick_result = None
     best_quick_score = float("-inf")
+    def _feature_set_score(result):
+        score = _finite_float_or_none(result.get("feature_set_selection_score"))
+        if score is not None:
+            return score
+        if use_train_cv_quick_score:
+            score = _finite_float_or_none(result.get("search_score"))
+            if score is not None:
+                result.setdefault("feature_set_selection_metric", "train_cv_model_search_score")
+                result.setdefault("feature_set_selection_score", score)
+                result["search_summary"].setdefault(
+                    "feature_set_selection_metric",
+                    result["feature_set_selection_metric"],
+                )
+                result["search_summary"].setdefault("feature_set_selection_score", score)
+                return score
+        return float(result["valid_acc"])
+
     for candidate_features, candidate_source in candidate_feature_sets:
         args.model_search = False
         try:
@@ -2201,12 +2602,13 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
                 args, k, candidate_features, df_train_raw, df_valid_raw,
                 train_groups, calibration_threshold_split, scale_pos_weight,
                 clip_bounds_cache=clip_bounds_cache,
+                train_cv_feature_score=use_train_cv_quick_score,
             )
         finally:
             args.model_search = original_model_search
         result["search_summary"]["scale_pos_weight"] = scale_pos_weight
         result["search_summary"]["feature_set_source"] = candidate_source
-        result["_combined_score"] = float(result["valid_acc"])
+        result["_combined_score"] = _feature_set_score(result)
         if result["_combined_score"] > best_quick_score:
             best_quick_score = result["_combined_score"]
             best_quick_result = result
@@ -2221,7 +2623,7 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
         result["search_summary"]["feature_set_source"] = (
             best_quick_result["search_summary"].get("feature_set_source")
         )
-        result["_combined_score"] = float(result["valid_acc"])
+        result["_combined_score"] = _feature_set_score(result)
     else:
         result = best_quick_result
 
@@ -2239,6 +2641,12 @@ def train_best_local_feature_set_for_k(args, k, ranked_features, base_features,
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
+    parser.add_argument(
+        "--feature_selection_mode",
+        choices=["manual", "auto"],
+        default="manual",
+    )
+    parser.add_argument("--manual_feature_file", type=str, default=None)
     parser.add_argument("--max_features", type=int, default=None,
                         help="从 ranked_features.json 取 top-k 特征；默认 None 时回退到 selected_features.json")
     parser.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
@@ -2350,39 +2758,61 @@ def main(args=None):
     if args is None:
         args = parser.parse_args()
 
-    selected_features_path = os.path.join(args.artifact_dir, "selected_features.json")
-    ranked_features_path = os.path.join(args.artifact_dir, "ranked_features.json")
-
-    # 若存在 ranked_features.json，从中取 top-k（支持不同 max_features）；
-    # 否则回退到 selected_features.json（向后兼容）。
-    if os.path.exists(ranked_features_path):
-        with open(ranked_features_path, "r", encoding="utf-8") as f:
-            ranked = json.load(f)
-        ranked = [
-            r for r in ranked
-            if r.get("feature") in set(filter_features_for_deployment([r.get("feature")]))
-        ]
-        _k = min(args.max_features if args.max_features is not None else 15, len(ranked))
-        selected_features = [r["feature"] for r in ranked[:_k]]
-        logger.info(f"从 ranked_features.json 取 top {_k} 特征（共 {len(ranked)} 个候选）")
-    else:
-        with open(selected_features_path, "r", encoding="utf-8") as f:
-            fs = json.load(f)
-        selected_features = fs["selected_features"]
-
-    selected_features = enforce_no_stage2_ir_features(selected_features, "initial selected_features")
-    selected_features = filter_features_for_deployment(selected_features)
-    if not selected_features:
-        raise ValueError(
-            "deployment-friendly feature filter left no selected features for s05; rerun s04."
-        )
-
     feature_pool_train_path = os.path.join(args.artifact_dir, "feature_pool_train.csv")
     feature_pool_valid_path = os.path.join(args.artifact_dir, "feature_pool_valid.csv")
     splits_path = os.path.join(args.artifact_dir, "splits.json")
 
     df_train_raw = pd.read_csv(feature_pool_train_path)
     df_valid_raw = pd.read_csv(feature_pool_valid_path)
+    validate_feature_pool_frames(df_train_raw, df_valid_raw)
+
+    selected_features_path = os.path.join(args.artifact_dir, "selected_features.json")
+    ranked_features_path = os.path.join(args.artifact_dir, "ranked_features.json")
+    full_ranking_path = os.path.join(args.artifact_dir, "feature_ranking_full.json")
+    selection_provenance = {
+        "feature_selection_mode": str(args.feature_selection_mode),
+        "feature_pool_version": FEATURE_POOL_VERSION,
+    }
+    if args.feature_selection_mode == "manual":
+        manual_feature_file = (
+            args.manual_feature_file
+            or os.path.join(args.artifact_dir, "manual_feature_selection.xlsx")
+        )
+        selected_features, selection_provenance = load_manual_feature_selection(
+            manual_feature_file,
+            full_ranking_path,
+            df_train_raw,
+            df_valid_raw,
+        )
+        if args.feature_search_local_swap:
+            raise ValueError(
+                "manual feature selection conflicts with --feature_search_local_swap; "
+                "use --no-feature_search_local_swap."
+            )
+        args.model_search_feature_counts = ""
+    else:
+        if os.path.exists(ranked_features_path):
+            with open(ranked_features_path, "r", encoding="utf-8") as f:
+                ranked = json.load(f)
+            ranked = [
+                r for r in ranked
+                if r.get("feature") in set(filter_features_for_deployment([r.get("feature")]))
+            ]
+            _k = min(args.max_features if args.max_features is not None else 15, len(ranked))
+            selected_features = [r["feature"] for r in ranked[:_k]]
+            logger.info(f"从 ranked_features.json 取 top {_k} 特征（共 {len(ranked)} 个候选）")
+        else:
+            with open(selected_features_path, "r", encoding="utf-8") as f:
+                fs = json.load(f)
+            selected_features = fs["selected_features"]
+        selected_features = enforce_no_stage2_ir_features(
+            selected_features, "initial selected_features"
+        )
+        selected_features = filter_features_for_deployment(selected_features)
+        if not selected_features:
+            raise ValueError(
+                "deployment-friendly feature filter left no selected features for s05; rerun s04."
+            )
 
     # ── 特征数量搜参：解析 --model_search_feature_counts ──
     _fc_str = getattr(args, "model_search_feature_counts", "") or ""
@@ -2396,6 +2826,8 @@ def main(args=None):
 
     # ── 多 k/显式 k 特征数搜索分支 / 普通单 k 分支 ──
     _using_feature_count_search = bool(_feature_counts and os.path.exists(ranked_features_path))
+    model_search_records = []
+    model_search_summary = {}
     if _using_feature_count_search:
         # ============ 多 k 搜参 ============
         if not args.model_search:
@@ -2487,7 +2919,7 @@ def main(args=None):
             "enabled": True,
             "candidates_tested": _ks,
             "best_k": int(_best_result["k"]),
-            "selection_metric": "valid_accuracy",
+            "selection_metric": _best_result.get("feature_set_selection_metric", "valid_accuracy"),
             "best_score": float(_best_score),
         }
         # 多 k 搜参只消耗 train 内部 group-CV；valid 仍重新拆成 calibration/threshold。
@@ -2672,6 +3104,8 @@ def main(args=None):
     }
     hard_negative_report_path = None
     hard_negative_weights_path = None
+    hard_negative_decision = None
+    model_candidate_decision = None
     if args.mine_hard_negatives:
         df_train_for_hn = clip_outliers(
             df_train_raw, selected_features, k=1.5, bounds=clip_bounds)
@@ -2738,12 +3172,63 @@ def main(args=None):
             int(hard_negative_summary.get("n_hard_negatives", 0)),
             int(hard_negative_summary.get("n_train_rows", len(y_train_hn))),
         )
-        raw_model = train_xgb_with_params(
+        reference_raw_model = raw_model
+        hard_negative_raw_model = train_xgb_with_params(
             hn_params,
             X_train_hn,
             y_train_hn,
             sample_weight=hn_weights,
         )
+        reference_threshold = search_threshold_by_valid(
+            reference_raw_model,
+            X_threshold,
+            y_threshold,
+            objective=args.threshold_objective,
+            beta=args.threshold_beta,
+            min_precision=args.threshold_min_precision,
+        )
+        hard_negative_threshold = search_threshold_by_valid(
+            hard_negative_raw_model,
+            X_threshold,
+            y_threshold,
+            objective=args.threshold_objective,
+            beta=args.threshold_beta,
+            min_precision=args.threshold_min_precision,
+        )
+        reference_record = _candidate_record(
+            "reference",
+            reference_raw_model,
+            eval_model(reference_raw_model, X_valid, y_valid, reference_threshold["threshold"]),
+        )
+        hard_negative_record = _candidate_record(
+            "hard_negative",
+            hard_negative_raw_model,
+            eval_model(hard_negative_raw_model, X_valid, y_valid, hard_negative_threshold["threshold"]),
+        )
+        reference_record["threshold"] = float(reference_threshold["threshold"])
+        hard_negative_record["threshold"] = float(hard_negative_threshold["threshold"])
+        hard_negative_decision = accept_hard_negative_candidate(
+            reference_record, hard_negative_record
+        )
+        raw_model = (
+            hard_negative_raw_model
+            if hard_negative_decision["accepted"]
+            else reference_raw_model
+        )
+        model_candidate_decision = select_model_candidate(
+            [reference_record, hard_negative_record],
+            max_nodes=args.max_model_nodes,
+            max_fpr=0.01,
+        )
+        _atomic_json_dump(
+            hard_negative_decision,
+            os.path.join(args.artifact_dir, "hard_negative_decision.json"),
+        )
+        _atomic_json_dump(
+            model_candidate_decision,
+            os.path.join(args.artifact_dir, "model_candidate_leaderboard.json"),
+        )
+        hard_negative_summary["decision"] = hard_negative_decision
         model_search_summary["hard_negative_mining"] = hard_negative_summary
 
     # 确保 quality_thresholds 已初始化（多 k 分支可能跳过）
@@ -2892,7 +3377,9 @@ def main(args=None):
         model_search_summary["results_path"] = model_search_results_path
 
     model_bundle = {
-        "version": "v2",
+        "version": "v3",
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "feature_selection": selection_provenance,
         "feature_names": selected_features,
         "fill_values": fill_values,
         "scaler": None,
@@ -2912,6 +3399,8 @@ def main(args=None):
         "feature_quantiles": feature_quantiles,    # 给 s06 OOD 监控用
         "fingerprint": fingerprint,                # provenance
         "meta": {
+            "feature_pool_version": FEATURE_POOL_VERSION,
+            "feature_selection": selection_provenance,
             "fs_ppg": 25.0,
             "fs_acc": None,
             "win_sec": float(args.window_sec),
@@ -2926,6 +3415,8 @@ def main(args=None):
     print(f"bundle fingerprint: {fingerprint}")
 
     config = {
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "feature_selection": selection_provenance,
         "selected_features": selected_features,
         "selected_feature_count": len(selected_features),
         "fill_values": fill_values,
@@ -2938,8 +3429,12 @@ def main(args=None):
             "calibration_data": "valid_calibration_split",
             "threshold_selection_data": "valid_threshold_split",
             "test_used": False,
-            "feature_selection_data": (fs.get("selection_policy", {}).get("selection_data", "unknown")
-                                         if "fs" in dir() else "multi_k_ranked"),
+            "feature_selection_data": (
+                "manual_file"
+                if args.feature_selection_mode == "manual"
+                else (fs.get("selection_policy", {}).get("selection_data", "unknown")
+                      if "fs" in dir() else "multi_k_ranked")
+            ),
         },
 
         "class_balance": {

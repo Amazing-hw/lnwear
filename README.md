@@ -2,10 +2,22 @@
 
 本项目是一个面向手表佩戴/活体检测的训练、评估和部署导出流水线。把原始 H5 中的 PPG/ACC 信号处理成 Stage2 窗口级特征，用 XGBoost 训练窗口模型，再用端到端评估和可选的状态机后处理控制误触发、响应时延和部署复杂度。
 
-当前推荐入口：
+首次处理新数据时，先生成完整特征排序：
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
+```
+
+默认采用人工固化特征流程，运行到 `s04` 后暂停。直接在
+`artifacts/manual_feature_selection.xlsx` 的 `Selected` 列填写 `1`，保存后再恢复训练。
+选择数量、信号类别和 FFT 类别完全由用户决定；工程代价只给警告，不修改选择。
+需要无人值守基线时显式使用：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts_auto \
+  --feature_selection_mode auto
 ```
 
 先不训练、只看实际会执行哪些步骤：
@@ -16,11 +28,14 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 
 ## 1. 核心结论
 
-- 默认流程不启用 `--auto_optimize_e2e`。
+- 默认 `feature_selection_mode=manual`，在 `s04` 输出完整排序后暂停，不会隐式选择特征或进入训练。
+- `--feature_selection_mode auto` 才执行候选子集搜索、特征数量搜索、模型训练和部署导出。
 - 不加 `--auto_optimize_e2e` 时，阈值目标仍是 `accuracy`，`threshold_min_precision=0.95`，`model_search_fp_cost=2.0`，不会自动导出窗口 NPZ，也不会跑 `s07` 后处理搜索。
-- 加 `--auto_optimize_e2e` 后，才会切到产品指标优先的端到端优化链路：启用模型搜索、窗口 NPZ 导出、`s07` 后处理搜索，并把阈值目标改成 `precision_constrained`。
+- 加 `--auto_optimize_e2e` 后，会自动切换为 `feature_selection_mode=auto`，并进入产品指标优先的端到端优化链路：启用模型搜索、窗口 NPZ 导出、`s07` 后处理搜索，并把阈值目标改成 `precision_constrained`。
 - `--with_postprocess` 只是打开后处理搜索；它不会改成 auto E2E 的精度约束策略，也不会写 `auto_optimize/` 汇总。
-- `--hard_negative_optimize` 和 `--staged_e2e_optimize` 已从推荐主流程移除；`s08_run_pipeline.py` 会拒绝这两个旧快捷入口。
+- 商用 8 特征全部进入 83 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。
+- 手动特征会冻结为 `manual_selected_features.json`，随后驱动模型搜参、复杂度约束、hard-negative 候选和 C 部署特征顺序。
+- hard-negative 候选只使用 train OOF 误报；只有 valid accuracy 不下降且 FPR 不恶化才接受，否则自动回滚参考模型。
 
 ## 2. 三阶段架构
 
@@ -49,7 +64,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 
 `s06_deploy_eval.py` 可以直接用窗口概率做端到端评估。`s07_postprocess_optimize.py` 在已导出的逐窗 NPZ 上搜索状态机参数，用于降低样本级 FP、false-worn event 和响应时延风险。
 
-## 3. 默认流程做什么
+## 3. 默认人工流程做什么
 
 默认命令：
 
@@ -60,16 +75,25 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 默认会运行：
 
 ```text
-s01 → s02 → s03 → s04 → s04_search → s04_embed → s05 → s05_viz → s06_eval → s06_tree_viz → s06_xpt → s06_feat → s06_plot → s06_cb
+s01 → s02 → s03 → s04 → 暂停，等待人工固化特征
 ```
 
-其中：
-- `s04_embed` 自动生成特征嵌入可视化报告（PCA / t-SNE 2D/3D 图、特征分布图、相关性热力图等）
-- `s05_viz` 自动生成 ROC/PR 曲线、阈值选择图、FP-Recall 权衡图
-- `s06_plot` 自动画出错误样本的时序分析图
-- `s06_tree_viz` 自动生成 XGBoost 树结构特征使用分析图
+`s04` 输出完整 83 特征的 `feature_ranking_full.json/csv`、
+`manual_feature_selection.xlsx`、`manual_feature_selection.csv` 和
+`feature_pool_completeness.json`。默认流程不会用 Top-K、分组上限或 FFT 上限覆写人工选择。
 
-以上图表分析均为流水线默认输出，无需额外 CLI 参数。
+创建人工文件后恢复：
+
+```bash
+python s08_run_pipeline.py \
+  --artifact_dir artifacts \
+  --feature_selection_mode manual \
+  --manual_feature_file artifacts/manual_feature_selection.xlsx \
+  --skip s01,s02,s03,s04 \
+  --stop_after s06_cb
+```
+
+恢复后会训练固定特征集合，并生成 ROC/PR、端到端评估、错误分析和部署产物。
 
 默认关键参数：
 
@@ -78,7 +102,8 @@ window_sec:                    5
 stride_sec:                    1
 skip_initial_windows:          3
 use_stage2_ir:                 false
-max_features:                  15
+max_features:                  仅用于 auto 模式；manual 不限数量
+feature_selection_mode:        manual
 model_search:                  true
 model_search_feature_counts:   8,10,12,15,18
 model_search_strategy:         staged_group_cv
@@ -87,7 +112,7 @@ threshold_objective:           accuracy
 threshold_min_precision:       0.95
 model_search_fp_cost:          2.0
 runtime_profile:               balanced
-stop_after:                    s06_cb
+effective stop_after:          s04（没有人工文件时）
 ```
 
 默认不会运行：
@@ -102,9 +127,9 @@ auto_optimize/                 auto E2E 汇总产物
 
 ## 4. 是否使用 `--auto_optimize_e2e`
 
-### 不使用 auto：默认推荐起点
+### 默认 manual：先排序，再固化
 
-如果目标是先得到一套窗口模型、部署脚本、XGBoost JSON、golden vectors 和基础端到端评估，使用默认命令：
+首次运行使用默认命令生成完整排序：
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
@@ -112,11 +137,18 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
 特点：
 
-- 先优化 Stage2 单窗口准确率。
-- 保留复杂度受限的 XGBoost 搜参。
-- 不自动跑后处理搜索，避免把窗口模型问题藏在状态机里。
-- 自动输出全部图表分析结果。
-- 适合第一次训练、检查数据质量、做基线、交付第一版部署产物。
+- 排名分数来自 train 内部 group-CV，valid 指标只作诊断旁证。
+- 人工文件冻结特征名称和顺序，不允许隐式 Top-K、local-swap 或自动回退。
+- 适合审计特征机理、部署成本和分布漂移。
+
+若目标是直接得到无人值守基线、部署脚本、XGBoost JSON 和 golden vectors，使用：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts_auto \
+  --feature_selection_mode auto
+```
 
 ### 使用 `--with_postprocess`：只加后处理搜索
 
@@ -126,6 +158,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 python s08_run_pipeline.py \
   --dataset_dir dataset \
   --artifact_dir artifacts \
+  --feature_selection_mode auto \
   --with_postprocess
 ```
 
@@ -139,7 +172,7 @@ python s08_run_pipeline.py \
 特点：
 
 - 会导出 valid/test 逐窗 NPZ。
-- 会在 `postprocess_split` 上搜索 `s07` 参数，并在 `split` 上 replay。
+- 固定在 `valid` 上搜索 `s07` 参数，并在 `split`（通常为 `test`）上做冻结 replay；禁止使用 test 选参。
 - 不会把 `threshold_objective` 自动改成 `precision_constrained`。
 - 不会写 `artifacts/auto_optimize/auto_optimization_summary.json`。
 
@@ -553,7 +586,7 @@ python s02_ir_dc_threshold.py \
 
 ### `s03_extract_feature_pool.py`
 
-作用：提取 Stage2 特征池 CSV。当前 Stage2 特征固定为环境光、绿光和 ACC，不使用 IR 派生特征。
+作用：提取 83 项 Stage2 特征池 CSV，包括环境光、绿光、ACC，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
 
 ```bash
 python s03_extract_feature_pool.py \
@@ -568,7 +601,7 @@ python s03_extract_feature_pool.py \
 
 ### `s04_feature_selection.py`
 
-作用：清洗特征、稳定性选择、分组约束、FP proxy 重排和候选子集搜索。
+作用：清洗并完整排序 83 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 Excel 选择接口。manual 模式不应用分组或数量上限。
 
 ```bash
 python s04_feature_selection.py \
@@ -590,10 +623,10 @@ python s04_feature_selection.py \
 ```bash
 python s05_train_final_model.py \
   --artifact_dir artifacts \
-  --max_features 15 \
+  --manual_feature_file artifacts/manual_feature_selection.xlsx \
   --threshold_objective accuracy \
   --model_search \
-  --model_search_feature_counts 8,10,12,15,18 \
+  --mine_hard_negatives \
   --max_model_nodes 500
 ```
 
@@ -607,7 +640,7 @@ python s05_train_final_model.py \
   --model_search_fp_cost 4.0
 ```
 
-`--mine_hard_negatives` 仍在 `s05` 中保留给手动实验，但不再由 `s08` 的推荐快捷入口自动启用。
+`--mine_hard_negatives` 产生独立候选和 `hard_negative_decision.json`；不满足 valid 无退化规则时不会替换参考模型。
 
 ### `s06_deploy_eval.py`
 
@@ -644,9 +677,10 @@ python s07_postprocess_optimize.py \
   --split valid \
   --cache_root window_outputs \
   --fp_cost 4.0 \
+  --max_window_fp_rate 0.01 \
   --max_sample_fp_rate 0.02 \
   --max_false_worn_event_rate 0.02 \
-  --max_first_worn_output_p95_sec 6.0 \
+  --max_first_worn_output_p95_sec 3.0 \
   --search_budget 240 \
   --replay_split test
 ```
@@ -672,7 +706,7 @@ python s09_commercial_compare.py \
 ```
 
 输出重点：
-- `commercial_compare/commercial_comparison_report.json`：商业 AdaBoost 与当前部署模型的完整对比报告。
+- `commercial_compare/commercial_compare.json`：商业 AdaBoost 与当前部署模型的完整对比报告。
 - `commercial_compare/window_level_compare.csv`：逐指标对比 sample、window model、streaming window 三个口径。
 - `commercial_compare/accuracy_scope_compare.csv`：只抽取三种口径的 accuracy，便于快速检查口径差异。
 - `commercial_compare/commercial_compare_summary.png`：左上为 sample-level 指标，右上为 streaming window 指标。
@@ -767,18 +801,22 @@ artifacts/
 
 ## 10. 图片输出说明（全部默认自动生成）
 
-流水线会在各阶段自动生成以下分析图，全部输出到 `report_plots/` 子目录及对应模块目录，无需额外 CLI 参数。
+流水线会在各阶段自动生成以下分析图，全部为 600 DPI PNG。核心定量图同时输出
+`*_source_data.csv`、`*_figure_manifest.json`、`*_figure_qa.json`；manifest 记录结论、
+面板含义、split、样本量口径、输入哈希和风险，QA 校验 DPI、像素尺寸及非空内容。
 
-### 10.1 Stage1 门控散点图
-
-| 图片 | 说明 |
-|---|---|
-| `stage1_scatter.png` | IR DC vs AC/DC 散点图，左栏 train、右栏 valid。红点（target=0 非佩戴）vs 绿点（target=1 佩戴），蓝色虚线标注部署阈值，浅蓝色区域为 PASS 区 |
-
-### 10.2 特征筛选报告图（s04）
+### 10.1 数据切分与 Stage1 门控
 
 | 图片 | 说明 |
 |---|---|
+| `report_plots/s01_split_analysis.png` | train/valid/test 的样本数量、正负类别构成和佩戴比例；用于在训练前发现切分失衡 |
+| `stage1_scatter.png` | IR DC vs AC/DC 散点图，左栏 train、右栏 valid。蓝色为非佩戴、橙色为佩戴，青色虚线标注固定部署阈值及 PASS 区 |
+
+### 10.2 特征池与特征筛选（s03-s04）
+
+| 图片 | 说明 |
+|---|---|
+| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、83 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
 | `report_plots/s04_feature_selection_report.png` | 三栏：左栏 Top 20 特征排名柱状（已选深色标记 + 综合得分折线），右上选入特征的群组分布，右下 Top 12 特征 FP Proxy 风险双柱 |
 | `report_plots/s04_shap_importance.png` | 四栏 SHAP 报告：左上 Top 20 特征 mean(\|SHAP\|) 柱状（已选特征深色），右上 Train vs Valid SHAP 散点 + Spearman ρ 标注，左下 Top-K 重叠率柱状，右下可疑 Train-only 强特征红色柱状 |
 
@@ -802,7 +840,7 @@ artifacts/
 
 | 图片 | 说明 |
 |---|---|
-| `postprocess_opt/postprocess_search_summary.png` | 六栏 2×3 后处理参数网格搜索结果：左上 FP Rate vs Recall 散点（颜色=score，最佳点星标），中上 P95 延迟 vs FP Rate 散点，右上 Score 分布直方图 + 最佳线，左下 T_on×T_off Score 热力图，中下 K_on×K_off Score 热力图，右下约束过滤级联柱状 |
+| `postprocess_opt/postprocess_search_summary.png` | 六栏 2×3 后处理参数网格搜索结果：联合比较因果中值滤波、EMA、迟滞阈值、K-on/K-off、冷却时间，以及 final-state、majority voting、any-worn 三种样本聚合策略；按 valid 的窗口准确率、FPR、P95 新增延迟和状态翻转数选择，test 只做冻结回放 |
 
 ### 10.6 泛化审计图（s06_audit）
 
@@ -914,7 +952,7 @@ artifacts/deploy_package/
 建议 Python 3.9+。
 
 ```bash
-pip install numpy scipy pandas scikit-learn xgboost joblib h5py matplotlib pytest
+pip install numpy scipy pandas scikit-learn xgboost joblib h5py matplotlib pillow openpyxl pytest
 ```
 
 常用依赖：
@@ -928,6 +966,8 @@ xgboost
 joblib
 h5py
 matplotlib
+pillow
+openpyxl
 pytest
 ```
 

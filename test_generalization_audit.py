@@ -224,6 +224,8 @@ def test_s08_dry_run_can_insert_generalization_audit_after_eval():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--run_generalization_audit",
             "--stop_after",
             "s06_audit",

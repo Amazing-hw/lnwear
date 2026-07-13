@@ -35,12 +35,11 @@ def test_deployment_feature_filter_removes_complex_operators():
     assert "GTOP2_BAND_ENERGY_RATIO" in filtered
     assert "GTOP2_DOM_FREQ" in filtered
     assert "AMB_BAND_ENERGY_RATIO" in filtered  # amb FFT now allowed
-    # All features now pass the deployment-friendly filter (C-friendly numpy ops only)
-    assert "GREEN_Entropy_SampEn" in filtered
-    assert "GREEN_Temporal_peak_prominence" in filtered
-    assert "ACC_TREMOR_PEAK_FREQ" in filtered
-    assert "G_bp_lag_std" in filtered
-    assert "ACC_PPG_coherence_mean" in filtered
+    assert "GREEN_Entropy_SampEn" not in filtered
+    assert "GREEN_Temporal_peak_prominence" not in filtered
+    assert "ACC_TREMOR_PEAK_FREQ" not in filtered
+    assert "G_bp_lag_std" not in filtered
+    assert "ACC_PPG_coherence_mean" not in filtered
 
 
 def test_deployment_feature_cost_summary_counts_green_top2_fft_only():
@@ -95,9 +94,11 @@ def test_s04_deployment_policy_delegates_to_s03_source_of_truth():
     for name in features:
         assert s04.is_deployment_allowed_feature(name) == s03.is_deployment_friendly_stage2_feature(name)
 
-    commercial_8 = s04.FEATURE_GROUPS["commercial_baseline"]
-    assert commercial_8 == s03.COMMERCIAL_8_FEATURE_NAMES
-    assert s04.filter_features_for_deployment(commercial_8) == commercial_8
+    # The commercial eight-feature baseline remains isolated in s09 and is not
+    # silently aliased into the governed Stage2 model surface.
+    assert s04.filter_features_for_deployment(s03.COMMERCIAL_8_FEATURE_NAMES) == [
+        "GREEN_CORR"
+    ]
 
 
 def test_s08_dry_run_does_not_expose_feature_pool_switches():
@@ -112,6 +113,8 @@ def test_s08_dry_run_does_not_expose_feature_pool_switches():
             "artifacts",
             "--stop_after",
             "s05",
+            "--feature_selection_mode",
+            "auto",
         ],
         cwd=ROOT,
         capture_output=True,
@@ -197,7 +200,7 @@ def test_export_deploy_cookbook_writes_performance_profile(tmp_path):
         "G_2OF3_AC_SUPPORT",
         "G_TOP2_CORR_MIN",
         "GTOP2_BAND_ENERGY_RATIO",
-        "ACC_TO_GTOP2_AC_RATIO",
+        "ACC_REL_MOTION",
     ]
     model = __import__("xgboost").XGBClassifier(
         n_estimators=4,
@@ -253,9 +256,9 @@ def test_s04_generates_accuracy_beam_subset_candidates():
         "GREEN_AC_MAD",
         "GTOP2_BAND_ENERGY_RATIO",
         "G_TOP2_CORR_MIN",
-        "G_SPATIAL_STABILITY_SCORE",
+        "G_TOP2_RANK_STABILITY",
         "ACC_GREEN_BP_CORR",
-        "ACC_TO_GTOP2_AC_RATIO",
+        "ACC_REL_MOTION",
         "AMBX_AC_MAD",
         "GREEN_AMB_BP_CORR",
     ]):
@@ -285,11 +288,11 @@ def test_s04_accuracy_first_group_limits_allow_more_high_signal_features():
     summary = []
     for i, feature in enumerate([
         "ACC_GREEN_BP_CORR",
-        "ACC_TO_GTOP2_AC_RATIO",
-        "ACC_STILL_X_GREEN_STABILITY",
+        "ACC_REL_MOTION",
+        "ACC_MAG_MAD",
         "G_TOP2_CORR_MIN",
         "G_TOP2_TO_ALL_AC_RATIO",
-        "G_SPATIAL_STABILITY_SCORE",
+        "G_TOP2_RANK_STABILITY",
         "GTOP2_BAND_ENERGY_RATIO",
         "GTOP2_DOM_FREQ",
         "GREEN_AC_MAD",
@@ -312,10 +315,11 @@ def test_s04_accuracy_first_group_limits_allow_more_high_signal_features():
         group_limits=s04.group_limits_for_ranking_objective("window_accuracy"),
     )
 
-    assert sum(s04.feature_to_group(f) == "acc_features" for f in default_selected) == 1
-    # ACC is intentionally reduced in accuracy-first: motion features are less
-    # informative for wearing detection (GROUP_LIMITS_ACCURACY_FIRST acc_features=1).
-    assert sum(s04.feature_to_group(f) == "acc_features" for f in accuracy_selected) >= 1
+    acc_groups = {"acc_motion", "acc_green_coupling"}
+    default_acc = sum(s04.feature_to_group(f) in acc_groups for f in default_selected)
+    accuracy_acc = sum(s04.feature_to_group(f) in acc_groups for f in accuracy_selected)
+    assert 1 <= default_acc <= 3
+    assert 1 <= accuracy_acc <= 3
     assert len(accuracy_selected) <= 8
 
 

@@ -4,12 +4,45 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import pytest
 
 import s06_deploy_eval as s06
 import s07_postprocess_optimize as s07
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+class _DeployTestBooster:
+    def get_dump(self, with_stats=True):
+        return ["0:leaf=0.0,cover=1.0"]
+
+    def trees_to_data_frame(self):
+        return pd.DataFrame([
+            {
+                "Tree": 0,
+                "Node": 0,
+                "ID": "0-0",
+                "Feature": "Leaf",
+                "Split": np.nan,
+                "Yes": np.nan,
+                "No": np.nan,
+                "Missing": np.nan,
+                "Gain": 0.0,
+                "Cover": 1.0,
+            }
+        ])
+
+
+class _DeployTestModel:
+    n_estimators = 1
+
+    def get_booster(self):
+        return _DeployTestBooster()
+
+    def get_params(self):
+        return {"n_estimators": 1}
 
 
 def test_window_error_analysis_exports_fp_fn_strata(tmp_path):
@@ -186,6 +219,137 @@ def test_window_cache_preserves_window_indices_and_targets(tmp_path):
     assert cache["window_targets"].tolist() == [0, 1]
 
 
+def test_window_cache_export_removes_only_top_level_obsolete_npz(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    split_dir = artifact_dir / "window_outputs" / "valid"
+    nested_dir = split_dir / "nested"
+    test_dir = artifact_dir / "window_outputs" / "test"
+    nested_dir.mkdir(parents=True)
+    test_dir.mkdir(parents=True)
+    (split_dir / "stale.npz").write_bytes(b"stale")
+    (split_dir / "keep.txt").write_text("keep", encoding="utf-8")
+    (nested_dir / "nested-stale.npz").write_bytes(b"nested")
+    (test_dir / "other-split.npz").write_bytes(b"other")
+    result = {
+        "sample_name": "current/sample",
+        "target": 1,
+        "mode": 0,
+        "window_probs": [0.9],
+        "window_preds": [1],
+        "stage2_enabled_flags": [1],
+        "quality_metas": [{}],
+    }
+
+    s06.export_window_cache(
+        [result],
+        artifact_dir,
+        "valid",
+        window_sec=5.0,
+        stride_sec=1.0,
+        model_threshold=0.5,
+        metadata={
+            "model_fingerprint": {"source": "test"},
+            "feature_names": ["GREEN_AC_RMS"],
+            "skip_initial_windows": 3,
+        },
+    )
+
+    assert (split_dir / "current_sample.npz").exists()
+    assert not (split_dir / "stale.npz").exists()
+    assert (split_dir / "keep.txt").exists()
+    assert (nested_dir / "nested-stale.npz").exists()
+    assert (test_dir / "other-split.npz").exists()
+
+
+def test_window_cache_export_does_not_silently_skip_failed_sample(
+        tmp_path, monkeypatch):
+    def fail_write(*_args, **_kwargs):
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(s06, "write_window_cache_npz", fail_write)
+
+    with pytest.raises(RuntimeError, match="broken_sample.*synthetic write failure"):
+        s06.export_window_cache(
+            [{"sample_name": "broken_sample", "target": 0}],
+            tmp_path / "artifacts",
+            "valid",
+            window_sec=5.0,
+            stride_sec=1.0,
+            model_threshold=0.5,
+        )
+
+
+@pytest.mark.parametrize(
+    ("cache_root", "split", "error_pattern"),
+    [
+        ("../escaped", "valid", "cache_root.*artifact_dir"),
+        ("window_outputs", "../escaped", "split.*cache_root"),
+    ],
+)
+def test_window_cache_export_rejects_path_escape(
+        tmp_path, cache_root, split, error_pattern):
+    artifact_dir = tmp_path / "artifacts"
+
+    with pytest.raises(ValueError, match=error_pattern):
+        s06.export_window_cache(
+            [],
+            artifact_dir,
+            split,
+            window_sec=5.0,
+            stride_sec=1.0,
+            model_threshold=0.5,
+            cache_root=cache_root,
+        )
+
+    assert not (tmp_path / "escaped").exists()
+
+
+def test_export_deploy_artifacts_writes_selected_stage2_contracts(
+        tmp_path, monkeypatch):
+    feature_names = ["GREEN_AC_RMS"]
+    bundle = {
+        "feature_names": feature_names,
+        "fill_values": {"GREEN_AC_RMS": 0.0},
+        "model": _DeployTestModel(),
+        "raw_model": _DeployTestModel(),
+        "threshold": 0.5,
+        "threshold_policy": {},
+        "quality_thresholds": {},
+        "feature_quantiles": {},
+        "fingerprint": {"source": "test"},
+        "meta": {
+            "fs_ppg": 25.0,
+            "win_sec": 5.0,
+            "step_sec": 1.0,
+            "use_stage2_ir": False,
+        },
+    }
+    (tmp_path / "stage1_threshold.json").write_text(
+        json.dumps({
+            "deploy_stage1_threshold": {
+                "dc_threshold": 1.0,
+                "ac_dc_threshold": 0.1,
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(s06.joblib, "load", lambda _path: bundle)
+
+    s06.export_deploy_artifacts(tmp_path, skip_initial_windows=3)
+
+    deploy_dir = tmp_path / "deploy_package"
+    catalog = json.loads(
+        (deploy_dir / "stage2_feature_catalog.json").read_text(encoding="utf-8"))
+    c_contract = json.loads(
+        (deploy_dir / "stage2_c_contract.json").read_text(encoding="utf-8"))
+    assert catalog["feature_order"] == feature_names
+    assert list(catalog["features"]) == feature_names
+    assert c_contract["feature_order"] == feature_names
+    assert c_contract["sample_rate_hz"] == 25.0
+    assert c_contract["window_samples"] == 125
+    assert "sum_squares" in c_contract["operator_inventory"]
+
+
 def test_s08_dry_run_exports_replay_cache_before_postprocess():
     result = subprocess.run(
         [
@@ -200,6 +364,8 @@ def test_s08_dry_run_exports_replay_cache_before_postprocess():
             "valid",
             "--split",
             "test",
+            "--feature_selection_mode",
+            "auto",
         ],
         cwd=str(ROOT),
         text=True,

@@ -71,6 +71,30 @@ def test_readme_does_not_document_empty_model_search_feature_counts():
     assert '--model_search_feature_counts ""' not in readme
 
 
+def test_s08_rejects_test_split_for_postprocess_parameter_selection(tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dataset_dir",
+            str(tmp_path / "dataset"),
+            "--artifact_dir",
+            str(tmp_path / "artifacts"),
+            "--with_postprocess",
+            "--postprocess_split",
+            "test",
+            "--dry_run",
+        ],
+        cwd=str(ROOT),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode != 0
+    assert "postprocess_split must be 'valid'" in result.stdout + result.stderr
+
+
 def test_s08_synthetic_grouped_h5_smoke_exports_consistent_deploy_artifacts(tmp_path):
     dataset_dir = tmp_path / "dataset"
     artifact_dir = tmp_path / "artifacts"
@@ -84,6 +108,8 @@ def test_s08_synthetic_grouped_h5_smoke_exports_consistent_deploy_artifacts(tmp_
             str(dataset_dir),
             "--artifact_dir",
             str(artifact_dir),
+            "--feature_selection_mode",
+            "auto",
             "--n_workers",
             "1",
             "--no-model_search",
@@ -113,6 +139,8 @@ def test_s08_synthetic_grouped_h5_smoke_exports_consistent_deploy_artifacts(tmp_
         "deploy_xgboost.json",
         "deploy_cookbook.json",
         "golden_vectors.json",
+        "stage2_feature_catalog.json",
+        "stage2_c_contract.json",
         "deploy_package/model_params.json",
     ]
     for rel_path in expected:

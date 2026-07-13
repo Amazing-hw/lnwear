@@ -8,8 +8,10 @@ under FP-sensitive multi-objective scoring. No s03/s05/s06 re-run needed.
 import argparse, json, os, time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import joblib
 import numpy as np
 import pandas as pd
+from scientific_figures import save_scientific_figure
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, confusion_matrix)
 
@@ -28,6 +30,16 @@ REQUIRED_NPZ_KEYS = [
 ]
 
 DEFAULT_WARMUP_FRAMES = 5
+EXPECTED_CACHE_SCHEMA_VERSION = "window_outputs_v2"
+CACHE_CONTRACT_FIELDS = (
+    "cache_schema_version",
+    "model_fingerprint",
+    "feature_names",
+    "model_threshold",
+    "window_sec",
+    "stride_sec",
+    "skip_initial_windows",
+)
 
 
 def _scalar(value):
@@ -69,7 +81,68 @@ def load_window_cache_npz(path):
     out["model_fingerprint"] = json.loads(str(_scalar(out["model_fingerprint_json"])))
     out["feature_names"] = json.loads(str(_scalar(out["feature_names_json"])))
     out["skip_initial_windows"] = int(_scalar(out["skip_initial_windows"]))
+    if not isinstance(out["model_fingerprint"], dict):
+        raise ValueError(f"{path} model_fingerprint_json must encode an object")
+    if (not isinstance(out["feature_names"], list)
+            or not all(isinstance(name, str) for name in out["feature_names"])):
+        raise ValueError(f"{path} feature_names_json must encode a string list")
+    for key in ["model_threshold", "window_sec", "stride_sec"]:
+        if not np.isfinite(out[key]):
+            raise ValueError(f"{path} key {key} must be finite")
+    if out["window_sec"] <= 0 or out["stride_sec"] <= 0:
+        raise ValueError(f"{path} window_sec and stride_sec must be positive")
+    if out["skip_initial_windows"] < 0:
+        raise ValueError(f"{path} skip_initial_windows must be non-negative")
     return out
+
+
+def cache_provenance(caches):
+    if not caches:
+        raise ValueError("cache provenance requires at least one cache")
+    first = caches[0]
+    return {field: first[field] for field in CACHE_CONTRACT_FIELDS}
+
+
+def validate_cache_batch(caches, paths=None, model_bundle=None):
+    """Validate all NPZ files as one immutable cache/model contract."""
+    if not caches:
+        raise ValueError("no usable window caches")
+    paths = list(paths or [f"cache[{i}]" for i in range(len(caches))])
+    if len(paths) != len(caches):
+        raise ValueError("cache paths must align with caches")
+
+    reference = cache_provenance(caches)
+    if reference["cache_schema_version"] != EXPECTED_CACHE_SCHEMA_VERSION:
+        raise ValueError(
+            "cache_schema_version must equal "
+            f"{EXPECTED_CACHE_SCHEMA_VERSION!r}, got "
+            f"{reference['cache_schema_version']!r} in {paths[0]}"
+        )
+    for cache, path in zip(caches[1:], paths[1:]):
+        for field in CACHE_CONTRACT_FIELDS:
+            if cache[field] != reference[field]:
+                raise ValueError(
+                    f"mixed cache contract for {field}: {paths[0]} has "
+                    f"{reference[field]!r}, {path} has {cache[field]!r}"
+                )
+
+    if model_bundle is not None:
+        if ("fingerprint" in model_bundle
+                and model_bundle.get("fingerprint") != reference["model_fingerprint"]):
+            raise ValueError(
+                "cache model_fingerprint does not match current model_bundle "
+                f"fingerprint: {reference['model_fingerprint']!r} != "
+                f"{model_bundle.get('fingerprint')!r}"
+            )
+        if ("feature_names" in model_bundle
+                and list(model_bundle.get("feature_names") or [])
+                != reference["feature_names"]):
+            raise ValueError(
+                "cache feature_names do not match current model_bundle "
+                f"feature_names: {reference['feature_names']!r} != "
+                f"{list(model_bundle.get('feature_names') or [])!r}"
+            )
+    return reference
 
 
 # =========================================================
@@ -96,6 +169,12 @@ def run_postprocess_on_cache(cache, params):
     ends = np.asarray(cache["window_end_sec"], dtype=float)
     stride_sec = float(cache.get("stride_sec", 1.0))
     probs = np.where(enabled > 0, probs, 0.0)
+    enabled_indices = np.flatnonzero(enabled > 0)
+    first_valid_probability_sec = (
+        float(ends[int(enabled_indices[0])])
+        if len(enabled_indices) and int(enabled_indices[0]) < len(ends)
+        else np.inf
+    )
     probs = causal_median_filter_1d(probs, int(params.get("median_k", 1)))
 
     sm = WearStateMachine(
@@ -147,6 +226,17 @@ def run_postprocess_on_cache(cache, params):
         "first_output_sec": float(first_output_sec if first_output_sec is not None else np.inf),
         "positive_output_sec": float(positive_output_sec if positive_output_sec is not None else np.inf),
         "time_to_correct_sec": float(time_to_correct_sec if time_to_correct_sec is not None else np.inf),
+        "first_valid_probability_sec": float(first_valid_probability_sec),
+        "first_output_latency_sec": float(
+            first_output_sec - first_valid_probability_sec
+            if first_output_sec is not None and np.isfinite(first_valid_probability_sec)
+            else np.inf
+        ),
+        "positive_output_latency_sec": float(
+            positive_output_sec - first_valid_probability_sec
+            if positive_output_sec is not None and np.isfinite(first_valid_probability_sec)
+            else np.inf
+        ),
     }
 
 
@@ -229,14 +319,14 @@ def compute_dataset_metrics(details, params_label="", warmup_frames=0):
         window_fp_rate = 0.0
 
     first_output_secs = [
-        float(d.get("first_output_sec", np.inf)) for d in details
-        if np.isfinite(float(d.get("first_output_sec", np.inf)))
+        float(d.get("first_output_latency_sec", np.inf)) for d in details
+        if np.isfinite(float(d.get("first_output_latency_sec", np.inf)))
     ]
     first_output_p95 = float(np.percentile(first_output_secs, 95)) if first_output_secs else np.inf
     first_output_mean = float(np.mean(first_output_secs)) if first_output_secs else np.inf
     first_worn_output_secs = [
-        float(d.get("positive_output_sec", np.inf)) for d in details
-        if d["target"] == 1 and d["pred"] == 1 and np.isfinite(float(d.get("positive_output_sec", np.inf)))
+        float(d.get("positive_output_latency_sec", np.inf)) for d in details
+        if d["target"] == 1 and d["pred"] == 1 and np.isfinite(float(d.get("positive_output_latency_sec", np.inf)))
     ]
     first_worn_output_p95 = (
         float(np.percentile(first_worn_output_secs, 95)) if first_worn_output_secs else np.inf
@@ -264,6 +354,12 @@ def compute_dataset_metrics(details, params_label="", warmup_frames=0):
     false_worn_duration_mean = (
         float(np.mean(false_worn_durations)) if false_worn_durations else 0.0
     )
+    state_flip_count = int(sum(
+        sum(int(a) != int(b) for a, b in zip(
+            list(d.get("states", []))[:-1], list(d.get("states", []))[1:]
+        ))
+        for d in details
+    ))
 
     out = {
         "params": params_label,
@@ -281,6 +377,7 @@ def compute_dataset_metrics(details, params_label="", warmup_frames=0):
         "time_to_correct_mean_sec": time_to_correct_mean,
         "false_worn_event_rate": false_worn_event_rate,
         "false_worn_duration_mean_sec": false_worn_duration_mean,
+        "state_flip_count": state_flip_count,
     }
     out.update(early_accuracy)
     return out
@@ -328,22 +425,32 @@ def iter_param_grid(model_threshold=0.5):
                             if K_on < K_off:
                                 continue
                             for cooldown_sec in [0.0, 2.0, 5.0]:
-                                yield {
-                                    "ema_alpha": ema_alpha,
-                                    "median_k": median_k,
-                                    "T_on": T_on,
-                                    "T_off": T_off,
-                                    "K_on": K_on,
-                                    "K_off": K_off,
-                                    "cooldown_sec": cooldown_sec,
-                                    "sample_pred_strategy": "any_worn_after_warmup",
-                                    "sample_pred_warmup_frames": 0,
-                                }
+                                for strategy in [
+                                        "final_state",
+                                        "majority_state_after_warmup",
+                                        "any_worn_after_warmup"]:
+                                    yield {
+                                        "ema_alpha": ema_alpha,
+                                        "median_k": median_k,
+                                        "T_on": T_on,
+                                        "T_off": T_off,
+                                        "K_on": K_on,
+                                        "K_off": K_off,
+                                        "cooldown_sec": cooldown_sec,
+                                        "sample_pred_strategy": strategy,
+                                        "sample_pred_warmup_frames": 0,
+                                    }
 
 
 def _postprocess_grid_priority(params):
     """Prefer deploy-stable, FP-safe candidates when a runtime budget is used."""
+    strategy_rank = {
+        "majority_state_after_warmup": 0,
+        "final_state": 1,
+        "any_worn_after_warmup": 2,
+    }
     return (
+        strategy_rank.get(str(params.get("sample_pred_strategy")), 9),
         -float(params["T_on"]),
         -int(params["K_on"]),
         int(params["K_off"]),
@@ -361,6 +468,13 @@ def select_postprocess_search_grid(grid, search_budget=240):
     if budget <= 0 or budget >= len(grid):
         return grid
     anchors = [grid[0], grid[len(grid) // 2], grid[-1]]
+    for strategy in ["final_state", "majority_state_after_warmup", "any_worn_after_warmup"]:
+        candidate = next(
+            (item for item in grid if item.get("sample_pred_strategy") == strategy),
+            None,
+        )
+        if candidate is not None:
+            anchors.append(candidate)
     selected = []
     seen = set()
 
@@ -394,13 +508,20 @@ def infer_model_threshold_from_caches(caches, default=0.5):
 
 
 def _params_label(p):
-    return (f"a={p['ema_alpha']:.2f}_mk={p['median_k']}_"
+    strategy = str(p.get("sample_pred_strategy", "final_state"))
+    return (f"strategy={strategy}_a={p['ema_alpha']:.2f}_mk={p['median_k']}_"
             f"Ton={p['T_on']:.2f}_Toff={p['T_off']:.2f}_"
             f"Kon={p['K_on']}_Koff={p['K_off']}_cd={p.get('cooldown_sec', 0.0):.1f}")
 
 
 def metrics_with_params(metrics, params):
     out = dict(metrics)
+    out["parameter_complexity"] = int(
+        int(params["median_k"])
+        + int(params["K_on"])
+        + int(params["K_off"])
+        + (1 if float(params.get("cooldown_sec", 0.0)) > 0.0 else 0)
+    )
     out.update({
         "param_ema_alpha": float(params["ema_alpha"]),
         "param_median_k": int(params["median_k"]),
@@ -472,7 +593,7 @@ def _best_params_from_search_row(best):
     }
 
 
-def write_optimized_config(best, out_dir, split, constraints):
+def write_optimized_config(best, out_dir, split, constraints, cache_provenance=None):
     out_dir = os.fspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     postprocess = {
@@ -493,6 +614,7 @@ def write_optimized_config(best, out_dir, split, constraints):
         "first_output_p95_sec", "first_worn_output_p95_sec", "score",
         "accuracy_at_8s", "time_to_correct_mean_sec",
         "false_worn_event_rate", "false_worn_duration_mean_sec",
+        "state_flip_count", "parameter_complexity",
     ]
     config_out = {
         "source": "s07_postprocess_optimize",
@@ -501,6 +623,8 @@ def write_optimized_config(best, out_dir, split, constraints):
         "metrics": {k: float(best[k]) for k in metric_keys if k in best},
         "postprocess": postprocess,
     }
+    if cache_provenance is not None:
+        config_out["cache_provenance"] = dict(cache_provenance)
     out_path = os.path.join(out_dir, "postprocess_optimized.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(config_out, f, indent=2, ensure_ascii=False)
@@ -520,6 +644,7 @@ def update_final_model_config(artifact_dir, optimized_config):
         "split": optimized_config.get("split"),
         "constraints": optimized_config.get("constraints", {}),
         "metrics": optimized_config.get("metrics", {}),
+        "cache_provenance": optimized_config.get("cache_provenance", {}),
     }
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
@@ -540,9 +665,24 @@ def load_split_caches(artifact_dir, cache_root, split):
     if not os.path.isdir(cache_dir):
         raise FileNotFoundError(cache_dir)
     npz_files = sorted([f for f in os.listdir(cache_dir) if f.endswith(".npz")])
+    if not npz_files:
+        raise ValueError(f"no NPZ window caches in {cache_dir}")
     caches = []
+    cache_paths = []
     for fn in npz_files:
-        caches.append(load_window_cache_npz(os.path.join(cache_dir, fn)))
+        path = os.path.join(cache_dir, fn)
+        caches.append(load_window_cache_npz(path))
+        cache_paths.append(path)
+    bundle = None
+    bundle_path = os.path.join(os.fspath(artifact_dir), "model_bundle.pkl")
+    if os.path.isfile(bundle_path):
+        try:
+            bundle = joblib.load(bundle_path)
+        except Exception as exc:
+            raise ValueError(
+                f"failed to load current model_bundle for cache validation: "
+                f"{bundle_path}: {exc}") from exc
+    validate_cache_batch(caches, paths=cache_paths, model_bundle=bundle)
     return caches, cache_dir
 
 
@@ -570,6 +710,60 @@ def _eval_one_param(params):
     return params, metrics
 
 
+def select_postprocess_candidate(
+        records, max_window_fp_rate=0.01, max_added_latency_sec=3.0):
+    """Select a causal postprocess candidate by accuracy, FPR, and added latency."""
+    records = [dict(record) for record in records]
+    if not records:
+        raise ValueError("postprocess candidate list is empty")
+    for record in records:
+        record["fpr_constraint_pass"] = (
+            float(record.get("window_fp_rate", np.inf)) <= float(max_window_fp_rate)
+        )
+        record["latency_constraint_pass"] = (
+            float(record.get("first_worn_output_p95_sec", np.inf))
+            <= float(max_added_latency_sec)
+        )
+        record["deployment_constraint_pass"] = bool(
+            record["fpr_constraint_pass"] and record["latency_constraint_pass"]
+        )
+    feasible = [record for record in records if record["deployment_constraint_pass"]]
+    pool = feasible if feasible else records
+    if feasible:
+        key = lambda record: (
+            -float(record.get("window_accuracy", 0.0)),
+            float(record.get("window_fp_rate", np.inf)),
+            float(record.get("first_worn_output_p95_sec", np.inf)),
+            int(record.get("state_flip_count", 10**9)),
+            int(record.get("parameter_complexity", 10**9)),
+            str(record.get("params", "")),
+        )
+    else:
+        key = lambda record: (
+            float(record.get("window_fp_rate", np.inf)),
+            -float(record.get("window_accuracy", 0.0)),
+            float(record.get("first_worn_output_p95_sec", np.inf)),
+            int(record.get("state_flip_count", 10**9)),
+            int(record.get("parameter_complexity", 10**9)),
+            str(record.get("params", "")),
+        )
+    selected = min(pool, key=key)
+    return {
+        "selected_params": selected.get("params"),
+        "deployment_acceptance": bool(feasible),
+        "status": "deployment_candidate" if feasible else "analysis_only",
+        "selection_reason": (
+            "max_streaming_accuracy_within_fpr_and_latency_constraints"
+            if feasible else "no_candidate_met_fpr_and_latency_constraints"
+        ),
+        "max_window_fp_rate": float(max_window_fp_rate),
+        "max_added_latency_sec": float(max_added_latency_sec),
+        "leaderboard": sorted(
+            records, key=lambda record: record.get("params") != selected.get("params")
+        ),
+    }
+
+
 # Main
 # =========================================================
 
@@ -580,7 +774,8 @@ def main():
     parser.add_argument("--cache_root", type=str, default="window_outputs")
     parser.add_argument("--max_sample_fp_rate", type=float, default=0.02)
     parser.add_argument("--max_false_worn_event_rate", type=float, default=0.02)
-    parser.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0)
+    parser.add_argument("--max_window_fp_rate", type=float, default=0.01)
+    parser.add_argument("--max_first_worn_output_p95_sec", type=float, default=3.0)
     parser.add_argument("--fp_cost", type=float, default=1.5)
     parser.add_argument("--n_workers", type=int, default=4)
     parser.add_argument("--search_budget", type=int, default=240,
@@ -591,32 +786,14 @@ def main():
                         help="optional split to replay the selected postprocess params on, e.g. test")
     args = parser.parse_args()
 
-    cache_dir = resolve_cache_dir(args.artifact_dir, args.cache_root, args.split)
-    if not os.path.isdir(cache_dir):
-        print(f"[ERROR] cache dir not found: {cache_dir}")
-        print("  Run s06_deploy_eval.py --export_window_cache first")
-        return
+    if args.split != "valid":
+        parser.error("selection split must be 'valid'; use --replay_split test for read-only evaluation")
 
-    # Load all caches
-    npz_files = sorted(
-        [f for f in os.listdir(cache_dir) if f.endswith(".npz")])
-    if not npz_files:
-        print(f"[ERROR] no NPZ files in {cache_dir}")
-        return
-
-    print(f"Loading {len(npz_files)} window caches from {cache_dir}...")
-    caches = []
-    for fn in npz_files:
-        try:
-            caches.append(load_window_cache_npz(os.path.join(cache_dir, fn)))
-        except Exception as e:
-            print(f"  skip {fn}: {e}")
+    caches, cache_dir = load_split_caches(
+        args.artifact_dir, args.cache_root, args.split)
+    provenance = cache_provenance(caches)
+    print(f"Loading {len(caches)} window caches from {cache_dir}...")
     print(f"  loaded {len(caches)} {args.split} caches")
-    if not caches:
-        raise RuntimeError(
-            f"No usable window caches loaded from {cache_dir}; "
-            "rerun s06_deploy_eval.py --export_window_cache and inspect skipped files."
-        )
 
     # Grid search (parallel)
     model_threshold = infer_model_threshold_from_caches(caches)
@@ -688,15 +865,16 @@ def main():
     dt = time.time() - t0
     print(f"  done in {dt:.1f}s")
 
-    # Select best
-    valid = [r for r in results if r["is_valid"]]
-    if not valid:
-        print(f"[WARN] no config meets max_fp_rate={args.max_sample_fp_rate}, "
-              f"max_false_worn_event_rate={args.max_false_worn_event_rate}, "
-              f"max_worn_latency={args.max_first_worn_output_p95_sec}s. Relaxing...")
-        valid = results
-
-    best = max(valid, key=lambda r: r["score"])
+    # Select the deployable candidate using window-level risk and added latency.
+    decision = select_postprocess_candidate(
+        results,
+        max_window_fp_rate=args.max_window_fp_rate,
+        max_added_latency_sec=args.max_first_worn_output_p95_sec,
+    )
+    best = next(
+        record for record in decision["leaderboard"]
+        if record.get("params") == decision["selected_params"]
+    )
     print(f"\nBest config: {best['params']}")
     print(f"  sample_acc={best['sample_accuracy']:.4f}  "
           f"precision={best['sample_precision']:.4f}  "
@@ -705,6 +883,9 @@ def main():
     print(f"  window_acc={best['window_accuracy']:.4f}  "
           f"first_output_p95={best['first_output_p95_sec']:.1f}s  "
           f"score={best['score']:.4f}")
+    print(f"  deployment_status={decision['status']}  "
+          f"window_fp_rate={best['window_fp_rate']:.4f}  "
+          f"added_latency_p95={best['first_worn_output_p95_sec']:.3f}s")
 
     # Export
     out_dir = os.path.join(args.artifact_dir, "postprocess_opt")
@@ -718,26 +899,39 @@ def main():
             "max_sample_fp_rate": args.max_sample_fp_rate,
             "max_false_worn_event_rate": args.max_false_worn_event_rate,
             "max_first_worn_output_p95_sec": args.max_first_worn_output_p95_sec,
+            "max_window_fp_rate": args.max_window_fp_rate,
             "fp_cost": args.fp_cost,
             "warmup_frames": args.warmup_frames,
         },
+        cache_provenance=provenance,
     )
     print(f"[OK] {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         optimized_config = json.load(f)
-    final_config_path = update_final_model_config(args.artifact_dir, optimized_config)
-    print(f"[OK] updated final_model_config.json -> {final_config_path}")
+    optimized_config["selection_decision"] = {
+        key: value for key, value in decision.items() if key != "leaderboard"
+    }
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(optimized_config, f, indent=2, ensure_ascii=False)
+    if decision["deployment_acceptance"]:
+        final_config_path = update_final_model_config(args.artifact_dir, optimized_config)
+        print(f"[OK] updated final_model_config.json -> {final_config_path}")
+    else:
+        print("[WARN] analysis-only postprocess result; final_model_config.json was not updated")
 
     replay_caches = None
     replay_split = args.replay_split.strip()
     if replay_split:
-        try:
-            replay_caches, replay_cache_dir = load_split_caches(
-                args.artifact_dir, args.cache_root, replay_split)
-            print(f"  loaded {len(replay_caches)} replay caches from {replay_cache_dir}")
-        except Exception as e:
-            replay_caches = None
-            print(f"[WARN] replay split {replay_split!r} skipped: {e}")
+        replay_caches, replay_cache_dir = load_split_caches(
+            args.artifact_dir, args.cache_root, replay_split)
+        validate_cache_batch(
+            caches + replay_caches,
+            paths=(
+                [f"{args.split}:{cache['sample_name']}" for cache in caches]
+                + [f"{replay_split}:{cache['sample_name']}" for cache in replay_caches]
+            ),
+        )
+        print(f"  loaded {len(replay_caches)} replay caches from {replay_cache_dir}")
     replay_payload = build_replay_report(
         best_params=_best_params_from_search_row(best),
         selection_split=args.split,
@@ -918,9 +1112,9 @@ def export_postprocess_search_plots(df_results, out_dir):
     # (1,2) Constraint filtering breakdown
     ax6 = fig.add_subplot(gs[1, 2])
     constraint_cols = {
-        "sample_fp_rate": ("max_sample_fp_rate", 0.02),
+        "window_fp_rate": ("max_window_fp_rate", 0.01),
         "false_worn_event_rate": ("max_false_worn_event_rate", 0.02),
-        "first_worn_output_p95_sec": ("max_first_worn_output_p95_sec", 6.0),
+        "first_worn_output_p95_sec": ("max_first_worn_output_p95_sec", 3.0),
     }
     counts = {"total": len(df)}
     cum_pass = np.ones(len(df), dtype=bool)
@@ -950,7 +1144,28 @@ def export_postprocess_search_plots(df_results, out_dir):
 
     fig.suptitle("Postprocess Parameter Search Summary", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    save_scientific_figure(
+        fig,
+        out_path,
+        source_data=df,
+        inputs=[os.path.splitext(out_path)[0] + "_source_data.csv"],
+        core_conclusion=(
+            "Causal postprocessing is selected for maximum window accuracy only among "
+            "candidates meeting the window FPR and added-latency deployment constraints."
+        ),
+        panel_map={
+            "a": "Recall versus false-positive rate.",
+            "b": "Added response latency versus false-positive rate.",
+            "c": "Candidate score distribution.",
+            "d": "Window accuracy versus window false-positive rate.",
+            "e": "Top candidate metrics.",
+            "f": "Deployment constraint filtering cascade.",
+        },
+        split="valid",
+        n_definition="one row per deterministic postprocess parameter candidate",
+        statistics={"selection": "validation-only constrained deterministic ranking"},
+        reviewer_risks=["Test data must not participate in parameter selection."],
+    )
     plt.close(fig)
     print(f"[OK] s07 postprocess search plot -> {out_path}")
     return out_path

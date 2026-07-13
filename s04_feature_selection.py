@@ -33,6 +33,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+from scientific_figures import save_scientific_figure
 
 from sklearn.model_selection import GroupKFold
 from sklearn.inspection import permutation_importance
@@ -50,6 +51,18 @@ from s03_extract_feature_pool import (
     filter_stage2_ir_features,
     is_deployment_friendly_stage2_feature as s03_is_deployment_friendly_stage2_feature,
 )
+from stage2_feature_catalog import (
+    COMMERCIAL_8_FEATURE_MAPPING,
+    DIAGNOSTIC_ONLY_FIELDS,
+    FEATURE_CATALOG,
+    FEATURE_POOL_VERSION,
+    ROW_METADATA_FIELDS,
+    feature_record as catalog_feature_record,
+    feature_group as catalog_feature_group,
+    filter_model_candidates,
+    is_model_candidate,
+)
+from manual_feature_selection import export_manual_selection_workbook
 
 logger = logging.getLogger(__name__)
 
@@ -204,10 +217,11 @@ META_COLS = [
     "start_100hz",
     "start_sec",
     "window_index",
+    *sorted(DIAGNOSTIC_ONLY_FIELDS),
 ]
 
 
-FEATURE_GROUPS = {
+LEGACY_FEATURE_GROUPS = {
     "commercial_baseline": [
         "GREEN_CORR",
         "GREEN_AC",
@@ -334,41 +348,35 @@ FEATURE_GROUPS = {
     "mode": ["mode"],
 }
 
+# Runtime groups are derived from the catalog. The commercial baseline remains
+# a separate s09 comparison surface and is never treated as Stage2 candidates.
+FEATURE_GROUPS = {"commercial_baseline": list(LEGACY_FEATURE_GROUPS["commercial_baseline"])}
+for _feature_name, _feature_record in FEATURE_CATALOG.items():
+    FEATURE_GROUPS.setdefault(str(_feature_record["group"]), []).append(_feature_name)
+
 GROUP_LIMITS_DEFAULT = {
-    "commercial_baseline": 8,
     "signal_quality": 2,
-    "short_window_stability": 2,
-    "short_window_frequency": 1,
-    "green_stats": 2,
-    "ambient_stats": 2,
-    "green_spatial": 3,
-    "green_3ch_consistency": 3,
-    "amb_cross": 2,
+    "green_contact": 2,
+    "ambient_contact": 2,
+    "green_top2_contact": 3,
+    "green_spatial": 4,
+    "ambient_cross": 2,
     "frequency": 4,
     "spatial_coupling": 1,
-    "signal_complexity": 2,
-    "waveform_morphology": 3,
-    "acc_features": 1,
-    "acc_per_axis": 1,
-    "acc_tremor": 1,
-    "acc_orientation": 1,
-    "meta": 0,
-    "mode": 1,
-    "other": 2,
+    "pulse_shape": 2,
+    "acc_motion": 2,
+    "acc_green_coupling": 1,
 }
 
 GROUP_LIMITS_ACCURACY_FIRST = {
     **GROUP_LIMITS_DEFAULT,
-    "green_stats": 4,
+    "green_contact": 4,
+    "green_top2_contact": 4,
     "green_spatial": 4,
-    "green_3ch_consistency": 4,
     "frequency": 5,
-    "amb_cross": 3,
-    # ACC reduced: motion features less informative for wearing detection
-    "acc_features": 1,
-    "acc_per_axis": 1,
-    "acc_tremor": 1,
-    "acc_orientation": 1,
+    "ambient_cross": 3,
+    "acc_motion": 2,
+    "acc_green_coupling": 1,
 }
 
 
@@ -527,25 +535,51 @@ def summarize_deployment_feature_costs(features):
 
 
 def get_feature_cols(df):
-    exclude = set(META_COLS)
-    cols = [c for c in df.columns if c not in exclude]
-    cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
-    return cols
+    numeric = [
+        c for c in df.columns
+        if c not in ROW_METADATA_FIELDS
+        and c not in DIAGNOSTIC_ONLY_FIELDS
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+    return filter_model_candidates(numeric)
+
+
+def validate_feature_pool_frames(df_train, df_valid):
+    """Reject stale or unmanaged Stage2 feature-pool inputs."""
+    for split_name, frame in (("train", df_train), ("valid", df_valid)):
+        if "feature_pool_version" not in frame.columns:
+            raise ValueError(
+                f"{split_name} feature pool has no feature_pool_version; "
+                "rerun s03 before feature selection."
+            )
+        versions = sorted({
+            str(value)
+            for value in frame["feature_pool_version"].dropna().unique().tolist()
+        })
+        if versions != [FEATURE_POOL_VERSION]:
+            raise ValueError(
+                f"{split_name} feature pool version {versions or ['<missing>']} "
+                f"does not match {FEATURE_POOL_VERSION}; rerun s03."
+            )
+
+        unmanaged = [
+            column
+            for column in frame.columns
+            if column not in ROW_METADATA_FIELDS
+            and column not in DIAGNOSTIC_ONLY_FIELDS
+            and pd.api.types.is_numeric_dtype(frame[column])
+            and not is_model_candidate(column)
+        ]
+        if unmanaged:
+            raise ValueError(
+                f"{split_name} feature pool contains unmanaged Stage2 candidates: "
+                + ", ".join(unmanaged[:10])
+                + "; rerun s03."
+            )
 
 
 def feature_to_group(feature):
-    for g, cols in FEATURE_GROUPS.items():
-        if feature in cols:
-            return g
-    # 前缀匹配：GREEN_/IRX_/AMBX_ + 基础特征名 → 对应组
-    for pf in ("GREEN_", "IRX_", "AMBX_"):
-        if feature.startswith(pf):
-            base = feature[len(pf):]
-            for g, cols in FEATURE_GROUPS.items():
-                if base in cols:
-                    return g
-            break
-    return "other"
+    return catalog_feature_group(feature)
 
 
 # =========================================================
@@ -1171,7 +1205,7 @@ def export_shap_importance_plot(shap_train, shap_valid, spearman_rho, topk_overl
 
     fig.suptitle("SHAP Feature Importance Report", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] s04 SHAP plot -> {out_path}")
     return out_path
@@ -1180,20 +1214,9 @@ def export_shap_importance_plot(shap_train, shap_valid, spearman_rho, topk_overl
 # 标量绝对量纲（依赖原始 ADC 数值大小）的特征清单。
 # 它们随肤色 / 传感器 / 老化漂移，应优先用 ratio/correlation 替代或在线上做基线自适应。
 SCALE_DEPENDENT_FEATURES = {
-    # ir_basic
-    "IR_mean", "IR_std", "IR_p95", "IR_diff_std",
-    # green_basic
-    "G_mean_mean", "G_mean_std", "G_mean_diff_std",
-    # ambient
-    "Ambient_mean", "Ambient_std", "Ambient_p95",
-    # robust_ac_dc - DC 绝对值
-    "GREEN_DC_MEDIAN", "GREEN_DC_IQR", "GREEN_AC_RMS", "GREEN_AC_MAD", "GREEN_DERIV_MAD",
-    "IRX_DC_MEDIAN", "IRX_DC_IQR", "IRX_AC_RMS", "IRX_AC_MAD", "IRX_DERIV_MAD",
-    "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD", "AMBX_DERIV_MAD",
-    "PPG_GREEN_DC", "PPG_AMB_DC", "PPG_GREEN_AC", "PPG_AMB_AC",
-    "GREEN_AC", "AMB_AC", "GREEN_DC", "AMB_DC", "ACC_YSUM",
-    # acc 部分
-    "ACC_MAG_MEAN", "ACC_AXIS_STD_SUM",
+    name
+    for name in FEATURE_CATALOG
+    if bool(catalog_feature_record(name)["scale_dependent"])
 }
 
 
@@ -1267,26 +1290,8 @@ def compute_drift_metrics(x_train, x_valid, n_bins=10):
 
 
 DEPLOYMENT_COST_BY_GROUP = {
-    "commercial_baseline": 1.2,
-    "signal_quality": 0.8,
-    "short_window_stability": 1.0,
-    "short_window_frequency": 1.6,
-    "ir_stats": 1.0,
-    "green_stats": 1.0,
-    "ambient_stats": 1.0,
-    "ir_g_amplitude": 1.2,
-    "ir_g_correlation": 1.4,
-    "amb_cross": 1.4,
-    "green_spatial": 1.5,
-    "green_3ch_consistency": 1.6,
-    "spatial_coupling": 1.8,
-    "acc_features": 2.0,
-    "frequency": 2.8,
-    "waveform_morphology": 2.2,
-    "signal_complexity": 3.2,
-    "mode": 0.5,
-    "meta": 0.2,
-    "other": 2.0,
+    catalog_feature_group(name): float(catalog_feature_record(name)["deployment_cost"])
+    for name in FEATURE_CATALOG
 }
 
 
@@ -1298,7 +1303,8 @@ def deployment_feature_summary(feature):
     importance is otherwise similar.
     """
     group = feature_to_group(feature)
-    cost = float(DEPLOYMENT_COST_BY_GROUP.get(group, DEPLOYMENT_COST_BY_GROUP["other"]))
+    record = catalog_feature_record(feature)
+    cost = float(record["deployment_cost"])
     reasons = [f"group={group}", f"cost={cost:g}"]
 
     if "SampEn" in feature or "Entropy" in feature:
@@ -1308,7 +1314,7 @@ def deployment_feature_summary(feature):
         cost = max(cost, 2.8)
         reasons.append("frequency-domain")
 
-    scale_dependent = feature in SCALE_DEPENDENT_FEATURES
+    scale_dependent = bool(record["scale_dependent"])
     reasons.append("scale-dependent" if scale_dependent else "scale-robust")
 
     cost_penalty = min(cost / 4.0, 1.0) * 0.45
@@ -1435,6 +1441,235 @@ def _fp_proxy_for_feature(df, feature, recall_floor=0.95, state_k_on=3):
         "fit": float(max(0.0, min(1.0, 1.0 - penalty))),
         "available": True,
         "reason": "ok",
+    }
+
+
+def build_full_feature_ranking(
+    df_train,
+    df_valid,
+    feature_cols,
+    *,
+    removed_map=None,
+    n_splits=5,
+    recall_floor=0.95,
+    state_k_on=3,
+):
+    """Rank every governed candidate with transparent train-only evidence."""
+    removed_map = removed_map or {}
+    removed_reasons = defaultdict(list)
+    for reason, names in removed_map.items():
+        for name in names:
+            removed_reasons[str(name)].append(str(reason))
+
+    groups = (
+        df_train["sample_name"].astype("object").to_numpy()
+        if "sample_name" in df_train.columns
+        else np.arange(len(df_train), dtype=object)
+    )
+    y_train = df_train["target"].to_numpy(dtype=int)
+    unique_groups = np.unique(groups)
+    split_count = min(max(2, int(n_splits)), len(unique_groups))
+    splits = []
+    if len(unique_groups) >= 2:
+        splits = list(GroupKFold(n_splits=split_count).split(
+            np.zeros(len(df_train)), y_train, groups
+        ))
+
+    rows = []
+    for catalog_index, feature in enumerate(feature_cols):
+        reasons = list(removed_reasons.get(feature, []))
+        in_train = feature in df_train.columns
+        in_valid = feature in df_valid.columns
+        train_raw = (
+            pd.to_numeric(df_train[feature], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            if in_train else pd.Series(dtype=float)
+        )
+        valid_raw = (
+            pd.to_numeric(df_valid[feature], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            if in_valid else pd.Series(dtype=float)
+        )
+        train_finite = int(train_raw.notna().sum())
+        valid_finite = int(valid_raw.notna().sum())
+        eligible_reasons = []
+        if not in_train:
+            eligible_reasons.append("missing_train_column")
+        if not in_valid:
+            eligible_reasons.append("missing_valid_column")
+        if train_finite == 0:
+            eligible_reasons.append("no_finite_train_values")
+        if valid_finite == 0:
+            eligible_reasons.append("no_finite_valid_values")
+        if not is_deployment_allowed_feature(feature):
+            eligible_reasons.append("not_deployment_allowed")
+
+        fill = float(train_raw.median()) if train_finite else 0.0
+        train_values = train_raw.fillna(fill).to_numpy(dtype=float) if in_train else np.zeros(len(df_train))
+        valid_values = valid_raw.fillna(fill).to_numpy(dtype=float) if in_valid else np.zeros(len(df_valid))
+        variance = float(np.var(train_values)) if len(train_values) else 0.0
+        missing_rate = float(train_raw.isna().mean()) if in_train and len(train_raw) else 1.0
+        if missing_rate > 0.3:
+            reasons.append("high_missing")
+        if variance <= 1e-8:
+            reasons.append("low_variance")
+
+        fold_aucs = []
+        fold_separations = []
+        for train_idx, holdout_idx in splits:
+            y_holdout = y_train[holdout_idx]
+            if np.unique(y_holdout).size < 2:
+                continue
+            fold_train = train_raw.iloc[train_idx]
+            fold_fill = float(fold_train.median()) if fold_train.notna().any() else 0.0
+            holdout_values = train_raw.iloc[holdout_idx].fillna(fold_fill).to_numpy(dtype=float)
+            try:
+                auc = float(roc_auc_score(y_holdout, holdout_values))
+            except Exception:
+                continue
+            fold_aucs.append(auc)
+            fold_separations.append(float(2.0 * abs(auc - 0.5)))
+
+        mean_sep = float(np.mean(fold_separations)) if fold_separations else 0.0
+        min_sep = float(np.min(fold_separations)) if fold_separations else 0.0
+        std_sep = float(np.std(fold_separations)) if fold_separations else 0.0
+        proxy = _fp_proxy_for_feature(
+            df_train,
+            feature,
+            recall_floor=recall_floor,
+            state_k_on=state_k_on,
+        )
+        deploy = deployment_feature_summary(feature)
+        ranking_score = (
+            0.45 * mean_sep
+            + 0.25 * min_sep
+            + 0.20 * float(proxy["fit"])
+            + 0.10 * float(deploy["deployment_fit"])
+        )
+
+        valid_auc = None
+        if in_valid and "target" in df_valid.columns and df_valid["target"].nunique() >= 2:
+            try:
+                valid_auc = float(roc_auc_score(
+                    df_valid["target"].to_numpy(dtype=int), valid_values
+                ))
+            except Exception:
+                valid_auc = None
+        drift = compute_drift_metrics(train_values, valid_values) if in_valid else {}
+        if drift.get("psi") is not None and float(drift["psi"]) > 0.25:
+            reasons.append("high_psi")
+
+        record = catalog_feature_record(feature)
+        rows.append({
+            "feature": feature,
+            "catalog_index": int(catalog_index),
+            "group": str(record["group"]),
+            "formula": str(record["formula"]),
+            "preprocessing": str(record["preprocessing"]),
+            "unit": str(record["unit"]),
+            "signal_source": str(record["signal_source"]),
+            "commercial_8_member": bool(record["commercial_8_member"]),
+            "commercial_original_name": record["commercial_original_name"],
+            "fft": bool(record["fft"]),
+            "buffer_samples": int(record["buffer_samples"]),
+            "accumulator": str(record["accumulator"]),
+            "c_operators": list(record["c_operators"]),
+            "c_abs_tolerance": float(record["c_abs_tolerance"]),
+            "c_rel_tolerance": float(record["c_rel_tolerance"]),
+            "ranking_score": float(ranking_score),
+            "train_group_fold_auc_mean": float(np.mean(fold_aucs)) if fold_aucs else None,
+            "train_group_fold_auc_min": float(np.min(fold_aucs)) if fold_aucs else None,
+            "train_group_fold_separation_mean": mean_sep,
+            "train_group_fold_separation_min": min_sep,
+            "train_group_fold_separation_std": std_sep,
+            "train_group_fold_count": int(len(fold_separations)),
+            "fp_proxy_fit": float(proxy["fit"]),
+            "fp_proxy_sample_fp_rate": float(proxy["sample_fp_rate"]),
+            "fp_proxy_state_fp_rate": float(proxy["state_fp_rate"]),
+            "deployment_cost": float(deploy["deployment_cost"]),
+            "deployment_fit": float(deploy["deployment_fit"]),
+            "is_scale_dependent": bool(record["scale_dependent"]),
+            "train_missing_rate": missing_rate,
+            "train_variance": variance,
+            "valid_auc": valid_auc,
+            "valid_ks_stat": drift.get("ks_stat"),
+            "valid_ks_pvalue": drift.get("ks_pvalue"),
+            "valid_psi": drift.get("psi"),
+            "valid_mean_shift": drift.get("mean_shift"),
+            "valid_std_ratio": drift.get("std_ratio"),
+            "risk_flags": sorted(set(reasons)),
+            "removed_reason": ", ".join(sorted(set(reasons))),
+            "eligible_for_manual_selection": not eligible_reasons,
+            "ineligible_reasons": eligible_reasons,
+        })
+
+    rows.sort(key=lambda item: (
+        not bool(item["eligible_for_manual_selection"]),
+        -float(item["ranking_score"]),
+        int(item["catalog_index"]),
+    ))
+    for rank, item in enumerate(rows, start=1):
+        item["rank"] = int(rank)
+    return rows
+
+
+def export_full_feature_ranking(artifact_dir, ranking):
+    artifact_dir = Path(artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    json_path = artifact_dir / "feature_ranking_full.json"
+    csv_path = artifact_dir / "feature_ranking_full.csv"
+    template_path = artifact_dir / "manual_selected_features.template.json"
+    completeness_path = artifact_dir / "feature_pool_completeness.json"
+    payload = {
+        "schema_version": 1,
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "ranking_policy": {
+            "selection_data": "train_only",
+            "valid_used_for_score": False,
+            "score_formula": (
+                "0.45*mean_group_fold_separation + "
+                "0.25*min_group_fold_separation + "
+                "0.20*fp_proxy_fit + 0.10*deployment_fit"
+            ),
+        },
+        "ranking": list(ranking),
+    }
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+    pd.DataFrame(ranking).to_csv(csv_path, index=False)
+    template = {
+        "schema_version": 1,
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "ranking_source": json_path.name,
+        "selected_features": [],
+        "selection_notes": {},
+    }
+    with template_path.open("w", encoding="utf-8") as handle:
+        json.dump(template, handle, indent=2, ensure_ascii=False)
+    ranked_names = [str(item.get("feature")) for item in ranking]
+    catalog_names = list(FEATURE_CATALOG)
+    completeness = {
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "catalog_count": len(catalog_names),
+        "ranked_count": len(ranked_names),
+        "unique_ranked_count": len(set(ranked_names)),
+        "eligible_count": sum(bool(item.get("eligible_for_manual_selection")) for item in ranking),
+        "ineligible_count": sum(not bool(item.get("eligible_for_manual_selection")) for item in ranking),
+        "missing_from_ranking": [name for name in catalog_names if name not in ranked_names],
+        "extra_in_ranking": [name for name in ranked_names if name not in FEATURE_CATALOG],
+        "duplicate_ranked_features": sorted({name for name in ranked_names if ranked_names.count(name) > 1}),
+        "commercial_8_mapping": dict(COMMERCIAL_8_FEATURE_MAPPING),
+    }
+    with completeness_path.open("w", encoding="utf-8") as handle:
+        json.dump(completeness, handle, indent=2, ensure_ascii=False)
+    selection_outputs = export_manual_selection_workbook(json_path, artifact_dir)
+    return {
+        "json": json_path,
+        "csv": csv_path,
+        "template": template_path,
+        "workbook": selection_outputs["workbook"],
+        "selection_csv": selection_outputs["csv"],
+        "completeness": completeness_path,
     }
 
 
@@ -1684,17 +1919,17 @@ def generate_feature_subset_candidates(combined_summary, kept_features, max_feat
     }
 
     focus_groups = [
-        "green_stats", "green_spatial", "green_3ch_consistency",
-        "frequency", "short_window_stability", "amb_cross",
-        "acc_features", "acc_per_axis", "acc_orientation",
+        "green_contact", "green_top2_contact", "green_spatial",
+        "frequency", "pulse_shape", "ambient_cross",
+        "acc_motion", "acc_green_coupling",
     ]
     by_group = defaultdict(list)
     for item in acc_sorted:
         by_group[item.get("group", feature_to_group(item["feature"]))].append(item)
     beam_specs = [
-        ("accuracy_beam_green_top2", ["green_stats", "frequency", "green_3ch_consistency", "green_spatial", "acc_features", "amb_cross"]),
-        ("accuracy_beam_stability", ["short_window_stability", "green_spatial", "green_3ch_consistency", "green_stats", "frequency", "acc_features"]),
-        ("accuracy_beam_motion_light", ["acc_features", "acc_per_axis", "acc_orientation", "green_stats", "frequency", "amb_cross"]),
+        ("accuracy_beam_green_top2", ["green_contact", "green_top2_contact", "frequency", "green_spatial", "acc_green_coupling", "ambient_cross"]),
+        ("accuracy_beam_stability", ["pulse_shape", "green_spatial", "green_top2_contact", "green_contact", "frequency", "acc_motion"]),
+        ("accuracy_beam_motion_light", ["acc_motion", "acc_green_coupling", "green_contact", "frequency", "ambient_cross"]),
     ]
     for name, preferred_groups in beam_specs:
         ordered = []
@@ -1951,9 +2186,12 @@ def _select_by_group_impl(summary, max_features=10, group_limits=None, min_acc_f
         if len(selected) >= max_features:
             break
 
-    acc_selected = [f for f in selected if f in FEATURE_GROUPS["acc_features"]]
+    acc_groups = {"acc_motion", "acc_green_coupling"}
+    acc_selected = [f for f in selected if feature_to_group(f) in acc_groups]
     if len(acc_selected) < min_acc_features and min_acc_features > 0:
-        acc_candidates = [item["feature"] for item in summary if item["group"] == "acc_features"]
+        acc_candidates = [
+            item["feature"] for item in summary if item["group"] in acc_groups
+        ]
         for f in acc_candidates:
             if f not in selected:
                 if len(selected) >= max_features:
@@ -1962,7 +2200,8 @@ def _select_by_group_impl(summary, max_features=10, group_limits=None, min_acc_f
                     if removed_group in group_count:
                         group_count[removed_group] = max(0, group_count[removed_group] - 1)
                 selected.append(f)
-                group_count["acc_features"] = group_count.get("acc_features", 0) + 1
+                group_name = feature_to_group(f)
+                group_count[group_name] = group_count.get(group_name, 0) + 1
                 break
 
     return selected, dict(group_count)
@@ -2066,7 +2305,39 @@ def export_feature_selection_report_plot(result, artifact_dir):
 
     fig.suptitle("Feature Selection Report", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    source_rows = []
+    for rank, item in enumerate(summary, start=1):
+        source_rows.append({
+            "panel": "ranking", "rank": rank,
+            "feature": item.get("feature"),
+            "deployment_score": item.get("deployment_score"),
+            "combined_score": item.get("combined_score"),
+            "selected": item.get("feature") in selected,
+            "group": item.get("group"),
+            "fp_proxy_sample_fp_rate": item.get("fp_proxy_sample_fp_rate"),
+            "fp_proxy_state_fp_rate": item.get("fp_proxy_state_fp_rate"),
+        })
+    for group, count in group_count.items():
+        source_rows.append({"panel": "selected_groups", "group": group, "count": count})
+    save_scientific_figure(
+        fig,
+        out_path,
+        source_data=pd.DataFrame(source_rows),
+        inputs=[os.path.splitext(out_path)[0] + "_source_data.csv"],
+        core_conclusion=(
+            "The complete feature pool is transparently ranked by deployment-aware "
+            "evidence while preserving the user's unrestricted manual selection."
+        ),
+        panel_map={
+            "a": "Top deployment and combined feature scores.",
+            "b": "Selected feature counts by signal group.",
+            "c": "Sample and streaming false-positive proxy risks.",
+        },
+        split="train_valid",
+        n_definition="one row per ranked feature plus selected-group summary rows",
+        statistics={"ranking": "train evidence with validation stability and FP proxies"},
+        reviewer_risks=["Ranking assists selection but does not impose a feature-count or category limit."],
+    )
     plt.close(fig)
     print(f"[OK] s04 report plot -> {out_path}")
     return out_path
@@ -2079,6 +2350,12 @@ def export_feature_selection_report_plot(result, artifact_dir):
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
+    parser.add_argument(
+        "--feature_selection_mode",
+        choices=["manual", "auto"],
+        default="manual",
+        help="manual exports the complete transparent ranking and stops; auto continues legacy selection",
+    )
     parser.add_argument("--max_features", type=int, default=15)
     parser.add_argument("--missing_thresh", type=float, default=0.3)
     parser.add_argument("--var_thresh", type=float, default=1e-8)
@@ -2111,6 +2388,7 @@ def main(args=None):
 
     df_train = pd.read_csv(os.path.join(args.artifact_dir, "feature_pool_train.csv"))
     df_valid = pd.read_csv(os.path.join(args.artifact_dir, "feature_pool_valid.csv"))
+    validate_feature_pool_frames(df_train, df_valid)
 
     feature_cols = get_feature_cols(df_train)
 
@@ -2150,6 +2428,32 @@ def main(args=None):
     print(f"[s04] STEP 1/5: 数据清洗完成. 原始={len(feature_cols)}, 清洗后={len(kept_features)}, "
           f"elapsed={_elapsed(step_start):.1f}s")
     sys.stdout.flush()
+
+    full_ranking = build_full_feature_ranking(
+        df_train,
+        df_valid,
+        feature_cols,
+        removed_map=removed,
+        n_splits=5,
+        recall_floor=args.fp_proxy_recall_floor,
+        state_k_on=args.fp_proxy_state_k_on,
+    )
+    ranking_outputs = export_full_feature_ranking(args.artifact_dir, full_ranking)
+    pd.DataFrame(full_ranking).to_csv(
+        os.path.join(args.artifact_dir, "feature_diagnostics.csv"),
+        index=False,
+    )
+    print(f"[s04] full ranking -> {ranking_outputs['json']}")
+    print(f"[s04] ranking table -> {ranking_outputs['csv']}")
+    print(f"[s04] manual selection workbook -> {ranking_outputs['workbook']}")
+    print(f"[s04] feature-pool completeness -> {ranking_outputs['completeness']}")
+    if args.feature_selection_mode == "manual":
+        print(
+            "[s04] manual mode complete. Set Selected=1 for any desired rows in "
+            "manual_feature_selection.xlsx, save it, then run s05. No feature-count "
+            "or category limit is applied to the workbook selection."
+        )
+        return
 
     step_start = time.perf_counter()
     print("\n[s04] STEP 2/5: 组内快速预筛...")
@@ -2353,6 +2657,8 @@ def main(args=None):
     sys.stdout.flush()
 
     result = {
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "feature_selection_mode": "auto",
         "selected_features": selected,
         "max_features": args.max_features,
         "selection_policy": {

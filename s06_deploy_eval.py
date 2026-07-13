@@ -39,6 +39,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scientific_figures import save_scientific_figure
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
 from s03_extract_feature_pool import (
@@ -59,6 +60,11 @@ from s03_extract_feature_pool import (
     extract_acc_green_coupling_features,
     validate_h5_file,
     load_grouped_window_metadata,
+)
+from stage2_feature_catalog import (
+    FEATURE_CATALOG,
+    FEATURE_POOL_VERSION,
+    build_selected_feature_contract,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -182,6 +188,13 @@ def assert_bundle_ok(bundle):
         if k not in bundle:
             raise ValueError(f"model_bundle missing key: {k}")
 
+    version = bundle.get("feature_pool_version")
+    if version != FEATURE_POOL_VERSION:
+        raise ValueError(
+            f"model_bundle feature_pool_version={version!r} does not match "
+            f"{FEATURE_POOL_VERSION}; rerun s03-s05 before deployment evaluation."
+        )
+
     miss = [c for c in bundle["feature_names"] if c not in bundle["fill_values"]]
     if miss:
         raise ValueError(f"fill_values missing for: {miss[:5]} ...")
@@ -190,6 +203,37 @@ def assert_bundle_ok(bundle):
     for k in ["fs_ppg", "win_sec", "step_sec"]:
         if k not in bundle["meta"]:
             raise ValueError(f"meta missing: {k}")
+
+
+def validate_inference_window_contract(bundle, window_sec, stride_sec):
+    """Reject inference windows that differ from the trained bundle contract."""
+    meta = bundle.get("meta", {}) if isinstance(bundle, dict) else {}
+    expected = {
+        "window_sec": ("model_bundle.meta.win_sec", meta.get("win_sec")),
+        "stride_sec": ("model_bundle.meta.step_sec", meta.get("step_sec")),
+    }
+    actual = {
+        "window_sec": window_sec,
+        "stride_sec": stride_sec,
+    }
+    for name, (bundle_name, bundle_value) in expected.items():
+        if bundle_value is None:
+            raise ValueError(f"{bundle_name} is required for inference")
+        try:
+            value = float(actual[name])
+            trained_value = float(bundle_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} and {bundle_name} must be numeric") from exc
+        if not np.isfinite(value) or not np.isfinite(trained_value):
+            raise ValueError(f"{name} and {bundle_name} must be finite")
+        if not np.isclose(value, trained_value, rtol=1e-9, atol=1e-9):
+            raise ValueError(
+                f"{name}={value:g} does not match "
+                f"{bundle_name}={trained_value:g}; rerun training or use the "
+                "bundle window contract."
+            )
+    return float(window_sec), float(stride_sec)
 
 
 def apply_preprocess(feat_dict_list, bundle=None):
@@ -403,7 +447,8 @@ def compute_ood_score(feat_dict, feature_quantiles, feature_names):
     return float(out) / float(total)
 
 
-def apply_postprocess(window_probs, quality_metas, method, cfg, model_threshold):
+def apply_postprocess(window_probs, quality_metas, method, cfg, model_threshold,
+                      stride_sec=1.0):
     """
     纯函数后处理。基于已缓存的 probs 直接产出 final_pred / states / window_preds / scores。
 
@@ -432,7 +477,7 @@ def apply_postprocess(window_probs, quality_metas, method, cfg, model_threshold)
         for i, p in enumerate(probs_for_state):
             meta_i = quality_metas[i] if i < len(quality_metas) else None
             q = compute_quality(meta_i, thresholds=qt) if meta_i else 1.0
-            state, score = sm.update(p, quality=q)
+            state, score = sm.update(p, quality=q, stride_sec=stride_sec)
             states.append(int(state))
             scores.append(float(score))
         final_pred = sample_pred_from_states(
@@ -519,8 +564,8 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
     """Run deployed inference directly on stored 3s windows."""
     FEATURE_FS = 25
     window_meta = load_grouped_window_metadata(base)
-    window_indices = window_meta.get("window_indices") if window_meta else None
-    window_labels = window_meta.get("window_labels") if window_meta else None
+    window_indices = list(window_meta.get("window_indices") or []) if window_meta else []
+    window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
     native_25hz = _is_25hz_sample(base) or int(ppg.shape[1]) == int(round(float(window_sec) * FEATURE_FS))
     ppg_src_fs = 25 if native_25hz else 100
     mode = detect_green_mode(ppg)
@@ -946,7 +991,17 @@ def _safe_confusion(y_true, y_pred):
         return 0, 0, 0, 0
 
 
-def compute_sample_metrics(results, method, cfg, model_threshold):
+def build_evaluation_contract(split):
+    split = str(split)
+    return {
+        "split": split,
+        "test_read_only": split.lower() == "test",
+        "configuration_frozen": True,
+        "selection_performed": False,
+    }
+
+
+def compute_sample_metrics(results, method, cfg, model_threshold, stride_sec=1.0):
     """
     Sample 级（端到端）：
     fallback / Stage1-fail / 空 probs 一律 pred=0 参与统计。
@@ -971,7 +1026,8 @@ def compute_sample_metrics(results, method, cfg, model_threshold):
             window_preds = list(r.get("window_preds", []))
         else:
             final_pred, states, window_preds, scores = apply_postprocess(
-                probs, r.get("quality_metas", []), method, cfg, model_threshold
+                probs, r.get("quality_metas", []), method, cfg, model_threshold,
+                stride_sec=stride_sec,
             )
 
         y_true.append(target)
@@ -1260,7 +1316,46 @@ def export_deploy_report_plot(payload, artifact_dir, split="test", method="state
 
     fig.suptitle(f"Deployment Evaluation Report ({split}, {method})", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    source_rows = []
+    for level, block in blocks:
+        for metric in ["accuracy", "precision", "recall", "f1", "fp_rate"]:
+            if metric in block:
+                source_rows.append({
+                    "panel": "metrics", "level": level,
+                    "metric": metric, "value": block.get(metric),
+                })
+    for detail in details:
+        for index, prob in enumerate(detail.get("window_probs", []) or []):
+            if prob is not None and np.isfinite(prob):
+                source_rows.append({
+                    "panel": "window_probability",
+                    "sample_name": detail.get("sample_name"),
+                    "target": detail.get("target"),
+                    "window_index": index,
+                    "value": float(prob),
+                })
+    if not source_rows:
+        source_rows.append({"panel": "summary", "metric": "total_samples", "value": total})
+    save_scientific_figure(
+        fig,
+        out_path,
+        source_data=pd.DataFrame(source_rows),
+        inputs=[os.path.splitext(out_path)[0] + "_source_data.csv"],
+        core_conclusion=(
+            "Frozen end-to-end evaluation reports sample and window behavior, error modes, "
+            "and probability separation without changing the evaluated configuration."
+        ),
+        panel_map={
+            "a": "Stage funnel.", "b": "Sample confusion matrix.",
+            "c": "Window probability distributions.", "d": "Metric comparison.",
+            "e": "Highest-confidence false positives.", "f": "Errors by Stage1 stratum.",
+        },
+        split=str(split),
+        n_definition="samples in the frozen evaluation split; probability panel uses eligible windows",
+        statistics={"metrics": "point estimates on the named frozen split"},
+        reviewer_risks=["Window observations within a sample are correlated and are not independent replicates."],
+        test_read_only=str(split).lower() == "test",
+    )
     plt.close(fig)
     print(f"[OK] s06 report plot -> {out_path}")
     return out_path
@@ -1529,7 +1624,8 @@ def export_window_error_analysis(report, artifact_dir, split, method):
     return out_csv, out_json
 
 
-def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold=None):
+def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold=None,
+                                  stride_sec=1.0):
     """Window-level streaming state metrics: state[i] vs target after warmup."""
     y_true, y_pred = [], []
     samples_with_no_windows = 0
@@ -1566,7 +1662,7 @@ def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold
         for i, p in enumerate(probs_for_state):
             meta_i = qm[i] if i < len(qm) else None
             q = compute_quality(meta_i, thresholds=qt) if meta_i else 1.0
-            state, _ = sm.update(p, quality=q)
+            state, _ = sm.update(p, quality=q, stride_sec=stride_sec)
             sample_states.append(int(state))
             sample_targets.append(int(_safe_list_get(window_targets, i, sample_target)))
 
@@ -1616,6 +1712,7 @@ def _score_grid_point(args_tuple):
     data = pickle.loads(cache_pickle)
     cache = data["samples"]
     quality_thresholds = data.get("quality_thresholds")
+    stride_sec = float(data.get("stride_sec", 1.0))
 
     y_true, y_pred = [], []
     for s in cache:
@@ -1629,7 +1726,7 @@ def _score_grid_point(args_tuple):
             state = 0
             for i, p in enumerate(probs):
                 q = compute_quality(qm[i], thresholds=quality_thresholds) if i < len(qm) and qm[i] else 1.0
-                state, _ = sm.update(p, quality=q)
+                state, _ = sm.update(p, quality=q, stride_sec=stride_sec)
             pred = int(state)
         y_true.append(target)
         y_pred.append(pred)
@@ -1702,6 +1799,7 @@ def optimize_state_machine_params(samples, dc_threshold, ac_dc_threshold,
     score_data = {
         "samples": sample_cache,
         "quality_thresholds": _bundle.get("quality_thresholds"),
+        "stride_sec": float(stride_sec),
     }
     cache_pickle = pickle.dumps(score_data, protocol=pickle.HIGHEST_PROTOCOL)
     task_args = [(a, t_on, t_off, ko, kf, cache_pickle) for (a, t_on, t_off, ko, kf) in grid]
@@ -1804,7 +1902,8 @@ def predict_sample_with_bundle(sample, dc_threshold, ac_dc_threshold,
         }
 
     final_pred, _states, window_preds, _scores = apply_postprocess(
-        r["window_probs"], r["quality_metas"], method, postprocess_cfg, _BUNDLE["threshold"]
+        r["window_probs"], r["quality_metas"], method, postprocess_cfg,
+        _BUNDLE["threshold"], stride_sec=stride_sec,
     )
     return {
         "sample_name": r["sample_name"],
@@ -1921,7 +2020,7 @@ def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
         states = []
         for i, p in enumerate(probs):
             q = compute_quality(qm[i], thresholds=qt) if i < len(qm) and qm[i] else 1.0
-            state, _ = sm.update(p, quality=q)
+            state, _ = sm.update(p, quality=q, stride_sec=stride_sec)
             states.append(state)
             all_true.append(target)
             all_pred.append(state)
@@ -2026,7 +2125,7 @@ def predict_sample(sample, model, scaler, selected_features,
             window_preds.append(wp)
             if method == "state_machine":
                 q = compute_quality(feat)
-                state, _ = sm.update(p, quality=q)
+                state, _ = sm.update(p, quality=q, stride_sec=stride_sec)
                 states.append(state)
         except Exception:
             continue
@@ -2063,8 +2162,7 @@ def predict_sample(sample, model, scaler, selected_features,
 
 def build_feature_formula_map(selected_features):
     """
-    为每个入选特征生成计算公描述。
-    按特征命名约定自动匹配公式模板。
+    Build deployment formula metadata from the governed Stage2 catalog.
 
     返回: OrderedDict[feature_name -> formula_info]
     """
@@ -2073,6 +2171,35 @@ def build_feature_formula_map(selected_features):
         list(selected_features),
         "deploy feature formula selected_features",
     )
+    unknown = [name for name in selected_features if name not in FEATURE_CATALOG]
+    if unknown:
+        raise ValueError(
+            "unknown Stage2 model candidates in deployment formula export: "
+            + ", ".join(unknown)
+            + "; rerun s03-s05 with the current feature pool."
+        )
+    return OrderedDict(
+        (
+            name,
+            OrderedDict([
+                ("feature", name),
+                ("category", str(FEATURE_CATALOG[name]["group"])),
+                ("signals", [str(FEATURE_CATALOG[name]["signal_source"])]),
+                ("formula", str(FEATURE_CATALOG[name]["formula"])),
+                ("preprocessing", str(FEATURE_CATALOG[name]["preprocessing"])),
+                ("unit", str(FEATURE_CATALOG[name]["unit"])),
+                ("numerical_guard", str(FEATURE_CATALOG[name]["numerical_guard"])),
+                ("c_operators", list(FEATURE_CATALOG[name]["c_operators"])),
+                ("c_abs_tolerance", float(FEATURE_CATALOG[name]["c_abs_tolerance"])),
+                ("c_rel_tolerance", float(FEATURE_CATALOG[name]["c_rel_tolerance"])),
+            ]),
+        )
+        for name in selected_features
+    )
+
+    # Legacy name-pattern templates below are intentionally unreachable. They
+    # remain temporarily for a small follow-up deletion after all consumers
+    # have migrated to the catalog-backed payload above.
     # ---- 公式片段模板 ----
     # 按通道替换
     CHANNEL_NAMES = {
@@ -2686,6 +2813,28 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
         json.dump(deploy_config, f, indent=2, ensure_ascii=False)
     print("[OK] deploy_config.json")
 
+    # The deployment package must carry the exact selected-feature contract.
+    fs_ppg = float(bundle["meta"]["fs_ppg"])
+    win_sec = float(bundle["meta"]["win_sec"])
+    stage2_contract = build_selected_feature_contract(
+        selected_features,
+        fs=fs_ppg,
+        window_samples=max(1, int(round(fs_ppg * win_sec))),
+    )
+    stage2_catalog = OrderedDict([
+        ("feature_pool_version", stage2_contract["feature_pool_version"]),
+        ("feature_order", list(stage2_contract["feature_order"])),
+        ("features", stage2_contract["features"]),
+    ])
+    with open(_os.path.join(out_dir, "stage2_feature_catalog.json"),
+              "w", encoding="utf-8") as f:
+        json.dump(stage2_catalog, f, indent=2, ensure_ascii=False)
+    with open(_os.path.join(out_dir, "stage2_c_contract.json"),
+              "w", encoding="utf-8") as f:
+        json.dump(stage2_contract, f, indent=2, ensure_ascii=False)
+    print("[OK] stage2_feature_catalog.json")
+    print("[OK] stage2_c_contract.json")
+
     # 复制已有的 xgboost JSON 模型文件
     model_json_path = _os.path.join(artifact_dir, "final_model.json")
     if _os.path.exists(model_json_path):
@@ -2918,7 +3067,7 @@ def export_tree_feature_usage_plot(artifact_dir):
 
     fig.suptitle("XGBoost Tree Feature Usage Report", fontsize=16, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] s06 tree feature usage plot -> {out_path}")
     return out_path
@@ -2928,9 +3077,25 @@ def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, mo
                         quality_thresholds=None, metadata=None, cache_root="window_outputs"):
     import os as _os, pandas as _pd
     metadata = metadata or {}
-    out_dir = _os.path.join(artifact_dir, cache_root, split)
-    _os.makedirs(out_dir, exist_ok=True)
+    artifact_path = Path(artifact_dir).resolve()
+    cache_path = (artifact_path / _os.fspath(cache_root)).resolve()
+    try:
+        cache_path.relative_to(artifact_path)
+    except ValueError as exc:
+        raise ValueError(
+            f"cache_root={cache_root!r} must resolve under artifact_dir={artifact_path}") from exc
+    out_path = (cache_path / _os.fspath(split)).resolve()
+    try:
+        out_path.relative_to(cache_path)
+    except ValueError as exc:
+        raise ValueError(
+            f"split={split!r} must resolve under cache_root={cache_path}") from exc
+    if out_path == cache_path:
+        raise ValueError("split must name a directory below cache_root")
+    out_path.mkdir(parents=True, exist_ok=True)
+    out_dir = _os.fspath(out_path)
     manifest = []
+    produced_paths = set()
     for r in results:
         try:
             npz_path = write_window_cache_npz(
@@ -2938,6 +3103,11 @@ def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, mo
                 quality_thresholds=quality_thresholds,
                 metadata=metadata,
             )
+            resolved_npz = Path(npz_path).resolve()
+            if resolved_npz.parent != out_path:
+                raise ValueError(
+                    f"cache output {resolved_npz} escaped target split directory {out_path}")
+            produced_paths.add(resolved_npz)
             prob_arr = np.asarray(r.get("window_probs", []), dtype=float)
             enabled_arr = np.asarray(r.get("stage2_enabled_flags", np.ones(len(prob_arr), dtype=int)), dtype=int)
             n_windows = int(len(prob_arr))
@@ -2957,8 +3127,17 @@ def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, mo
                 "fallback": int(bool(r.get("fallback", False))),
                 "fallback_reason": str(r.get("fallback_reason", "")),
             })
-        except Exception:
-            continue
+        except Exception as exc:
+            sample_name = str(r.get("sample_name", "unknown"))
+            raise RuntimeError(
+                f"failed to export window cache for sample {sample_name}: {exc}"
+            ) from exc
+    for existing in out_path.iterdir():
+        resolved_existing = existing.resolve()
+        if (existing.is_file() and existing.suffix.lower() == ".npz"
+                and resolved_existing.parent == out_path
+                and resolved_existing not in produced_paths):
+            existing.unlink()
     if manifest:
         _pd.DataFrame(manifest).to_csv(_os.path.join(out_dir, "manifest.csv"), index=False)
         with open(_os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as f:
@@ -3028,6 +3207,11 @@ def main(args=None):
     print("加载统一模型包")
     print("=" * 80)
     bundle = load_bundle(bundle_path)
+    validate_inference_window_contract(
+        bundle,
+        window_sec=args.window_sec,
+        stride_sec=args.stride_sec,
+    )
     use_stage2_ir = resolve_use_stage2_ir(bundle, args.use_stage2_ir)
     print(f"feature_names: {len(bundle['feature_names'])} 个特征")
     print(f"threshold: {bundle['threshold']}")
@@ -3107,12 +3291,14 @@ def main(args=None):
 
     # 三套指标 + Stage1 target=1 通过率
     sample_summary, details = compute_sample_metrics(
-        results, args.method, postprocess_cfg, bundle["threshold"]
+        results, args.method, postprocess_cfg, bundle["threshold"],
+        stride_sec=args.stride_sec,
     )
     window_model_summary = compute_window_model_metrics(results)
     window_stream_summary = compute_window_stream_metrics(
         results, postprocess_cfg, warmup_frames=args.warmup_frames,
         model_threshold=bundle["threshold"],
+        stride_sec=args.stride_sec,
     )
     stage1_target1_summary = summarize_stage1_target1_pass_rate(results)
 
@@ -3249,6 +3435,7 @@ def main(args=None):
     out_path = os.path.join(args.artifact_dir, f"end_to_end_eval_{args.split}_{args.method}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({
+            "evaluation_contract": build_evaluation_contract(args.split),
             "summary": sample_summary,
             "window_summary": window_stream_summary,         # 向后兼容旧字段
             "window_model_summary": window_model_summary,    # 新增
@@ -4172,7 +4359,7 @@ def export_audit_ranked_error_bars(window_strata, sample_strata, out_dir, top_k=
         ax.legend(frameon=False, loc="lower right")
     fig.tight_layout()
     out_path = out_dir / "audit_ranked_error_bars.png"
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] audit ranked error bars -> {out_path}")
     return str(out_path)
@@ -4227,7 +4414,7 @@ def export_audit_latency_distribution(sample_df, out_dir):
     fig.suptitle("Latency and False-Worn Summary", fontsize=14, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     out_path = out_dir / "audit_latency_distribution.png"
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] audit latency distribution -> {out_path}")
     return str(out_path)
@@ -4298,7 +4485,7 @@ def export_audit_heatmap(strata_df, out_dir, min_support=10):
                               facecolor="white", squeeze=False)
     axes = axes[0]
 
-    cmap = plt.cm.RdYlGn
+    cmap = plt.get_cmap("RdYlGn")
     for idx, metric in enumerate(metric_cols):
         ax = axes[idx]
         col_data = display_data[:, idx].reshape(-1, 1)
@@ -4324,7 +4511,7 @@ def export_audit_heatmap(strata_df, out_dir, min_support=10):
     fig.suptitle(f"Generalization Audit — Stratified Metrics (min_support={min_support})",
                  fontsize=14, weight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(out_path, dpi=180, bbox_inches="tight")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] audit heatmap -> {out_path}")
     return out_path

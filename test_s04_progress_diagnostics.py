@@ -47,14 +47,14 @@ def test_diagnostics_can_reuse_cleaning_result_without_reclean(monkeypatch):
     df_train = pd.DataFrame({
         "sample_name": ["a", "a", "b", "b"],
         "target": [0, 0, 1, 1],
-        "f_keep": [0.1, 0.2, 0.8, 0.9],
-        "f_removed": [1.0, 1.0, 1.0, 1.0],
+        "GREEN_AC_RMS": [0.1, 0.2, 0.8, 0.9],
+        "GREEN_DC_MEDIAN": [1.0, 1.0, 1.0, 1.0],
     })
     df_valid = pd.DataFrame({
         "sample_name": ["v0", "v1"],
         "target": [0, 1],
-        "f_keep": [0.15, 0.85],
-        "f_removed": [1.0, 1.0],
+        "GREEN_AC_RMS": [0.15, 0.85],
+        "GREEN_DC_MEDIAN": [1.0, 1.0],
     })
 
     def fail_if_reclean(*_args, **_kwargs):
@@ -64,13 +64,13 @@ def test_diagnostics_can_reuse_cleaning_result_without_reclean(monkeypatch):
     diag = s04.compute_all_feature_diagnostics(
         df_train,
         df_valid,
-        ["f_keep", "f_removed"],
-        kept_features=["f_keep"],
-        removed_map={"low_variance": ["f_removed"]},
-        fill_values={"f_keep": 0.2, "f_removed": 1.0},
+        ["GREEN_AC_RMS", "GREEN_DC_MEDIAN"],
+        kept_features=["GREEN_AC_RMS"],
+        removed_map={"low_variance": ["GREEN_DC_MEDIAN"]},
+        fill_values={"GREEN_AC_RMS": 0.2, "GREEN_DC_MEDIAN": 1.0},
     )
 
-    removed = diag.set_index("feature").loc["f_removed"]
+    removed = diag.set_index("feature").loc["GREEN_DC_MEDIAN"]
     assert int(removed["removed"]) == 1
     assert removed["removed_reason"] == "low_variance"
 

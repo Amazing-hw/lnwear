@@ -39,6 +39,7 @@ from s03_extract_feature_pool import (
     get_channels_from_window,
     is_prewindowed_signal,
     load_acc,
+    load_grouped_window_metadata,
     load_ppg,
     moving_average_filter,
     normalized_autocorr,
@@ -62,6 +63,7 @@ from s06_deploy_eval import (
     load_bundle,
     resolve_use_stage2_ir,
 )
+from scientific_figures import save_scientific_figure
 
 
 EPS = 1e-12
@@ -162,7 +164,9 @@ def _adaboost_classifier(random_state: int = 42):
     try:
         return AdaBoostClassifier(estimator=tree, n_estimators=16, random_state=random_state)
     except TypeError:
-        return AdaBoostClassifier(base_estimator=tree, n_estimators=16, random_state=random_state)
+        model = AdaBoostClassifier(n_estimators=16, random_state=random_state)
+        model.set_params(base_estimator=tree)
+        return model
 
 
 def _make_png_path(path: Path) -> str:
@@ -223,6 +227,20 @@ def _load_sample_arrays(sample):
     if not ok:
         raise ValueError(err)
     return load_ppg(sample), load_acc(sample)
+
+
+def _prewindow_targets(sample, n_windows):
+    """Return one label per pre-windowed record, preserving grouped metadata."""
+    metadata = load_grouped_window_metadata(sample)
+    labels = list(metadata.get("window_labels", [])) if metadata else []
+    if labels and len(labels) != int(n_windows):
+        raise ValueError(
+            f"sample {sample.get('sample_name', 'unknown')} grouped-window label count "
+            f"{len(labels)} does not match PPG window count {int(n_windows)}"
+        )
+    if not labels:
+        labels = [int(sample.get("target", 0))] * int(n_windows)
+    return [int(value) for value in labels]
 
 
 def _to_25hz(sample, ppg, acc):
@@ -289,6 +307,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
         "target": int(sample.get("target", 0)),
         "stage1_pass": True,
         "features": [],
+        "window_targets": [],
         "stage2_enabled_flags": [],
         "fallback": False,
         "fallback_reason": None,
@@ -296,6 +315,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
     try:
         ppg, acc = _load_sample_arrays(sample)
         if is_prewindowed_signal(ppg):
+            base["window_targets"] = _prewindow_targets(sample, ppg.shape[0])
             mode = detect_green_mode(ppg)
             for idx in range(ppg.shape[0]):
                 raw_window = ppg[idx]
@@ -328,6 +348,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
     n_s1 = (len(ir_5hz) - s1_win) // s1_stride + 1
     n_s2 = (len(ppg_25) - s2_win) // s2_stride + 1
     n_steps = max(0, n_s2)
+    base["window_targets"] = [base["target"]] * n_steps
 
     mode = detect_green_mode(ppg)
     gate = CommercialStage1Gate(dc_threshold, K=STAGE1_GATE_K)
@@ -382,7 +403,8 @@ def collect_commercial_training_windows(samples, dc_threshold: float):
                 continue
             if len(feature_vec) == len(COMMERCIAL_FEATURE_NAMES) and np.isfinite(feature_vec).all():
                 X.append(feature_vec)
-                y.append(result["target"])
+                window_targets = result.get("window_targets", [])
+                y.append(int(window_targets[idx]) if idx < len(window_targets) else int(result["target"]))
                 diag["valid_windows"] += 1
             else:
                 diag["invalid_feature_windows"] += 1
@@ -455,6 +477,7 @@ def _finalize_commercial_results(raw_results, threshold: float):
             "fallback_reason": raw.get("fallback_reason"),
             "window_probs": probs,
             "window_preds": window_preds,
+            "window_targets": [int(value) for value in raw.get("window_targets", [])],
             "window_states": [],
             "window_scores": [],
             "stage2_enabled_flags": list(raw.get("stage2_enabled_flags", [])),
@@ -471,8 +494,9 @@ def window_metrics_from_details(details, count_key: str = "total_windows"):
     y_true, y_pred = [], []
     for detail in details:
         target = int(detail.get("target", 0))
-        for pred in detail.get("window_preds", []):
-            y_true.append(target)
+        targets = detail.get("window_targets", [])
+        for idx, pred in enumerate(detail.get("window_preds", [])):
+            y_true.append(int(targets[idx]) if idx < len(targets) else target)
             y_pred.append(int(pred))
     return _metrics(y_true, y_pred, count_key=count_key)
 
@@ -484,7 +508,7 @@ def _apply_state_machine_to_details(details, threshold: float, postprocess_cfg):
     for detail in details:
         probs = [float(p) for p in detail.get("window_probs", [])]
         if detail.get("fallback") or not detail.get("stage1_pass", False) or len(probs) == 0:
-            detail["pred"] = 0
+            detail["stream_pred"] = 0
             detail["window_states"] = []
             detail["window_scores"] = []
             continue
@@ -495,7 +519,7 @@ def _apply_state_machine_to_details(details, threshold: float, postprocess_cfg):
             cfg,
             threshold,
         )
-        detail["pred"] = int(pred)
+        detail["stream_pred"] = int(pred)
         detail["window_states"] = [int(s) for s in states]
         detail["window_scores"] = [float(s) for s in scores]
     return cfg
@@ -641,6 +665,7 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
         "mode": 0,
         "window_probs": [],
         "window_preds": [],
+        "window_targets": [],
         "stage2_enabled_flags": [],
         "fallback": False,
         "fallback_reason": None,
@@ -651,6 +676,8 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
             mode = detect_green_mode(ppg)
             base["mode"] = int(mode)
             first_step = max(0, int(skip_initial_windows))
+            all_targets = _prewindow_targets(sample, ppg.shape[0])
+            base["window_targets"] = all_targets[first_step:]
             n_steps = max(0, ppg.shape[0] - first_step)
             probs = np.zeros(n_steps, dtype=float)
             window_preds = np.zeros(n_steps, dtype=int)
@@ -707,6 +734,7 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
     n_s1 = (len(ir_5hz) - s1_win) // s1_stride + 1
     n_s2 = (len(ppg_25) - s2_win) // s2_stride + 1
     n_steps = max(0, n_s2)
+    base["window_targets"] = [base["target"]] * n_steps
 
     gate = Stage1StreamingGate(
         stage1["dc_threshold"],
@@ -782,6 +810,7 @@ def _finalize_project_detail(base, method, postprocess_cfg, model_threshold):
         "mode": int(base.get("mode", 0)),
         "window_probs": [float(p) for p in probs],
         "window_preds": [int(p) for p in window_preds],
+        "window_targets": [int(value) for value in base.get("window_targets", [])],
         "window_states": [int(s) for s in states],
         "window_scores": [float(s) for s in scores],
         "stage2_enabled_flags": list(base.get("stage2_enabled_flags", [])),
@@ -989,7 +1018,7 @@ def _annotate_bars(ax, bars, fmt="{:.2f}"):
         ax.text(bar.get_x() + bar.get_width() / 2, h + 0.015, fmt.format(h), ha="center", va="bottom", fontsize=8)
 
 
-def plot_summary(report, out_dir: Path):
+def plot_summary(report, out_dir: Path, inputs=()):
     out_path = Path(_make_png_path(out_dir / "commercial_compare_summary.png"))
     commercial = report["commercial"]
     project = report["project"]
@@ -1025,12 +1054,30 @@ def plot_summary(report, out_dir: Path):
     _draw_confusion(axes[1, 1], project["summary"]["confusion_matrix"], "Deployed sample confusion")
 
     fig.tight_layout(rect=[0, 0, 1, 0.94])
-    fig.savefig(out_path, bbox_inches="tight")
+    source_rows = []
+    for scope in ("summary", "window_stream_summary"):
+        for model_name, payload in (("commercial", commercial), ("project", project)):
+            for metric in metrics:
+                source_rows.append({
+                    "panel": scope, "model": model_name, "metric": metric,
+                    "value": payload[scope][metric],
+                })
+    split = str(report.get("metadata", {}).get("split", "comparison"))
+    save_scientific_figure(
+        fig, out_path, source_data=source_rows,
+        core_conclusion="The deployed model is compared with the commercial baseline at sample and streaming-window levels.",
+        panel_map={"a": "Sample metrics.", "b": "Streaming-window metrics.", "c": "Commercial confusion matrix.", "d": "Deployed confusion matrix."},
+        inputs=inputs, split=split,
+        n_definition="paired samples and their causal streaming windows",
+        statistics={"comparison": "paired point estimates"},
+        reviewer_risks=["Windows within one sample are correlated."],
+        test_read_only=split.lower() == "test",
+    )
     plt.close(fig)
     return str(out_path)
 
 
-def plot_probabilities(report, out_dir: Path):
+def plot_probabilities(report, out_dir: Path, inputs=()):
     out_path = Path(_make_png_path(out_dir / "commercial_compare_probabilities.png"))
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8), dpi=160, sharey=True)
     for ax, key, title, color in [
@@ -1049,12 +1096,29 @@ def plot_probabilities(report, out_dir: Path):
         ax.legend(frameon=False)
     axes[0].set_ylabel("Window count")
     fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    source_rows = [
+        {"model": key, "sample_name": detail.get("sample_name"), "target": detail["target"], "probability": float(probability)}
+        for key in ("commercial", "project")
+        for detail in report[key]["details"]
+        for probability in detail.get("window_probs", [])
+        if probability is not None and np.isfinite(probability)
+    ]
+    split = str(report.get("metadata", {}).get("split", "comparison"))
+    save_scientific_figure(
+        fig, out_path, source_data=source_rows,
+        core_conclusion="Window-probability separation is compared for the commercial and deployed models.",
+        panel_map={"a": "Commercial probability distributions.", "b": "Deployed probability distributions."},
+        inputs=inputs, split=split,
+        n_definition="one row per finite window probability",
+        statistics={"display": "fixed-width probability histograms"},
+        reviewer_risks=["Window probabilities are correlated within samples."],
+        test_read_only=split.lower() == "test",
+    )
     plt.close(fig)
     return str(out_path)
 
 
-def plot_disagreements(report, out_dir: Path):
+def plot_disagreements(report, out_dir: Path, inputs=()):
     out_path = Path(_make_png_path(out_dir / "commercial_compare_disagreements.png"))
     categories = report["paired_comparison"]["categories"]
     names = [
@@ -1086,18 +1150,32 @@ def plot_disagreements(report, out_dir: Path):
     for bar in bars:
         ax.text(bar.get_width() + 0.15, bar.get_y() + bar.get_height() / 2, int(bar.get_width()), va="center", fontsize=9)
     fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    source_rows = [
+        {"category": name, "label": label, "sample_count": value}
+        for name, label, value in zip(names, labels, values)
+    ]
+    split = str(report.get("metadata", {}).get("split", "comparison"))
+    save_scientific_figure(
+        fig, out_path, source_data=source_rows,
+        core_conclusion="Paired outcomes identify which model owns each sample-level error and false positive.",
+        panel_map={"a": "Paired correctness and false-positive ownership counts."},
+        inputs=inputs, split=split,
+        n_definition="one paired outcome category per row",
+        statistics={"comparison": "paired sample counts"},
+        reviewer_risks=["Small disagreement strata may be unstable."],
+        test_read_only=split.lower() == "test",
+    )
     plt.close(fig)
     return str(out_path)
 
 
-def export_comparison_plots(report, out_dir):
+def export_comparison_plots(report, out_dir, inputs=()):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {
-        "summary": plot_summary(report, out_dir),
-        "probabilities": plot_probabilities(report, out_dir),
-        "disagreements": plot_disagreements(report, out_dir),
+        "summary": plot_summary(report, out_dir, inputs=inputs),
+        "probabilities": plot_probabilities(report, out_dir, inputs=inputs),
+        "disagreements": plot_disagreements(report, out_dir, inputs=inputs),
     }
     return paths
 
@@ -1204,9 +1282,11 @@ def main(argv=None):
         "elapsed_sec": None,
     }
     report = build_comparison_report(commercial_eval, project_eval, metadata)
-    plot_paths = export_comparison_plots(report, out_dir)
     window_compare_path = export_window_metric_comparison_csv(report, out_dir)
     accuracy_scope_path = export_accuracy_scope_csv(report, out_dir)
+    plot_paths = export_comparison_plots(
+        report, out_dir, inputs=[window_compare_path, accuracy_scope_path]
+    )
     report["metadata"]["plot_paths"] = plot_paths
     report["metadata"]["window_level_compare_csv"] = window_compare_path
     report["metadata"]["accuracy_scope_compare_csv"] = accuracy_scope_path

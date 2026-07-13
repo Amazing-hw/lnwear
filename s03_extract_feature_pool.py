@@ -43,6 +43,15 @@ import pandas as pd
 
 from scipy.signal import resample_poly  # only for polyphase downsampling (C has equivalent)
 
+from stage2_feature_catalog import (
+    FEATURE_CATALOG,
+    FEATURE_POOL_VERSION as STAGE2_FEATURE_POOL_VERSION,
+    feature_record as stage2_feature_record,
+    is_model_candidate as is_stage2_model_candidate,
+    model_candidate_names as stage2_model_candidate_names,
+    validate_candidate_names as validate_stage2_candidate_names,
+)
+
 # =========================================================
 # 基本配置
 # =========================================================
@@ -103,6 +112,109 @@ def multiprocessing_context_from_env():
         return None
     import multiprocessing as mp
     return mp.get_context(method)
+
+
+def export_feature_pool_analysis_plot(frames, artifact_dir):
+    """Export split coverage, numerical quality, groups, and top separation as PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scientific_figures import save_scientific_figure
+
+    parts = [part for part in ("train", "valid", "test") if part in frames]
+    candidate_names = stage2_model_candidate_names()
+    source_rows = []
+    window_counts = {part: [] for part in parts}
+    finite_rates = []
+    for part in parts:
+        frame = frames[part]
+        for target in (0, 1):
+            count = int((frame.get("target", pd.Series(dtype=int)) == target).sum())
+            window_counts[part].append(count)
+            source_rows.append({"panel": "window_count", "split": part, "target": target, "value": count})
+        available = [name for name in candidate_names if name in frame.columns]
+        values = frame[available].to_numpy(dtype=float) if available and len(frame) else np.empty((0, 0))
+        finite_rate = float(np.isfinite(values).mean()) if values.size else 0.0
+        finite_rates.append(finite_rate)
+        source_rows.append({"panel": "finite_rate", "split": part, "value": finite_rate})
+
+    group_counts = OrderedDict()
+    for name in candidate_names:
+        group = str(stage2_feature_record(name)["group"])
+        group_counts[group] = group_counts.get(group, 0) + 1
+        source_rows.append({"panel": "feature_group", "group": group, "feature": name, "value": 1})
+
+    separations = []
+    train = frames.get("train", pd.DataFrame())
+    if len(train) and "target" in train.columns:
+        for name in candidate_names:
+            if name not in train.columns:
+                continue
+            x0 = pd.to_numeric(train.loc[train["target"] == 0, name], errors="coerce")
+            x1 = pd.to_numeric(train.loc[train["target"] == 1, name], errors="coerce")
+            pooled = float(pd.concat([x0, x1]).std(ddof=0))
+            score = abs(float(x1.mean()) - float(x0.mean())) / max(pooled, 1e-12)
+            if np.isfinite(score):
+                separations.append((name, score))
+    separations = sorted(separations, key=lambda item: (-item[1], item[0]))[:12]
+    for rank, (name, score) in enumerate(separations, start=1):
+        source_rows.append({"panel": "train_separation", "rank": rank, "feature": name, "value": score})
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), facecolor="white")
+    x = np.arange(len(parts))
+    c0 = [window_counts[part][0] for part in parts]
+    c1 = [window_counts[part][1] for part in parts]
+    axes[0, 0].bar(x, c0, color="#4C78A8", label="not worn")
+    axes[0, 0].bar(x, c1, bottom=c0, color="#E07B53", label="worn")
+    axes[0, 0].set_xticks(x, parts)
+    axes[0, 0].set_ylabel("windows")
+    axes[0, 0].set_title("Window coverage", loc="left", weight="bold")
+    axes[0, 0].legend(frameon=False)
+    axes[0, 1].bar(x, finite_rates, color="#2A9D8F")
+    axes[0, 1].set_xticks(x, parts)
+    axes[0, 1].set_ylim(0, 1.01)
+    axes[0, 1].set_ylabel("finite fraction")
+    axes[0, 1].set_title("Numerical completeness", loc="left", weight="bold")
+    group_names = list(group_counts)
+    axes[1, 0].barh(group_names, list(group_counts.values()), color="#6C8EBF")
+    axes[1, 0].set_xlabel("features")
+    axes[1, 0].set_title("Interpretable feature groups", loc="left", weight="bold")
+    if separations:
+        labels = [name for name, _score in separations][::-1]
+        scores = [score for _name, score in separations][::-1]
+        axes[1, 1].barh(labels, scores, color="#C89B3C")
+        axes[1, 1].set_xlabel("standardized mean difference")
+    else:
+        axes[1, 1].text(0.5, 0.5, "No train separation data", ha="center", va="center")
+        axes[1, 1].set_axis_off()
+    axes[1, 1].set_title("Top train-only separation", loc="left", weight="bold")
+    fig.suptitle("Stage2 feature-pool audit", fontsize=14, weight="bold", x=0.04, ha="left")
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+
+    artifact_dir = os.fspath(artifact_dir)
+    out_path = os.path.join(artifact_dir, "report_plots", "s03_feature_pool_analysis.png")
+    inputs = [
+        os.path.join(artifact_dir, f"feature_pool_{part}.csv")
+        for part in parts
+        if os.path.isfile(os.path.join(artifact_dir, f"feature_pool_{part}.csv"))
+    ]
+    outputs = save_scientific_figure(
+        fig, out_path, source_data=source_rows,
+        core_conclusion="The Stage2 pool is complete, numerically finite, physically grouped, and diagnostically diverse before manual selection.",
+        panel_map={
+            "a": "Window counts by split and target.",
+            "b": "Finite feature-value rate by split.",
+            "c": "Governed feature counts by interpretable group.",
+            "d": "Top train-only standardized class separations.",
+        },
+        inputs=inputs,
+        split="train_valid_test",
+        n_definition="windows for coverage/finite panels and governed features for group/separation panels",
+        statistics={"separation": "absolute train-only standardized mean difference", "interval": "none"},
+        reviewer_risks=["Train-only separation is descriptive and must not replace grouped validation evidence."],
+    )
+    plt.close(fig)
+    return outputs
 
 # 已知高冗余特征（节省计算，尤其 Entropy/Derivative 类 O(N²) 操作）
 # 这些特征在 s04 清洗阶段也会被 VIF/高相关移除，提前在 s03 跳过以加速提取
@@ -396,11 +508,12 @@ def detect_green_mode(ppg):
     """
     if is_prewindowed_signal(ppg):
         ppg = flatten_prewindowed_signal(ppg)
+    ppg = np.asarray(ppg, dtype=np.float64)
     if ppg.shape[1] >= 6:
-        var_ch0 = np.var(ppg[:, 0])
-        var_ch3 = np.var(ppg[:, 3])
-        var_ch4 = np.var(ppg[:, 4])
-        var_ch5 = np.var(ppg[:, 5])
+        var_ch0 = np.var(finite_signal(ppg[:, 0]))
+        var_ch3 = np.var(finite_signal(ppg[:, 3]))
+        var_ch4 = np.var(finite_signal(ppg[:, 4]))
+        var_ch5 = np.var(finite_signal(ppg[:, 5]))
 
         mode1_var = (var_ch3 + var_ch4 + var_ch5) / 3.0
         mode2_var = var_ch0
@@ -437,7 +550,11 @@ def get_channels_from_window(window, mode):
     else:
         ambient = window[:, 0]
 
-    if mode == 1 and window.shape[1] >= 6:
+    if mode == 0 and window.shape[1] >= 5:
+        g1 = window[:, 2]
+        g2 = window[:, 3]
+        g3 = window[:, 4]
+    elif mode == 1 and window.shape[1] >= 6:
         g1 = window[:, 3]
         g2 = window[:, 4]
         g3 = window[:, 5]
@@ -565,69 +682,17 @@ def filter_stage2_ir_features(features):
     return [f for f in features if not is_stage2_ir_feature(f)]
 
 
-DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
-    "SQI_FLAT_RATIO", "SQI_SPIKE_RATIO",
-    "GREEN_ROBUST_RANGE_RATIO", "AMB_ROBUST_RANGE_RATIO",
-    "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
-    "G_mean_mean", "G_mean_std", "G_mean_diff_std", "G_mean_acdc",
-    "GREEN_DC_MEDIAN", "GREEN_DC_IQR", "GREEN_AC_RMS", "GREEN_AC_MAD",
-    "GREEN_AC_DC_RATIO", "GREEN_DERIV_MAD",
-    "Ambient_mean", "Ambient_std", "Ambient_p95", "corr_Ambient_Gmean",
-    "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
-    "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
-    "GREEN_AC", "AMB_AC", "GREEN_DC", "AMB_DC", "GREEN_CORR", "GREEN_XCORR",
-    "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
-    "GREEN_AMB_BP_CORR", "GREEN_AMB_ENV_CORR", "GREEN_AMB_LEAK",
-    "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
-    "G_rangeNorm_mean", "G_rangeNorm_p90",
-    "G_spatial_vmag_mean", "G_spatial_vmag_p90", "G_spatial_vmag_iqr",
-    "G_spatial_vmag_std", "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
-    "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
-    "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
-    "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
-    "G_TOP1_TO_TOP2_AC_RATIO", "G_TOP2_RANK_STABILITY", "G_TOP2_SWITCH_RATE",
-    "G_SPATIAL_VMAG_RANGE", "GREEN_AMB_SEG_CORR_RANGE",
-    "GTOP2_ROBUST_RANGE_RATIO", "GTOP2_SEG_ACDC_CV",
-    "GTOP2_DC_MEDIAN", "GTOP2_DC_IQR", "GTOP2_AC_RMS", "GTOP2_AC_MAD",
-    "GTOP2_AC_DC_RATIO", "GTOP2_DERIV_MAD",
-    "GTOP2_bp_skewness", "GTOP2_bp_kurtosis",
-    "GTOP2_zero_cross_rate", "GTOP2_abs_diff_ratio",
-    "GTOP2_HALF_ACDC_DELTA", "GTOP2_SEG_ACDC_RANGE",
-    "GREEN_AMB_LEAK_STABILITY",
-    "ACC_MAG_MEAN", "ACC_MAG_STD", "ACC_MAG_MAD", "ACC_AXIS_STD_SUM",
-    "ACC_GRAVITY_DOM_RATIO", "ACC_BP_RMS", "ACC_DIFF_MAD", "ACC_STILL_SCORE",
-    "ACC_MAG_P50", "ACC_MAG_P90", "ACC_YSUM",
-    "ACC_X_MEAN", "ACC_Y_MEAN", "ACC_Z_MEAN",
-    "ACC_X_STD", "ACC_Y_STD", "ACC_Z_STD",
-    "ACC_X_ENERGY", "ACC_Y_ENERGY", "ACC_Z_ENERGY",
-    "ACC_AXIS_MEAN_SUM", "ACC_MAG_ENERGY", "ACC_MAG_P2P",
-    "ACC_TILT_ANGLE", "ACC_DOM_AXIS", "ACC_GRAVITY_RATIO",
-    "ACC_ENERGY_TO_GREEN_AC", "ACC_GREEN_BP_CORR",
-    "ACC_TO_GTOP2_AC_RATIO", "ACC_STILL_X_GREEN_STABILITY",
-    "ACC_DIFF_TO_GTOP2_DIFF_RATIO", "ACC_STILL_GREEN_MISMATCH",
-    "SIG_LEN", "SIG_SEC", "mode",
-    "TOTAL_INVALID_COUNT", "PPG_INVALID_COUNT", "GREEN_INVALID_COUNT",
-}
-
 DEPLOYMENT_ALLOWED_FFT_FEATURES = {
-    "GTOP2_BAND_ENERGY_RATIO",
-    "GTOP2_FFT_PEAK_MEDIAN_RATIO",
-    "GTOP2_DOM_FREQ",
-    "GREEN_BAND_ENERGY_RATIO",
-    "GREEN_FFT_PEAK_MEDIAN_RATIO",
-    "GREEN_DOM_FREQ",
-    "FFT_PEAK_MEDIAN_RATIO",
-    "AMB_BAND_ENERGY_RATIO",
-    "AMB_FFT_PEAK_MEDIAN_RATIO",
-    "AMB_DOM_FREQ",
-    "AMBX_FFT_PEAK_MEDIAN_RATIO",
-    "AMBX_DOM_FREQ",
+    name for name, record in FEATURE_CATALOG.items() if bool(record.get("fft"))
 }
+DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = (
+    set(FEATURE_CATALOG) - DEPLOYMENT_ALLOWED_FFT_FEATURES
+)
 
 
 def is_deployment_friendly_stage2_feature(name):
-    """All features pass — s03 uses only C-friendly numpy operations."""
-    return True
+    """Return whether a feature belongs to the governed Stage2 model surface."""
+    return is_stage2_model_candidate(name)
 
 
 def filter_deployment_friendly_stage2_features(features):
@@ -891,7 +956,7 @@ def compute_fft_cache(x, fs, fmin=0.5, fmax=5.0):
     返回：
         dict: 包含 peak_ratio, dom_freq, spec, freqs 等
     """
-    x = np.asarray(x, dtype=np.float64)
+    x = finite_signal(x)
     
     result = {
         'peak_ratio': 0.0,
@@ -1064,7 +1129,7 @@ def robust_range_ratio(x):
         return 0.0
     p95, p5 = np.percentile(x, [95, 5])
     med = float(np.median(x))
-    return safe_div(float(p95 - p5), abs(med) + EPS)
+    return guarded_ratio(float(p95 - p5), abs(med), scale=x)
 
 
 def segment_acdc_cv(raw, n_segments=3):
@@ -1080,11 +1145,11 @@ def segment_acdc_cv(raw, n_segments=3):
             continue
         dc = float(np.median(seg))
         ac = robust_mad(np.diff(seg)) if len(seg) > 1 else 0.0
-        vals.append(safe_div(ac, abs(dc) + EPS))
+        vals.append(guarded_ratio(ac, abs(dc), scale=seg))
     if len(vals) < 2:
         return 0.0
     vals = np.asarray(vals, dtype=np.float64)
-    return safe_div(float(np.std(vals)), abs(float(np.mean(vals))) + EPS)
+    return guarded_ratio(float(np.std(vals)), abs(float(np.mean(vals))), scale=vals)
 
 
 def segment_acdc_values(raw, n_segments=3):
@@ -1100,7 +1165,7 @@ def segment_acdc_values(raw, n_segments=3):
             continue
         dc = float(np.median(seg))
         ac = robust_mad(np.diff(seg)) if len(seg) > 1 else 0.0
-        vals.append(safe_div(ac, abs(dc) + EPS))
+        vals.append(guarded_ratio(ac, abs(dc), scale=seg))
     return vals
 
 
@@ -1144,16 +1209,18 @@ def segment_stability_features(raw, prefix):
     half_vals = segment_acdc_values(raw, n_segments=2)
     third_vals = segment_acdc_values(raw, n_segments=3)
     if len(half_vals) == 2:
-        feat[f"{prefix}_HALF_ACDC_DELTA"] = safe_div(
+        feat[f"{prefix}_HALF_ACDC_DELTA"] = guarded_ratio(
             abs(float(half_vals[0]) - float(half_vals[1])),
-            abs(float(np.mean(half_vals))) + EPS,
+            abs(float(np.mean(half_vals))),
+            scale=half_vals,
         )
     else:
         feat[f"{prefix}_HALF_ACDC_DELTA"] = 0.0
     if len(third_vals) >= 2:
-        feat[f"{prefix}_SEG_ACDC_RANGE"] = safe_div(
+        feat[f"{prefix}_SEG_ACDC_RANGE"] = guarded_ratio(
             float(np.max(third_vals) - np.min(third_vals)),
-            abs(float(np.mean(third_vals))) + EPS,
+            abs(float(np.mean(third_vals))),
+            scale=third_vals,
         )
     else:
         feat[f"{prefix}_SEG_ACDC_RANGE"] = 0.0
@@ -1166,8 +1233,11 @@ def ambient_green_leak_stability(amb_raw, green_raw):
     n = min(len(amb_vals), len(green_vals))
     if n < 2:
         return 0.0
-    ratios = [safe_div(amb_vals[i], green_vals[i] + EPS) for i in range(n)]
-    return safe_div(float(np.std(ratios)), abs(float(np.mean(ratios))) + EPS)
+    ratios = [
+        guarded_ratio(amb_vals[i], green_vals[i], scale=green_vals)
+        for i in range(n)
+    ]
+    return guarded_ratio(float(np.std(ratios)), abs(float(np.mean(ratios))), scale=ratios)
 
 
 def segment_corr_range(x, y, n_segments=3):
@@ -1202,7 +1272,7 @@ def band_energy_ratio_from_fft_cache(fft_cache, low=0.7, high=3.0):
     band_mask = (freqs >= low) & (freqs <= high)
     total = float(np.sum(spec[total_mask] ** 2))
     band = float(np.sum(spec[band_mask] ** 2))
-    return safe_div(band, total + EPS)
+    return guarded_ratio(band, total, scale=spec)
 
 
 def _diff_flat_ratio(x):
@@ -1928,60 +1998,6 @@ def extract_temporal_dynamic_features(x, fs=100.0, prefix=""):
     return feat
 
 
-# =========================================================
-# 统一窗口级特征提取函数（供训练和部署共用）
-# =========================================================
-
-def extract_window_features(ppg_window, fs=25.0, acc_window=None,
-                            use_stage2_ir=DEFAULT_USE_STAGE2_IR):
-    """
-    统一的窗口级特征提取函数。
-    训练（s03）和部署（s06）都调用此函数，保证一致性。
-
-    参数:
-        ppg_window: shape (N, C)，C 至少包含 6 通道
-                    约定通道顺序: [IR, Ambient, G1, G2, G3, ...]
-        fs: 采样率，默认100Hz
-        acc_window: shape (M, 3) 加速度计数据，可选
-
-    返回:
-        OrderedDict 形式的特征字典
-    """
-    ppg = np.asarray(ppg_window, dtype=np.float64)
-    if ppg.ndim == 1:
-        ppg = ppg.reshape(-1, 1)
-
-    if ppg.shape[1] < 6:
-        raise ValueError(f"ppg_window 需要至少6通道，当前只有{ppg.shape[1]}通道")
-
-    ir = apply_stage2_ir_policy(ppg[:, 0], use_stage2_ir=use_stage2_ir)
-    ambient = ppg[:, 1] if ppg.shape[1] > 1 else np.zeros_like(ir)
-    g1 = ppg[:, 2] if ppg.shape[1] > 2 else np.zeros_like(ir)
-    g2 = ppg[:, 3] if ppg.shape[1] > 3 else g1
-    g3 = ppg[:, 4] if ppg.shape[1] > 4 else g1
-
-    # 用 return_preprocessed 复用 g1_bp / ir_bp，避免再调两次 preprocess_signal
-    feat, preprocessed = extract_feature_pool_from_window(
-        ir, ambient, g1, g2, g3, fs, return_preprocessed=True
-    )
-
-    feat.update(extract_acc_features(acc_window, fs=fs, prefix="ACC"))
-
-    green_bp = preprocessed.get("g_top2_bp") if ppg.shape[1] > 2 else None
-    green_raw = preprocessed.get("g_top2_raw") if ppg.shape[1] > 2 else None
-    if green_bp is not None:
-        feat.update(extract_acc_ppg_cross_features(acc_window, green_bp, fs=fs))
-        _g_ac = float(np.sqrt(np.mean(green_bp ** 2)))
-        feat["ACC_ENERGY_TO_GREEN_AC"] = safe_div(feat.get("ACC_MAG_ENERGY", 0.0), _g_ac)
-    else:
-        feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
-    if green_raw is not None and green_bp is not None:
-        feat.update(extract_acc_green_coupling_features(acc_window, green_raw, green_bp))
-
-    # filter_deployment_friendly_stage2_features disabled: all features C-friendly
-    return feat
-
-
 def align_acc_window(acc, ppg_len, start_ppg, win_ppg, fs_ppg=100.0, fs_acc=None):
     """
     按时间比例对齐ACC窗口。
@@ -2006,7 +2022,7 @@ def align_acc_window(acc, ppg_len, start_ppg, win_ppg, fs_ppg=100.0, fs_acc=None
 # 单窗口特征提取主函数（保留原有接口，内部被extract_window_features调用）
 # =========================================================
 
-def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_preprocessed=False):
+def _extract_legacy_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_preprocessed=False):
     """
     输入：
         ir, ambient, g1, g2, g3: 5秒窗口信号 (默认已降采样至 25Hz)
@@ -2260,8 +2276,8 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     _fc = fft_cache['green']
     if _fc.get('band_spec') is not None and len(_fc['band_spec']) > 0:
-        _bs = _fc['band_spec']
-        _bf = _fc['band_freqs']
+        _bs = np.asarray(_fc['band_spec'], dtype=float)
+        _bf = np.asarray(_fc['band_freqs'], dtype=float)
         _peak_val = np.max(_bs)
         _above_half = _bs > _peak_val * 0.5
         feat["GREEN_FFT_peak_width_Hz"] = float(_bf[_above_half][-1] - _bf[_above_half][0]) if np.any(_above_half) else 0.0
@@ -2276,8 +2292,8 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # 谐波比: 2倍频功率 / 基频功率 (真实 PPG 有谐波结构，噪声没有)
     _fc = fft_cache['green']
     if _fc.get('band_spec') is not None and len(_fc['band_spec']) > 0:
-        _bs = _fc['band_spec']
-        _bf = _fc['band_freqs']
+        _bs = np.asarray(_fc['band_spec'], dtype=float)
+        _bf = np.asarray(_fc['band_freqs'], dtype=float)
         _f0_idx = int(np.argmax(_bs))
         _f0 = _bf[_f0_idx]
         _f0_power = float(_bs[_f0_idx] ** 2)
@@ -2331,8 +2347,8 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     # =====================================================
     _fc_amb = fft_cache['amb']
     if _fc_amb.get('band_spec') is not None and len(_fc_amb['band_spec']) > 0:
-        _bs = _fc_amb['band_spec']
-        _bf = _fc_amb['band_freqs']
+        _bs = np.asarray(_fc_amb['band_spec'], dtype=float)
+        _bf = np.asarray(_fc_amb['band_freqs'], dtype=float)
         feat["AMB_DOM_FREQ"] = float(_bf[int(np.argmax(_bs))])
         feat["AMB_FFT_PEAK_MEDIAN_RATIO"] = float(_fc_amb.get('peak_ratio', 0.0))
     else:
@@ -2438,6 +2454,490 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     
     return feat
 
+
+def _scale_floor(x, relative=1e-6, absolute=1e-9):
+    x = finite_signal(x)
+    if len(x) == 0:
+        return float(absolute)
+    scale = float(np.median(np.abs(x)))
+    return float(max(scale * float(relative), float(absolute)))
+
+
+def guarded_ratio(numerator, denominator, scale=None, relative=1e-6, absolute=1e-9):
+    """Finite ratio with a signal-scale denominator floor suitable for C."""
+    num = float(numerator)
+    den = float(denominator)
+    if not np.isfinite(num):
+        num = 0.0
+    if not np.isfinite(den):
+        den = 0.0
+    if scale is None:
+        scale_value = abs(den)
+    elif np.isscalar(scale):
+        scale_value = abs(float(scale))
+    else:
+        scale_value = _scale_floor(scale, relative=1.0, absolute=absolute)
+    floor = max(scale_value * float(relative), float(absolute))
+    signed_den = den if abs(den) >= floor else (floor if den >= 0 else -floor)
+    return float(num / signed_den)
+
+
+def guarded_corr(x, y, relative_std_floor=1e-6):
+    """Correlation with finite replacement and scale-aware variance guards."""
+    x = finite_signal(x)
+    y = finite_signal(y)
+    n = min(len(x), len(y))
+    if n < 8:
+        return 0.0
+    x = x[:n]
+    y = y[:n]
+    x_centered = x - np.mean(x)
+    y_centered = y - np.mean(y)
+    sx = float(np.std(x_centered))
+    sy = float(np.std(y_centered))
+    x_floor = max(float(np.sqrt(np.mean(x * x))) * relative_std_floor, 1e-9)
+    y_floor = max(float(np.sqrt(np.mean(y * y))) * relative_std_floor, 1e-9)
+    if sx <= x_floor or sy <= y_floor:
+        return 0.0
+    value = float(np.mean((x_centered / sx) * (y_centered / sy)))
+    return value if np.isfinite(value) else 0.0
+
+
+def _contact_raw_signal(x):
+    """Minimal raw path: finite replacement plus isolated-spike repair only."""
+    return remove_burr(finite_signal(x), burr_k=6.0)
+
+
+def _pulse_signal(contact_raw, fs):
+    """Short-window pulse path using rolling-median detrending.
+
+    This avoids the long forward-backward FIR edge response on 3-5 second
+    windows and maps directly to a bounded rolling-median C implementation.
+    """
+    x = finite_signal(contact_raw)
+    if len(x) < 4:
+        return np.zeros_like(x)
+    detrend_window = max(3, int(round(0.8 * float(fs))))
+    if detrend_window % 2 == 0:
+        detrend_window += 1
+    baseline = _median_filter_np(x, detrend_window)
+    pulse = x - baseline
+    smooth_window = max(1, int(round(0.04 * float(fs))))
+    if smooth_window >= 2:
+        pulse = moving_average_filter(pulse, smooth_window)
+    return finite_signal(pulse)
+
+
+def _quality_features(ambient_input, green_input):
+    ambient = finite_signal(ambient_input)
+    green = finite_signal(green_input)
+    green_flat = _diff_flat_ratio(green)
+    green_spike = _diff_spike_ratio(green)
+    ambient_flat = _diff_flat_ratio(ambient)
+    ambient_spike = _diff_spike_ratio(ambient)
+    return OrderedDict([
+        ("GREEN_FLAT_RATIO", float(green_flat)),
+        ("GREEN_SPIKE_RATIO", float(green_spike)),
+        ("AMB_FLAT_RATIO", float(ambient_flat)),
+        ("AMB_SPIKE_RATIO", float(ambient_spike)),
+    ])
+
+
+def _channel_candidate_features(raw, pulse, prefix, fs, fft_cache):
+    dc = float(np.median(raw)) if len(raw) else 0.0
+    ac_rms = float(np.sqrt(np.mean(pulse ** 2))) if len(pulse) else 0.0
+    ac_peak, _ = autocorr_periodicity_features(pulse, fs, bpm_min=40.0, bpm_max=180.0)
+    return OrderedDict([
+        (f"{prefix}_DC_MEDIAN", dc),
+        (f"{prefix}_DC_IQR", robust_iqr(raw)),
+        (f"{prefix}_AC_RMS", ac_rms),
+        (f"{prefix}_AC_MAD", robust_mad(pulse)),
+        (f"{prefix}_AC_DC_RATIO", guarded_ratio(ac_rms, abs(dc), scale=raw)),
+        (f"{prefix}_DERIV_MAD", robust_mad(np.diff(pulse)) if len(pulse) > 1 else 0.0),
+        (f"{prefix}_FFT_PEAK_MEDIAN_RATIO", float(fft_cache.get("peak_ratio", 0.0))),
+        (f"{prefix}_DOM_FREQ", float(fft_cache.get("dom_freq", 0.0))),
+        (f"{prefix}_AUTO_CORR_PEAK", float(ac_peak)),
+    ])
+
+
+def _fft_shape_features(fft_cache):
+    spec = fft_cache.get("spec")
+    freqs = fft_cache.get("freqs")
+    band_spec = fft_cache.get("band_spec")
+    band_freqs = fft_cache.get("band_freqs")
+    if spec is None or freqs is None or band_spec is None or len(band_spec) == 0:
+        return 0.0, 0.0
+    peak = float(np.max(band_spec))
+    above_half = band_spec >= 0.5 * peak
+    width = (
+        float(band_freqs[above_half][-1] - band_freqs[above_half][0])
+        if peak > 0.0 and np.any(above_half) else 0.0
+    )
+    non_dc = freqs > 0.0
+    total = float(np.sum(np.asarray(spec)[non_dc] ** 2))
+    in_band = float(np.sum(np.asarray(band_spec) ** 2))
+    snr = guarded_ratio(in_band, max(total - in_band, 0.0), scale=total)
+    return width, snr
+
+
+def _green_spatial_candidates(g_raw, g_pulse):
+    raw_stack = np.vstack(g_raw)
+    pulse_stack = np.vstack(g_pulse)
+    spatial_mean = np.mean(raw_stack, axis=0)
+    imbalance = np.std(raw_stack, axis=0) / (
+        np.abs(spatial_mean) + _scale_floor(spatial_mean)
+    )
+    range_norm = (np.max(raw_stack, axis=0) - np.min(raw_stack, axis=0)) / (
+        np.sum(np.abs(raw_stack), axis=0) + _scale_floor(raw_stack.reshape(-1))
+    )
+    channel_dc = np.median(raw_stack, axis=1)
+    channel_ac = np.sqrt(np.mean(pulse_stack ** 2, axis=1))
+    correlations = np.asarray([
+        guarded_corr(pulse_stack[0], pulse_stack[1]),
+        guarded_corr(pulse_stack[1], pulse_stack[2]),
+        guarded_corr(pulse_stack[2], pulse_stack[0]),
+    ], dtype=np.float64)
+    max_ac = float(np.max(channel_ac))
+    total_ac = float(np.sum(channel_ac))
+    if max_ac <= _scale_floor(channel_ac):
+        support = 0.0
+        top2_ratio = 0.0
+        top2_corr = 0.0
+        weak_gap = 0.0
+        top1_top2 = 0.0
+        rank_stability = 0.0
+    else:
+        top2_idx = np.argsort(channel_ac)[-2:]
+        top2_values = channel_ac[top2_idx]
+        top2_mean = float(np.mean(top2_values))
+        support = float(np.mean(channel_ac >= 0.5 * max_ac))
+        top2_ratio = guarded_ratio(float(np.sum(top2_values)), total_ac, scale=channel_ac)
+        top2_corr = guarded_corr(
+            pulse_stack[int(top2_idx[0])],
+            pulse_stack[int(top2_idx[1])],
+        )
+        weak_gap = max(
+            0.0,
+            guarded_ratio(top2_mean - float(np.min(channel_ac)), top2_mean, scale=channel_ac),
+        )
+        top1_top2 = guarded_ratio(max_ac, top2_mean, scale=channel_ac)
+        global_top2 = set(int(i) for i in top2_idx)
+        switches = []
+        n = pulse_stack.shape[1]
+        for indices in np.array_split(np.arange(n), 3):
+            if len(indices) < 4:
+                continue
+            seg_ac = np.sqrt(np.mean(pulse_stack[:, indices] ** 2, axis=1))
+            switches.append(set(int(i) for i in np.argsort(seg_ac)[-2:]) != global_top2)
+        rank_stability = float(1.0 - np.mean(switches)) if switches else 0.0
+    imbalance_mean = float(np.mean(imbalance))
+    return OrderedDict([
+        ("G_imbalance_mean", imbalance_mean),
+        ("G_imbalance_p90", float(np.percentile(imbalance, 90))),
+        ("G_imbalance_iqr", robust_iqr(imbalance)),
+        ("G_rangeNorm_mean", float(np.mean(range_norm))),
+        ("G_rangeNorm_p90", float(np.percentile(range_norm, 90))),
+        ("G_ch_dc_cv", guarded_ratio(float(np.std(channel_dc)), abs(float(np.mean(channel_dc))), scale=channel_dc)),
+        ("G_ch_dc_max_min_ratio", guarded_ratio(float(np.max(np.abs(channel_dc))), float(np.min(np.abs(channel_dc))), scale=channel_dc)),
+        ("GCH_AC_RANGE_RATIO", guarded_ratio(float(np.ptp(channel_ac)), float(np.mean(channel_ac)), scale=channel_ac)),
+        ("G_bp_corr_mean", float(np.mean(correlations))),
+        ("G_bp_corr_min", float(np.min(correlations))),
+        ("G_bp_corr_std", float(np.std(correlations))),
+        ("G_2OF3_AC_SUPPORT", support),
+        ("G_TOP2_TO_ALL_AC_RATIO", top2_ratio),
+        ("G_TOP2_CORR_MIN", top2_corr),
+        ("G_WEAK_CHANNEL_GAP", weak_gap),
+        ("G_TOP1_TO_TOP2_AC_RATIO", top1_top2),
+        ("G_TOP2_RANK_STABILITY", rank_stability),
+    ]), imbalance, channel_ac
+
+
+def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs):
+    names = [name for name in stage2_model_candidate_names() if name.startswith("ACC_")]
+    if acc_window is None or len(acc_window) < 4:
+        return OrderedDict((name, 0.0) for name in names)
+    acc = np.asarray(acc_window, dtype=np.float64)
+    if acc.ndim == 1:
+        acc = acc.reshape(-1, 1)
+    if acc.shape[1] < 3:
+        acc = np.hstack([acc, np.zeros((len(acc), 3 - acc.shape[1]))])
+    acc = acc[:, :3]
+    acc = np.column_stack([finite_signal(acc[:, i]) for i in range(3)])
+    magnitude = np.sqrt(np.sum(acc * acc, axis=1))
+    baseline_window = max(3, int(round(0.8 * float(fs))))
+    if baseline_window % 2 == 0:
+        baseline_window += 1
+    baseline = _median_filter_np(magnitude, baseline_window)
+    motion = magnitude - baseline
+    motion_mad = robust_mad(motion)
+    clip_limit = max(8.0 * 1.4826 * motion_mad, _scale_floor(magnitude))
+    motion = np.clip(motion, -clip_limit, clip_limit)
+    motion_rms = float(np.sqrt(np.mean(motion ** 2)))
+    mean_mag = float(np.mean(magnitude))
+    relative_motion = guarded_ratio(motion_rms, mean_mag, scale=magnitude)
+    n = min(len(motion), len(green_top2_pulse))
+    acc_green_corr = (
+        abs(guarded_corr(motion[:n], green_top2_pulse[:n])) if n >= 8 else 0.0
+    )
+    green_ratio = guarded_ratio(
+        float(np.sqrt(np.mean(green_top2_pulse ** 2))),
+        abs(float(np.median(green_top2_raw))),
+        scale=green_top2_raw,
+    )
+    values = {
+        "ACC_MAG_MEAN": mean_mag,
+        "ACC_MAG_STD": float(np.std(magnitude)),
+        "ACC_MAG_MAD": robust_mad(magnitude),
+        "ACC_DYNAMIC_STD": float(np.sqrt(np.sum(np.var(acc, axis=0)))),
+        "ACC_BP_RMS": motion_rms,
+        "ACC_DIFF_MAD": robust_mad(np.diff(magnitude)) if len(magnitude) > 1 else 0.0,
+        "ACC_MAG_P90": float(np.percentile(magnitude, 90)),
+        "ACC_GRAVITY_RATIO": guarded_ratio(
+            float(np.linalg.norm(np.mean(acc, axis=0))),
+            mean_mag,
+            scale=magnitude,
+        ),
+        "ACC_GREEN_BP_CORR": acc_green_corr,
+        "ACC_REL_MOTION": relative_motion,
+        "ACC_GREEN_REL_MOTION_GAP": float(
+            abs(np.log1p(max(0.0, relative_motion)) - np.log1p(max(0.0, green_ratio)))
+        ),
+    }
+    return OrderedDict((name, float(values.get(name, 0.0))) for name in names)
+
+
+def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_preprocessed=False):
+    """Extract the governed optical Stage2 candidate pool.
+
+    ACC candidates are assembled by :func:`assemble_stage2_feature_candidates`.
+    """
+    inputs = [finite_signal(x) for x in (ir, ambient, g1, g2, g3)]
+    n = min(len(x) for x in inputs)
+    if n < int(float(fs)):
+        raise ValueError(f"window too short: n={n}, required>={int(float(fs))}")
+    _, ambient_input, g1_input, g2_input, g3_input = [x[:n] for x in inputs]
+    green_input = (g1_input + g2_input + g3_input) / 3.0
+    features = OrderedDict()
+    features.update(_quality_features(ambient_input, green_input))
+
+    ambient_raw = _contact_raw_signal(ambient_input)
+    g1_raw = _contact_raw_signal(g1_input)
+    g2_raw = _contact_raw_signal(g2_input)
+    g3_raw = _contact_raw_signal(g3_input)
+    green_raw = (g1_raw + g2_raw + g3_raw) / 3.0
+    g1_pulse = _pulse_signal(g1_raw, fs)
+    g2_pulse = _pulse_signal(g2_raw, fs)
+    g3_pulse = _pulse_signal(g3_raw, fs)
+    green_pulse = (g1_pulse + g2_pulse + g3_pulse) / 3.0
+    ambient_pulse = _pulse_signal(ambient_raw, fs)
+
+    features["COMM_GREEN_AC"] = float(
+        0.5 * np.sqrt(np.mean(green_pulse ** 2))
+        + 0.5 * 1.4826 * robust_mad(green_pulse)
+    )
+    features["COMM_AMB_AC"] = float(
+        0.5 * np.sqrt(np.mean(ambient_pulse ** 2))
+        + 0.5 * 1.4826 * robust_mad(ambient_pulse)
+    )
+
+    channel_ac = np.asarray([
+        float(np.sqrt(np.mean(g1_pulse ** 2))),
+        float(np.sqrt(np.mean(g2_pulse ** 2))),
+        float(np.sqrt(np.mean(g3_pulse ** 2))),
+    ])
+    top2_idx = np.argsort(channel_ac)[-2:]
+    green_top2_raw = np.mean([g1_raw[int(i)] if False else [g1_raw, g2_raw, g3_raw][int(i)] for i in top2_idx], axis=0)
+    green_top2_pulse = np.mean([g1_pulse, g2_pulse, g3_pulse][0:0], axis=0) if False else np.mean(
+        [[g1_pulse, g2_pulse, g3_pulse][int(i)] for i in top2_idx],
+        axis=0,
+    )
+
+    green_fft = compute_fft_cache(green_pulse, fs, fmin=0.5, fmax=5.0)
+    ambient_fft = compute_fft_cache(ambient_pulse, fs, fmin=0.5, fmax=5.0)
+    top2_fft = compute_fft_cache(green_top2_pulse, fs, fmin=0.5, fmax=5.0)
+
+    for name, raw, pulse, prefix, cache in [
+        ("green", green_raw, green_pulse, "GREEN", green_fft),
+        ("ambient", ambient_raw, ambient_pulse, "AMBX", ambient_fft),
+        ("green_top2", green_top2_raw, green_top2_pulse, "GTOP2", top2_fft),
+    ]:
+        if name == "green":
+            features["GREEN_ROBUST_RANGE_RATIO"] = robust_range_ratio(raw)
+            features["GREEN_SEG_ACDC_CV"] = segment_acdc_cv(raw)
+        elif name == "ambient":
+            features["AMB_ROBUST_RANGE_RATIO"] = robust_range_ratio(raw)
+            features["AMB_SEG_ACDC_CV"] = segment_acdc_cv(raw)
+        else:
+            features["GTOP2_ROBUST_RANGE_RATIO"] = robust_range_ratio(raw)
+            features["GTOP2_SEG_ACDC_CV"] = segment_acdc_cv(raw)
+            features.update(segment_stability_features(raw, "GTOP2"))
+        features.update(_channel_candidate_features(raw, pulse, prefix, fs, cache))
+
+    features["GREEN_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(green_fft)
+    features["GTOP2_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(top2_fft)
+    features["AMB_BAND_ENERGY_RATIO"] = band_energy_ratio_from_fft_cache(ambient_fft)
+    features["GREEN_CORR"] = guarded_corr(
+        green_pulse,
+        moving_average_filter(green_pulse, max(2, int(round(0.15 * float(fs))))),
+    )
+    features["GTOP2_zero_cross_rate"] = zero_cross_rate(green_top2_pulse)
+    features["GTOP2_abs_diff_ratio"] = guarded_ratio(
+        float(np.mean(np.abs(np.diff(green_top2_pulse)))) if len(green_top2_pulse) > 1 else 0.0,
+        float(np.mean(np.abs(green_top2_pulse - np.median(green_top2_pulse)))),
+        scale=green_top2_pulse,
+    )
+
+    spatial, imbalance, _ = _green_spatial_candidates(
+        [g1_raw, g2_raw, g3_raw],
+        [g1_pulse, g2_pulse, g3_pulse],
+    )
+    features.update(spatial)
+    features["corr_Ambient_Gmean"] = guarded_corr(ambient_raw, green_raw)
+    features["GREEN_AMB_BP_CORR"] = guarded_corr(green_pulse, ambient_pulse)
+    features["GREEN_AMB_ENV_CORR"] = guarded_corr(
+        smooth_envelope(green_pulse, fs),
+        smooth_envelope(ambient_pulse, fs),
+    )
+    green_rms = float(np.sqrt(np.mean(green_pulse ** 2)))
+    ambient_rms = float(np.sqrt(np.mean(ambient_pulse ** 2)))
+    features["AMB_AC_TO_GREEN_AC"] = guarded_ratio(
+        ambient_rms, green_rms, scale=green_pulse
+    )
+    features["AMB_DC_TO_GREEN_DC"] = guarded_ratio(
+        float(np.median(ambient_raw)),
+        abs(float(np.median(green_raw))),
+        scale=green_raw,
+    )
+    features["GREEN_AMB_LEAK_STABILITY"] = ambient_green_leak_stability(
+        ambient_raw, green_top2_raw
+    )
+    features["GREEN_AMB_SEG_CORR_RANGE"] = segment_corr_range(
+        ambient_raw, green_top2_raw
+    )
+    features["corr_Gmean_G_imbalance"] = guarded_corr(green_raw, imbalance)
+
+    ordered_names = [
+        name for name in stage2_model_candidate_names() if not name.startswith("ACC_")
+    ]
+    missing = [name for name in ordered_names if name not in features]
+    if missing:
+        raise RuntimeError("governed optical feature extractor missing: " + ", ".join(missing))
+    ordered = OrderedDict()
+    for name in ordered_names:
+        value = features[name]
+        ordered[name] = float(value) if value is not None and np.isfinite(value) else 0.0
+    preprocessed = {
+        "g1_bp": g1_pulse,
+        "g2_bp": g2_pulse,
+        "g3_bp": g3_pulse,
+        "g_top2_bp": green_top2_pulse,
+        "g_top2_raw": green_top2_raw,
+        "amb_bp": ambient_pulse,
+        "g_mean_bp": green_pulse,
+        "g_mean_raw": green_raw,
+        "amb_raw": ambient_raw,
+    }
+    return (ordered, preprocessed) if return_preprocessed else ordered
+
+
+def assemble_stage2_feature_candidates(
+    ir,
+    ambient,
+    g1,
+    g2,
+    g3,
+    *,
+    fs=25.0,
+    acc_window=None,
+):
+    optical, preprocessed = extract_feature_pool_from_window(
+        ir=ir,
+        ambient=ambient,
+        g1=g1,
+        g2=g2,
+        g3=g3,
+        fs=fs,
+        return_preprocessed=True,
+    )
+    combined = OrderedDict(optical)
+    combined.update(_acc_candidate_features(
+        acc_window,
+        preprocessed["g_top2_bp"],
+        preprocessed["g_top2_raw"],
+        fs,
+    ))
+    ordered = OrderedDict((name, float(combined.get(name, 0.0))) for name in stage2_model_candidate_names())
+    validate_stage2_candidate_names(ordered.keys())
+    return ordered, preprocessed
+
+
+def stage2_diagnostic_fields(ir, ambient, g1, g2, g3, acc_window=None):
+    ppg_arrays = [
+        np.asarray(x, dtype=np.float64).reshape(-1)
+        for x in (ir, ambient, g1, g2, g3)
+    ]
+    green_arrays = ppg_arrays[2:]
+    ppg_invalid = int(sum(np.size(x) - np.isfinite(x).sum() for x in ppg_arrays))
+    green_invalid = int(sum(np.size(x) - np.isfinite(x).sum() for x in green_arrays))
+    acc_invalid = 0
+    acc_available = acc_window is not None and len(acc_window) >= 4
+    if acc_available:
+        acc = np.asarray(acc_window, dtype=np.float64)
+        acc_invalid = int(np.size(acc) - np.isfinite(acc).sum())
+    return {
+        "feature_pool_version": STAGE2_FEATURE_POOL_VERSION,
+        "TOTAL_INVALID_COUNT": float(ppg_invalid + acc_invalid),
+        "PPG_INVALID_COUNT": float(ppg_invalid),
+        "GREEN_INVALID_COUNT": float(green_invalid),
+        "ACC_AVAILABLE": float(bool(acc_available)),
+    }
+
+
+def extract_stage2_window(
+    ppg_window,
+    mode,
+    fs=25.0,
+    acc_window=None,
+    use_stage2_ir=DEFAULT_USE_STAGE2_IR,
+):
+    '''Return governed candidates, diagnostics, and shared intermediates.'''
+    ppg = np.asarray(ppg_window, dtype=np.float64)
+    if ppg.ndim == 1:
+        ppg = ppg.reshape(-1, 1)
+    if ppg.shape[1] < 3:
+        raise ValueError(f'ppg_window requires at least 3 channels, got {ppg.shape[1]}')
+
+    raw_ir, ambient, g1, g2, g3 = get_channels_from_window(ppg, mode)
+    stage2_ir = apply_stage2_ir_policy(raw_ir, use_stage2_ir=use_stage2_ir)
+    features, preprocessed = assemble_stage2_feature_candidates(
+        stage2_ir,
+        ambient,
+        g1,
+        g2,
+        g3,
+        fs=fs,
+        acc_window=acc_window,
+    )
+    diagnostics = stage2_diagnostic_fields(
+        raw_ir, ambient, g1, g2, g3, acc_window=acc_window
+    )
+    diagnostics.update(compute_ambient_stage1_features(ppg))
+    diagnostics['mode'] = int(mode)
+    return features, diagnostics, preprocessed
+
+
+def extract_window_features(ppg_window, fs=25.0, acc_window=None,
+                            use_stage2_ir=DEFAULT_USE_STAGE2_IR, mode=None):
+    resolved_mode = detect_green_mode(ppg_window) if mode is None else int(mode)
+    features, _, _ = extract_stage2_window(
+        ppg_window,
+        mode=resolved_mode,
+        fs=fs,
+        acc_window=acc_window,
+        use_stage2_ir=use_stage2_ir,
+    )
+    return features
+
 # =========================================================
 # split 级别批量特征提取
 # =========================================================
@@ -2483,8 +2983,8 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
 
     if is_prewindowed_signal(ppg):
         window_meta = load_grouped_window_metadata(sample)
-        window_indices = window_meta.get("window_indices") if window_meta else None
-        window_labels = window_meta.get("window_labels") if window_meta else None
+        window_indices = list(window_meta.get("window_indices") or []) if window_meta else []
+        window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
         native_25hz = _is_25hz_sample(sample) or int(ppg.shape[1]) == int(round((window_len / max(fs, 1)) * FEATURE_FS))
         ppg_src_fs = 25 if native_25hz else 100
         mode = detect_green_mode(ppg)
@@ -2520,38 +3020,20 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                 except Exception:
                     acc_seg = None
             try:
-                ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-                ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
-                feat, preprocessed = extract_feature_pool_from_window(
-                    ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
-                    fs=FEATURE_FS, return_preprocessed=True
+                feat, diagnostics, _ = extract_stage2_window(
+                    window,
+                    mode=mode,
+                    fs=FEATURE_FS,
+                    acc_window=acc_seg,
+                    use_stage2_ir=use_stage2_ir,
                 )
-                if acc_seg is not None and len(acc_seg) > 0:
-                    feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                    green_bp = preprocessed.get("g_top2_bp")
-                    ir_bp = preprocessed.get("ir_bp")
-                    if green_bp is not None and ir_bp is not None:
-                        feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, ir_bp, fs=FEATURE_FS))
-                    if green_bp is not None:
-                        _g_ac = float(np.sqrt(np.mean(green_bp ** 2)))
-                        _acc_energy = float(feat.get("ACC_MAG_ENERGY", 0.0))
-                        feat["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
-                        feat.update(extract_acc_green_coupling_features(
-                            acc_seg,
-                            preprocessed.get("g_top2_raw"),
-                            green_bp,
-                        ))
-                    else:
-                        feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
-                feat.update(compute_ambient_stage1_features(raw_window))
-                # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
+                feat.update(diagnostics)
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
                 feat["target"] = int(window_target)
                 feat["start_100hz"] = int(window_number * stride_len)
                 feat["start_sec"] = float(window_number * stride_len / max(fs, 1))
                 feat["window_index"] = int(window_number)
-                feat["mode"] = int(mode)
                 rows.append(feat)
             except Exception as e:
                 print(f"特征提取失败: sample={sample.get('sample_name')}, "
@@ -2605,42 +3087,24 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
     for start in range(first_start, len(ppg_25) - win_25 + 1, stride_25):
         window = ppg_25[start:start + win_25, :]
         try:
-            ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-            ir = apply_stage2_ir_policy(ir, use_stage2_ir=use_stage2_ir)
-            feat, preprocessed = extract_feature_pool_from_window(
-                ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
-                fs=FEATURE_FS, return_preprocessed=True
-            )
+            acc_seg = None
             if acc_25 is not None and len(acc_25) > 0:
                 acc_seg = align_acc_window(acc_25, len(ppg_25), start, win_25,
                                            fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
-                feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                green_bp = preprocessed.get("g_top2_bp")
-                ir_bp = preprocessed.get("ir_bp")
-                if green_bp is not None and ir_bp is not None:
-                    feat.update(extract_acc_ppg_cross_features(
-                        acc_seg, green_bp, ir_bp, fs=FEATURE_FS
-                    ))
-                if green_bp is not None:
-                    _g_ac = float(np.sqrt(np.mean(green_bp ** 2)))
-                    _acc_energy = float(feat.get("ACC_MAG_ENERGY", 0.0))
-                    feat["ACC_ENERGY_TO_GREEN_AC"] = safe_div(_acc_energy, _g_ac)
-                    feat.update(extract_acc_green_coupling_features(
-                        acc_seg,
-                        preprocessed.get("g_top2_raw"),
-                        green_bp,
-                    ))
-                else:
-                    feat["ACC_ENERGY_TO_GREEN_AC"] = 0.0
-
-            feat.update(compute_ambient_stage1_features(window))
-            # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
+            feat, diagnostics, _ = extract_stage2_window(
+                window,
+                mode=mode,
+                fs=FEATURE_FS,
+                acc_window=acc_seg,
+                use_stage2_ir=use_stage2_ir,
+            )
+            feat.update(diagnostics)
             feat["sample_name"] = sample["sample_name"]
             feat["h5_file"] = sample["h5_file"]
             feat["target"] = int(sample["target"])
             feat["start_100hz"] = int(start * (fs / FEATURE_FS))  # 映射回原始 fs 坐标
             feat["start_sec"] = float(start / FEATURE_FS)
-            feat["mode"] = int(mode)
+            feat["window_index"] = int(start // max(stride_25, 1))
             rows.append(feat)
         except Exception as e:
             print(f"特征提取失败: sample={sample.get('sample_name')}, "
@@ -2833,6 +3297,7 @@ def main(args=None):
     print(f"  dc_threshold    = {thresholds['train']['dc_threshold']}")
     print(f"  acdc_threshold  = {thresholds['train']['ac_dc_threshold']}")
 
+    feature_pool_frames = {}
     for part in ["train", "valid", "test"]:
         print("=" * 80)
         print(f"提取 {part} 特征")
@@ -2875,6 +3340,7 @@ def main(args=None):
 
         out_path = os.path.join(args.artifact_dir, f"feature_pool_{part}.csv")
         df.to_csv(out_path, index=False)
+        feature_pool_frames[part] = df
 
         print(f"{part} 特征提取完成: {len(df)} windows")
         print(f"保存到: {out_path}")
@@ -2884,6 +3350,9 @@ def main(args=None):
             print(f"  target=1: {np.sum(df['target'].values == 1)}")
             meta_cols = ["sample_name", "h5_file", "target", "start_100hz", "start_sec"]
             print(f"  特征列数: {len([c for c in df.columns if c not in meta_cols])}")
+
+    analysis_outputs = export_feature_pool_analysis_plot(feature_pool_frames, args.artifact_dir)
+    print(f"Stage2 特征池分析 PNG 已保存: {analysis_outputs['png']}")
 
 if __name__ == "__main__":
     main()

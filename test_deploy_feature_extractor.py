@@ -15,17 +15,12 @@ import s03_extract_feature_pool as s03
 import s04_feature_selection as s04
 import s05_train_final_model as s05
 import s08_run_pipeline as s08
+import stage2_feature_catalog as catalog
 
 
-def test_ambx_bp_shape_features_have_deploy_formulas():
-    selected = ["AMBX_bp_skewness", "AMBX_bp_kurtosis"]
-
-    formulas = s08.build_selected_feature_formulas(selected)
-
-    assert "amb_bp" in formulas["AMBX_bp_skewness"].get("intermediate_signals", {})
-    assert "amb_bp" in formulas["AMBX_bp_kurtosis"].get("intermediate_signals", {})
-    assert "std" in formulas["AMBX_bp_skewness"]["formula"]
-    assert "std" in formulas["AMBX_bp_kurtosis"]["formula"]
+def test_removed_high_order_shape_features_are_rejected_by_deploy_formulas():
+    with pytest.raises(ValueError, match="unknown Stage2 model candidates"):
+        s08.build_selected_feature_formulas(["AMBX_bp_skewness", "AMBX_bp_kurtosis"])
 
 
 def test_all_s03_window_features_have_deploy_formulas():
@@ -97,7 +92,6 @@ def test_green_reliability_features_capture_three_channel_failure_modes():
         "G_TOP2_TO_ALL_AC_RATIO",
         "G_TOP2_CORR_MIN",
         "G_WEAK_CHANNEL_GAP",
-        "G_SPATIAL_STABILITY_SCORE",
     ]
     for name in expected:
         assert name in aligned
@@ -106,13 +100,11 @@ def test_green_reliability_features_capture_three_channel_failure_modes():
     assert aligned["G_2OF3_AC_SUPPORT"] == 1.0
     assert aligned["G_TOP2_CORR_MIN"] > 0.95
     assert aligned["G_WEAK_CHANNEL_GAP"] < 0.15
-    assert aligned["G_SPATIAL_STABILITY_SCORE"] > single_channel_fake["G_SPATIAL_STABILITY_SCORE"]
-
     assert single_channel_fake["G_2OF3_AC_SUPPORT"] < 1.0
     assert single_channel_fake["G_TOP2_CORR_MIN"] < aligned["G_TOP2_CORR_MIN"]
     assert tilted["G_2OF3_AC_SUPPORT"] >= 2.0 / 3.0
     assert tilted["G_TOP2_CORR_MIN"] > 0.90
-    assert all_weak["G_SPATIAL_STABILITY_SCORE"] == 0.0
+    assert all_weak["G_2OF3_AC_SUPPORT"] == 0.0
 
 
 def test_green_reliability_features_have_deploy_formulas():
@@ -121,7 +113,6 @@ def test_green_reliability_features_have_deploy_formulas():
         "G_TOP2_TO_ALL_AC_RATIO",
         "G_TOP2_CORR_MIN",
         "G_WEAK_CHANNEL_GAP",
-        "G_SPATIAL_STABILITY_SCORE",
     ]
 
     formulas = s08.build_selected_feature_formulas(selected)
@@ -152,8 +143,6 @@ def test_accuracy_friendly_lightweight_features_are_source_and_deploy_ready():
     pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
     with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
     expected_ppg = [
-        "GTOP2_bp_skewness",
-        "GTOP2_bp_kurtosis",
         "GTOP2_zero_cross_rate",
         "GTOP2_abs_diff_ratio",
         "GTOP2_HALF_ACDC_DELTA",
@@ -161,9 +150,9 @@ def test_accuracy_friendly_lightweight_features_are_source_and_deploy_ready():
         "GREEN_AMB_LEAK_STABILITY",
     ]
     expected_acc = [
-        "ACC_TO_GTOP2_AC_RATIO",
-        "ACC_STILL_X_GREEN_STABILITY",
-        "ACC_DIFF_TO_GTOP2_DIFF_RATIO",
+        "ACC_REL_MOTION",
+        "ACC_GREEN_BP_CORR",
+        "ACC_GREEN_REL_MOTION_GAP",
     ]
 
     for name in expected_ppg:
@@ -200,11 +189,9 @@ def test_object_worn_friendly_feature_pool_expansion_is_deployable():
     expected_ppg = [
         "G_TOP1_TO_TOP2_AC_RATIO",
         "G_TOP2_RANK_STABILITY",
-        "G_TOP2_SWITCH_RATE",
-        "G_SPATIAL_VMAG_RANGE",
         "GREEN_AMB_SEG_CORR_RANGE",
     ]
-    expected_acc = ["ACC_STILL_GREEN_MISMATCH"]
+    expected_acc = ["ACC_REL_MOTION"]
 
     for name in expected_ppg:
         assert name in pool
@@ -242,7 +229,7 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
         {
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
-            "clip_bounds": {},
+            "clip_bounds": {"GREEN_AC_DC_RATIO": [0.0, 0.0]},
             "threshold": 0.37,
             "meta": {
                 "fs_ppg": float(fs),
@@ -268,14 +255,71 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
     assert len(vector) == len(selected)
 
 
+def test_export_feature_contract_files_and_golden_raw_values(tmp_path):
+    selected = ["GREEN_AC_DC_RATIO", "G_TOP2_CORR_MIN", "ACC_REL_MOTION"]
+    model = XGBClassifier(
+        n_estimators=1,
+        max_depth=1,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=0,
+    )
+    model.fit(
+        np.asarray([[0.0] * len(selected), [1.0] * len(selected)], dtype=float),
+        np.asarray([0, 1]),
+    )
+    joblib.dump(
+        {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "clip_bounds": {"GREEN_AC_DC_RATIO": [0.0, 0.0]},
+            "model": model,
+            "raw_model": model,
+            "threshold": 0.37,
+            "meta": {
+                "fs_ppg": 25.0,
+                "win_sec": 5.0,
+                "step_sec": 1.0,
+                "use_stage2_ir": False,
+            },
+        },
+        tmp_path / "model_bundle.pkl",
+    )
+
+    s08.export_feature_extractor_script(str(tmp_path))
+    contract_paths = s08.export_stage2_feature_contracts(str(tmp_path))
+    golden_path = s08.export_golden_vectors(str(tmp_path))
+
+    assert Path(contract_paths["catalog"]).exists()
+    assert Path(contract_paths["c_contract"]).exists()
+    selected_catalog = json.loads(Path(contract_paths["catalog"]).read_text(encoding="utf-8"))
+    c_contract = json.loads(Path(contract_paths["c_contract"]).read_text(encoding="utf-8"))
+    golden = json.loads(Path(golden_path).read_text(encoding="utf-8"))
+
+    assert selected_catalog["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
+    assert list(selected_catalog["features"]) == selected
+    assert c_contract["feature_order"] == selected
+    vector = golden["vectors"][0]
+    assert list(vector["features_raw"]) == selected
+    assert list(vector["tolerances"]) == selected
+    assert vector["features_raw"]["GREEN_AC_DC_RATIO"] != 0.0
+    assert vector["features_after_fill_clip"]["GREEN_AC_DC_RATIO"] == 0.0
+    for name in selected:
+        assert vector["tolerances"][name] == {
+            "abs": catalog.feature_record(name)["c_abs_tolerance"],
+            "rel": catalog.feature_record(name)["c_rel_tolerance"],
+        }
+
+
 def test_rendered_deploy_feature_extractor_is_s03_source_backed():
     selected = [
         "GREEN_CORR",
-        "GREEN_AC",
-        "AMB_AC",
-        "ACC_YSUM",
-        "GREEN_DC",
-        "AMB_DC",
+        "GREEN_AC_RMS",
+        "AMBX_AC_RMS",
+        "ACC_MAG_MEAN",
+        "GREEN_DC_MEDIAN",
+        "AMBX_DC_MEDIAN",
         "G_TOP2_CORR_MIN",
         "GTOP2_BAND_ENERGY_RATIO",
         "mode",
@@ -305,11 +349,11 @@ def test_rendered_deploy_feature_extractor_is_s03_source_backed():
 def test_rendered_deploy_feature_extractor_compiles_and_runs_standalone(tmp_path):
     selected = [
         "GREEN_CORR",
-        "GREEN_AC",
-        "AMB_AC",
-        "ACC_YSUM",
-        "GREEN_DC",
-        "AMB_DC",
+        "GREEN_AC_RMS",
+        "AMBX_AC_RMS",
+        "ACC_MAG_MEAN",
+        "GREEN_DC_MEDIAN",
+        "AMBX_DC_MEDIAN",
         "G_TOP2_CORR_MIN",
         "GTOP2_BAND_ENERGY_RATIO",
         "mode",
@@ -349,11 +393,11 @@ def test_rendered_deploy_feature_extractor_compiles_and_runs_standalone(tmp_path
 def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     selected = [
         "GREEN_CORR",
-        "GREEN_AC",
-        "AMB_AC",
-        "ACC_YSUM",
-        "GREEN_DC",
-        "AMB_DC",
+        "GREEN_AC_RMS",
+        "AMBX_AC_RMS",
+        "ACC_MAG_MEAN",
+        "GREEN_DC_MEDIAN",
+        "AMBX_DC_MEDIAN",
         "G_TOP2_CORR_MIN",
         "GTOP2_BAND_ENERGY_RATIO",
     ]
@@ -412,7 +456,7 @@ def test_s03_stage2_ir_disabled_omits_ir_features_before_selection():
     for name in features:
         assert np.isclose(features[name], features_with_different_ir[name], equal_nan=True), name
     assert "GREEN_CORR" in features
-    assert "AMB_DC" in features
+    assert "AMBX_DC_MEDIAN" in features
 
 
 def test_s03_feature_pool_source_keys_are_stage2_ir_free_even_with_acc():
@@ -449,12 +493,12 @@ def test_s05_filters_stale_ir_features_before_training():
         "IRX_bp_skewness",
         "GREEN_CORR",
         "corr_Ambient_IR",
-        "AMBX_bp_skewness",
+        "AMBX_AC_RMS",
     ]
 
     assert s05.enforce_no_stage2_ir_features(features, "unit-test") == [
         "GREEN_CORR",
-        "AMBX_bp_skewness",
+        "AMBX_AC_RMS",
     ]
 
 
@@ -474,7 +518,7 @@ def test_export_feature_extractor_rejects_ir_features_in_stage2_bundle(tmp_path)
     selected = [
         "GREEN_CORR",
         "IRX_bp_skewness",
-        "AMBX_bp_skewness",
+        "AMBX_AC_RMS",
     ]
     joblib.dump(
         {
@@ -491,7 +535,7 @@ def test_export_feature_extractor_rejects_ir_features_in_stage2_bundle(tmp_path)
 
 
 def test_deploy_feature_extractor_ignores_ir_for_stage2_features(tmp_path):
-    selected = ["GREEN_AC", "AMB_AC"]
+    selected = ["GREEN_AC_RMS", "AMBX_AC_RMS"]
     joblib.dump(
         {
             "feature_names": selected,
@@ -531,11 +575,11 @@ def test_deploy_feature_extractor_ignores_ir_for_stage2_features(tmp_path):
 def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_path):
     selected = [
         "GREEN_CORR",
-        "GREEN_AC",
-        "AMB_AC",
-        "ACC_YSUM",
-        "GREEN_DC",
-        "AMB_DC",
+        "GREEN_AC_RMS",
+        "AMBX_AC_RMS",
+        "ACC_MAG_MEAN",
+        "GREEN_DC_MEDIAN",
+        "AMBX_DC_MEDIAN",
         "G_TOP2_CORR_MIN",
         "GTOP2_BAND_ENERGY_RATIO",
     ]
@@ -582,12 +626,12 @@ def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_
     assert deploy_xgb["threshold"] == 0.37
     assert "FEATURE_ORDER = [\n  \"GREEN_CORR\"" in script
     assert "WINDOW_MODEL_THRESHOLD = 0.37" in script
-    assert '"GREEN_AC": 1.0' in script
+    assert '"GREEN_AC_RMS": 1.0' in script
 
 
 def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tmp_path):
-    bundle_features = ["GREEN_CORR", "GREEN_AC"]
-    stale_features = ["AMB_AC"]
+    bundle_features = ["GREEN_CORR", "GREEN_AC_RMS"]
+    stale_features = ["AMBX_AC_RMS"]
     model = XGBClassifier(
         n_estimators=1,
         max_depth=1,
@@ -602,7 +646,7 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
         encoding="utf-8",
     )
     (tmp_path / "selected_features.json").write_text(
-        '{"selected_features":["AMB_AC"]}',
+        '{"selected_features":["AMBX_AC_RMS"]}',
         encoding="utf-8",
     )
     joblib.dump(
@@ -632,15 +676,15 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
     feature_formulas = (tmp_path / "deploy_package" / "feature_formulas.json").read_text(encoding="utf-8")
     deploy_config = (tmp_path / "deploy_package" / "deploy_config.json").read_text(encoding="utf-8")
 
-    assert '"selected_features": [\n    "GREEN_CORR",\n    "GREEN_AC"\n  ]' in model_params
+    assert '"selected_features": [\n    "GREEN_CORR",\n    "GREEN_AC_RMS"\n  ]' in model_params
     assert '"n_selected_features": 2' in feature_formulas
-    assert '"names": [\n      "GREEN_CORR",\n      "GREEN_AC"\n    ]' in deploy_config
-    assert "AMB_AC" not in model_params
-    assert "AMB_AC" not in deploy_config
+    assert '"names": [\n      "GREEN_CORR",\n      "GREEN_AC_RMS"\n    ]' in deploy_config
+    assert "AMBX_AC_RMS" not in model_params
+    assert "AMBX_AC_RMS" not in deploy_config
 
 
 def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(tmp_path):
-    selected = ["GREEN_CORR", "GREEN_AC"]
+    selected = ["GREEN_CORR", "GREEN_AC_RMS"]
     model = XGBClassifier(
         n_estimators=1,
         max_depth=1,
@@ -658,7 +702,7 @@ def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(t
         {
             "feature_names": selected,
             "fill_values": {name: float(i) for i, name in enumerate(selected)},
-            "clip_bounds": {"GREEN_AC": [-1.0, 1.0]},
+            "clip_bounds": {"GREEN_AC_RMS": [-1.0, 1.0]},
             "model": model,
             "raw_model": model,
             "threshold": 0.37,
@@ -693,11 +737,11 @@ def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(t
 def test_export_golden_vectors_and_validate_feature_order(tmp_path):
     selected = [
         "GREEN_CORR",
-        "GREEN_AC",
-        "AMB_AC",
-        "ACC_YSUM",
-        "GREEN_DC",
-        "AMB_DC",
+        "GREEN_AC_RMS",
+        "AMBX_AC_RMS",
+        "ACC_MAG_MEAN",
+        "GREEN_DC_MEDIAN",
+        "AMBX_DC_MEDIAN",
         "G_TOP2_CORR_MIN",
         "GTOP2_BAND_ENERGY_RATIO",
     ]
@@ -760,8 +804,8 @@ def test_deploy_extractor_supports_green_and_ambient_fft_features(tmp_path):
         "GREEN_FFT_PEAK_MEDIAN_RATIO",
         "GREEN_DOM_FREQ",
         "AMB_BAND_ENERGY_RATIO",
-        "AMB_FFT_PEAK_MEDIAN_RATIO",
-        "AMB_DOM_FREQ",
+        "AMBX_FFT_PEAK_MEDIAN_RATIO",
+        "AMBX_DOM_FREQ",
     ]
     joblib.dump(
         {

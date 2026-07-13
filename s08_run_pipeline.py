@@ -1,12 +1,15 @@
 # s08_run_pipeline.py
 # -*- coding: utf-8 -*-
 """
-主控脚本：一键运行完整训练、搜参、评估和部署导出流程。
+主控脚本：人工可审计特征流程与显式无人值守训练流程。
 
-推荐一条命令（含 XGBoost 模型搜参；不含商用 baseline 对比、NPZ 缓存导出、s07 后处理搜参和泛化审计）:
+默认命令运行到 s04，导出完整排序后等待人工固化特征：
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
-这条命令会默认跑到 s06_cb：
+显式无人值守流程（含 XGBoost 搜参与部署导出）使用：
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --feature_selection_mode auto
+
+无人值守流程会运行到 s06_cb：
     s01 数据切分
     s02 Stage1 固定阈值
     s03 Stage2 特征窗口（默认 5s/1s，也支持 3s/1s）
@@ -93,6 +96,12 @@ from s04_feature_selection import (
     is_deployment_allowed_feature,
     summarize_deployment_feature_costs,
 )
+from stage2_feature_catalog import (
+    FEATURE_POOL_VERSION,
+    build_selected_feature_contract,
+    feature_record as stage2_feature_record,
+    selected_catalog as selected_stage2_catalog,
+)
 import ast
 import importlib.util
 from datetime import timedelta
@@ -173,6 +182,13 @@ def _finite_float(value, default=0.0):
     if value != value or value in (float("inf"), float("-inf")):
         return float(default)
     return value
+
+
+def pipeline_acceptance_exit_code(report, stopped_at=None):
+    """Return a failing exit code only for a completed, rejected pipeline."""
+    if stopped_at:
+        return 0
+    return 0 if bool((report or {}).get("overall_passed")) else 2
 
 
 def score_auto_e2e_metrics(metrics, deploy_cost=0.0, max_first_worn_output_p95_sec=6.0):
@@ -500,20 +516,21 @@ def build_selected_feature_formulas(selected_features):
             "Please rerun s03-s05 after the no-IR Stage2 policy update. Offending features: "
             + ", ".join(ir_features)
         )
-    recipe, *_ = _build_full_feature_recipe(selected_features)
-    for name in selected_features:
-        if str(recipe.get(name, {}).get("formula", "")).startswith("[") and name in EXTRA_FEATURE_FORMULAS:
-            recipe[name] = EXTRA_FEATURE_FORMULAS[name]
-    missing = [
-        name for name, info in recipe.items()
-        if str(info.get("formula", "")).startswith("[")
-    ]
-    if missing:
-        raise ValueError(
-            "No deploy formula registered for selected features: "
-            + ", ".join(missing)
-        )
-    return recipe
+    selected = selected_stage2_catalog(selected_features)
+    return {
+        name: {
+            "formula": record["formula"],
+            "preprocessing": record["preprocessing"],
+            "signal_source": record["signal_source"],
+            "unit": record["unit"],
+            "numerical_guard": record["numerical_guard"],
+            "c_operators": list(record["c_operators"]),
+            "c_abs_tolerance": float(record["c_abs_tolerance"]),
+            "c_rel_tolerance": float(record["c_rel_tolerance"]),
+            "intermediate_signals": {},
+        }
+        for name, record in selected.items()
+    }
 
 
 def _assert_selected_features_deployment_allowed(selected_features):
@@ -626,7 +643,7 @@ def _prepare_acc(acc, n):
     return arr
 
 
-def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
+def extract_raw_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
     ir = _finite_1d(ir)
     ambient = _finite_1d(ambient)
     g1 = _finite_1d(g1)
@@ -649,6 +666,7 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
             fs=float(fs),
             acc_window=_prepare_acc(acc, n),
             use_stage2_ir=False,
+            mode=mode,
         )
         raw["mode"] = float(mode)
     missing = [name for name in FEATURE_ORDER if name not in raw]
@@ -657,6 +675,11 @@ def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
             "Selected deployment features missing from s03 feature pool: "
             + ", ".join(missing)
         )
+    return {{name: float(raw[name]) for name in FEATURE_ORDER}}
+
+
+def extract_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, mode=0):
+    raw = extract_raw_feature_dict(ir, ambient, g1, g2, g3, acc=acc, fs=fs, mode=mode)
     return {{name: _clean_value(name, raw[name]) for name in FEATURE_ORDER}}
 
 
@@ -763,9 +786,56 @@ def export_feature_extractor_script(artifact_dir):
     with open(formula_path, "w", encoding="utf-8") as f:
         json.dump(formulas, f, indent=2, ensure_ascii=False)
 
+    export_stage2_feature_contracts(artifact_dir)
+
     print(f"[OK] selected deploy feature extractor -> {out_path}")
     print(f"[OK] selected deploy formulas -> {formula_path}")
     return out_path
+
+
+def export_stage2_feature_contracts(artifact_dir):
+    """Export selected catalog metadata and the firmware operator contract."""
+    bundle_path = os.path.join(artifact_dir, "model_bundle.pkl")
+    if not os.path.exists(bundle_path):
+        raise ValueError(f"model_bundle.pkl missing: {bundle_path}")
+    bundle = joblib.load(bundle_path)
+    selected = list(bundle["feature_names"])
+    version = bundle.get("feature_pool_version", FEATURE_POOL_VERSION)
+    if version != FEATURE_POOL_VERSION:
+        raise ValueError(
+            f"model_bundle feature_pool_version={version!r} does not match "
+            f"{FEATURE_POOL_VERSION}; rerun s03-s05 before deployment export."
+        )
+    meta = bundle.get("meta", {}) or {}
+    fs = float(meta.get("fs_ppg", 25.0))
+    win_sec = float(meta.get("win_sec", 5.0))
+    contract = build_selected_feature_contract(
+        selected,
+        fs=fs,
+        window_samples=max(1, int(round(fs * win_sec))),
+    )
+    catalog_payload = {
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "feature_order": selected,
+        "features": selected_stage2_catalog(selected),
+    }
+    catalog_path = os.path.join(artifact_dir, "stage2_feature_catalog.json")
+    contract_path = os.path.join(artifact_dir, "stage2_c_contract.json")
+    with open(catalog_path, "w", encoding="utf-8") as f:
+        json.dump(catalog_payload, f, indent=2, ensure_ascii=False)
+    with open(contract_path, "w", encoding="utf-8") as f:
+        json.dump(contract, f, indent=2, ensure_ascii=False)
+    deploy_package = os.path.join(artifact_dir, "deploy_package")
+    if os.path.isdir(deploy_package):
+        for name, payload in (
+            ("stage2_feature_catalog.json", catalog_payload),
+            ("stage2_c_contract.json", contract),
+        ):
+            with open(os.path.join(deploy_package, name), "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[OK] selected Stage2 catalog -> {catalog_path}")
+    print(f"[OK] Stage2 C contract -> {contract_path}")
+    return {"catalog": catalog_path, "c_contract": contract_path}
 
 
 def _load_json_if_exists(path):
@@ -861,7 +931,13 @@ def export_golden_vectors(artifact_dir, n_vectors=1):
         g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03 + phase)
         g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02 + phase)
         acc = rng.normal(0, 0.01, (n, 3))
-        feature_vector = module.extract_features(ir, ambient, g1, g2, g3, acc=acc, fs=fs)
+        raw_feature_dict = module.extract_raw_feature_dict(
+            ir, ambient, g1, g2, g3, acc=acc, fs=fs
+        )
+        feature_dict = module.extract_feature_dict(
+            ir, ambient, g1, g2, g3, acc=acc, fs=fs
+        )
+        feature_vector = [feature_dict[name] for name in selected]
         feature_dict = dict(zip(selected, feature_vector))
         X = np.asarray([feature_vector], dtype=float)
         model = bundle.get("model") or bundle.get("raw_model")
@@ -874,11 +950,22 @@ def export_golden_vectors(artifact_dir, n_vectors=1):
             "n_samples": int(n),
             "mode": 0,
             "feature_vector_length": int(len(feature_vector)),
+            "features_raw": {
+                name: _json_safe_number(raw_feature_dict[name])
+                for name in selected
+            },
             "features_after_fill_clip": {
                 name: _json_safe_number(feature_dict[name])
                 for name in selected
             },
             "feature_vector": [_json_safe_number(v) for v in feature_vector],
+            "tolerances": {
+                name: {
+                    "abs": float(stage2_feature_record(name)["c_abs_tolerance"]),
+                    "rel": float(stage2_feature_record(name)["c_rel_tolerance"]),
+                }
+                for name in selected
+            },
             "probability": _json_safe_number(probability),
             "threshold": threshold,
             "window_label": label,
@@ -938,6 +1025,34 @@ def validate_deploy_artifact_consistency(artifact_dir):
             raise ValueError("deploy_selected_feature_formulas.json missing formulas: "
                              + ", ".join(missing_formulas))
 
+    selected_catalog = _load_json_if_exists(
+        os.path.join(artifact_dir, "stage2_feature_catalog.json")
+    )
+    if selected_catalog is not None:
+        _assert_same(
+            "stage2_feature_catalog.json feature_pool_version",
+            selected_catalog.get("feature_pool_version"),
+            FEATURE_POOL_VERSION,
+        )
+        _assert_same(
+            "stage2_feature_catalog.json feature_order",
+            list(selected_catalog.get("feature_order", [])),
+            selected,
+        )
+
+    c_contract = _load_json_if_exists(os.path.join(artifact_dir, "stage2_c_contract.json"))
+    if c_contract is not None:
+        _assert_same(
+            "stage2_c_contract.json feature_pool_version",
+            c_contract.get("feature_pool_version"),
+            FEATURE_POOL_VERSION,
+        )
+        _assert_same(
+            "stage2_c_contract.json feature_order",
+            list(c_contract.get("feature_order", [])),
+            selected,
+        )
+
     deploy_xgb = _load_json_if_exists(os.path.join(artifact_dir, "deploy_xgboost.json"))
     if deploy_xgb is not None:
         _assert_same("deploy_xgboost.json feature_order", list(deploy_xgb.get("feature_order", [])), selected)
@@ -992,6 +1107,23 @@ def validate_deploy_artifact_consistency(artifact_dir):
                 len(selected),
             )
             _assert_same(
+                f"golden_vectors.json vectors[{idx}].features_raw order",
+                list(vec.get("features_raw", {})),
+                selected,
+            )
+            expected_tolerances = {
+                name: {
+                    "abs": float(stage2_feature_record(name)["c_abs_tolerance"]),
+                    "rel": float(stage2_feature_record(name)["c_rel_tolerance"]),
+                }
+                for name in selected
+            }
+            _assert_same(
+                f"golden_vectors.json vectors[{idx}].tolerances",
+                vec.get("tolerances", {}),
+                expected_tolerances,
+            )
+            _assert_same(
                 f"golden_vectors.json vectors[{idx}].feature_vector length",
                 len(vec.get("feature_vector", [])),
                 len(selected),
@@ -1006,6 +1138,8 @@ def validate_deploy_artifact_consistency(artifact_dir):
             name for name, exists in [
                 ("deploy_feature_extractor.py", True),
                 ("deploy_selected_feature_formulas.json", formulas is not None),
+                ("stage2_feature_catalog.json", selected_catalog is not None),
+                ("stage2_c_contract.json", c_contract is not None),
                 ("deploy_xgboost.json", deploy_xgb is not None),
                 ("deploy_cookbook.json", cookbook is not None),
                 ("deploy_package/model_params.json", model_params is not None),
@@ -2352,7 +2486,7 @@ def plot_error_samples(artifact_dir, split="test", method="state_machine",
 
         _plt.tight_layout()
         safe_name = d["sample_name"].replace("/", "_").replace("\\", "_")
-        fig.savefig(_os.path.join(out_dir, f"{safe_name}.png"), dpi=120, bbox_inches="tight")
+        fig.savefig(_os.path.join(out_dir, f"{safe_name}.png"), dpi=600, bbox_inches="tight")
         _plt.close(fig)
 
     print(f"[OK] {len(errors)} plots -> {out_dir}/")
@@ -2380,6 +2514,17 @@ def main():
     p.add_argument("--runtime_profile", default="balanced",
                    choices=["fast", "balanced", "thorough"],
                    help="运行预算档：fast 更快，balanced 默认折中，thorough 恢复更重搜参/后处理预算")
+    p.add_argument(
+        "--feature_selection_mode",
+        choices=["manual", "auto"],
+        default="manual",
+        help="manual 在 s04 导出完整排序后暂停；auto 执行无人值守特征选择与训练",
+    )
+    p.add_argument(
+        "--manual_feature_file",
+        default=None,
+        help="manual 恢复训练时使用的 Excel/JSON 特征文件；默认 artifact_dir/manual_feature_selection.xlsx",
+    )
 
     # ── 步骤控制 ──
     p.add_argument("--skip", default="", help="跳过的步骤，逗号分隔 (如 s03,s04)")
@@ -2425,6 +2570,8 @@ def main():
     # s05 model-search params
     p.add_argument("--model_search", action=argparse.BooleanOptionalAction, default=True,
                    help="enable s05 XGBoost param search under a node budget; use --no-model_search to disable")
+    p.add_argument("--mine_hard_negatives", action=argparse.BooleanOptionalAction, default=None,
+                   help="train an OOF train-only hard-negative candidate; defaults on for manual-selection resume")
     p.add_argument("--model_search_strategy", default="staged_group_cv",
                    choices=["staged_group_cv", "single_split"],
                    help="s05 model search strategy")
@@ -2505,16 +2652,18 @@ def main():
                    help="removed legacy shortcut; use --accuracy_first_optimize, --with_postprocess, or --auto_optimize_e2e")
     p.add_argument("--staged_e2e_optimize", action="store_true",
                    help="removed legacy shortcut; run the main flow directly or use --with_postprocess / --auto_optimize_e2e")
-    p.add_argument("--postprocess_split", default="valid", choices=["train", "valid", "test"],
-                   help="split used by s07 postprocess optimization")
+    p.add_argument("--postprocess_split", default="valid", metavar="valid",
+                   help="split used by s07 postprocess optimization; fixed to valid to protect test isolation")
     p.add_argument("--postprocess_fp_cost", type=float, default=1.5,
                    help="s07 sample false-positive cost")
     p.add_argument("--max_sample_fp_rate", type=float, default=0.02,
                    help="s07 maximum FP / true-negative-sample rate")
     p.add_argument("--max_false_worn_event_rate", type=float, default=0.02,
                    help="s07 maximum negative-sample false-worn event rate")
-    p.add_argument("--max_first_worn_output_p95_sec", type=float, default=6.0,
-                   help="s07 maximum P95 first worn output latency for positive samples")
+    p.add_argument("--max_window_fp_rate", type=float, default=0.01,
+                   help="s07 maximum streaming window false-positive rate")
+    p.add_argument("--max_first_worn_output_p95_sec", type=float, default=3.0,
+                   help="s07 maximum P95 added latency from first valid Stage2 probability")
     p.add_argument("--postprocess_search_budget", type=int, default=240,
                    help="maximum s07 postprocess candidates to evaluate; <=0 keeps full grid")
     p.add_argument("--postprocess_warmup_frames", type=int, default=5,
@@ -2542,6 +2691,9 @@ def main():
 
     _raw_argv = sys.argv[1:]
     args = p.parse_args()
+
+    if args.postprocess_split != "valid":
+        p.error("postprocess_split must be 'valid'; test is reserved for frozen read-only replay")
     apply_runtime_profile(args, _raw_argv)
     if args.hard_negative_optimize:
         print("[ERROR] --hard_negative_optimize has been removed from the recommended pipeline.")
@@ -2566,6 +2718,7 @@ def main():
         if "--model_search_full_top_k" not in _raw_argv:
             args.model_search_full_top_k = max(3, int(args.model_search_full_top_k))
     if args.auto_optimize_e2e:
+        args.feature_selection_mode = "auto"
         args.model_search = True
         args.export_window_cache = True
         args.optimize_postprocess = True
@@ -2579,23 +2732,29 @@ def main():
             args.fp_cost_weight = max(float(args.fp_cost_weight), 0.35)
         if "--postprocess_fp_cost" not in _raw_argv:
             args.postprocess_fp_cost = max(float(args.postprocess_fp_cost), 4.0)
-    if args.full_optimize or args.with_postprocess:
+    if args.full_optimize:
+        args.feature_selection_mode = "auto"
+        args.model_search = True
+        args.export_window_cache = True
+        args.optimize_postprocess = True
+    if args.with_postprocess:
         args.model_search = True
         args.export_window_cache = True
         args.optimize_postprocess = True
 
     _feature_counts = []
-    for _part in str(args.model_search_feature_counts or "").split(","):
-        _part = _part.strip()
-        if _part.isdigit():
-            _k = int(_part)
-            if _k <= 18:
-                _feature_counts.append(_k)
-    if _feature_counts:
-        args.model_search_feature_counts = ",".join(str(k) for k in sorted(set(_feature_counts)))
-    if int(args.max_features) > 18:
-        print("[WARN] max_features capped at 18 for current window-accuracy search policy")
-        args.max_features = 18
+    if args.feature_selection_mode == "auto":
+        for _part in str(args.model_search_feature_counts or "").split(","):
+            _part = _part.strip()
+            if _part.isdigit():
+                _k = int(_part)
+                if _k <= 18:
+                    _feature_counts.append(_k)
+        if _feature_counts:
+            args.model_search_feature_counts = ",".join(str(k) for k in sorted(set(_feature_counts)))
+        if int(args.max_features) > 18:
+            print("[WARN] auto-mode max_features capped at 18 for the current search policy")
+            args.max_features = 18
     thread_env = configure_thread_env()
     print("[parallel] thread caps inherited by child steps: " +
           ", ".join(f"{k}={v}" for k, v in thread_env.items()))
@@ -2635,6 +2794,25 @@ def main():
         print(f"[ERROR] unknown --stop_after={raw_stop_after!r}; choose one of: {','.join(step_keys + ['commercial_compare'])}")
         sys.exit(2)
 
+    manual_feature_file = args.manual_feature_file or os.path.join(
+        args.artifact_dir, "manual_feature_selection.xlsx"
+    )
+    manual_resume = (
+        args.feature_selection_mode == "manual"
+        and "s04" in skip_set
+        and os.path.exists(manual_feature_file)
+    )
+    if args.feature_selection_mode == "manual" and not manual_resume:
+        if step_keys.index(stop_after) > step_keys.index("s04"):
+            stop_after = "s04"
+            print(
+                "[manual] feature ranking is the first phase; stopping after s04. "
+                f"Set selected=1 in {manual_feature_file} and save the workbook."
+            )
+        skip_set.add("s04_search")
+    elif args.feature_selection_mode == "manual":
+        skip_set.add("s04_search")
+
     auto_enabled = []
     if stop_after in {"s06_cache", "s06_replay_cache", "s07_post"}:
         if "s06_cache" not in skip_set and not args.export_window_cache:
@@ -2656,6 +2834,12 @@ def main():
     stage2_ir_flag = "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir"
     s04_skip_vif_flag = "--skip_vif" if args.skip_vif else ""
     model_search_flag = "--model_search" if args.model_search else "--no-model_search"
+    mine_hard_negatives = (
+        args.feature_selection_mode == "manual"
+        if args.mine_hard_negatives is None
+        else bool(args.mine_hard_negatives)
+    )
+    hard_negative_flag = "--mine_hard_negatives" if mine_hard_negatives else ""
     cache_export_flag = " --export_window_cache" if args.export_window_cache else ""
     if not args.dry_run and "s01" not in skip_set and not dataset_has_h5_files(args.dataset_dir):
         print(f"[ERROR] no .h5 files found in dataset_dir={args.dataset_dir!r}")
@@ -2706,12 +2890,13 @@ def main():
             f'--fp_proxy_recall_floor {args.fp_proxy_recall_floor} '
             f'--fp_proxy_state_k_on {args.fp_proxy_state_k_on} '
             f'--ranking_objective {args.ranking_objective} '
+            f'--feature_selection_mode {args.feature_selection_mode} '
             f'{s04_skip_vif_flag} '
             f'--n_workers {args.n_workers}'
         )
 
     # s04_search: 候选特征子集搜索（可选步骤，覆写 selected_features.json）
-    if "s04_search" not in skip_set:
+    if "s04_search" not in skip_set and args.feature_selection_mode == "auto":
         commands["s04_search"] = (
             f'"{PYTHON}" "{_script_path("s04_feature_selection")}" '
             f'--artifact_dir "{args.artifact_dir}" '
@@ -2722,6 +2907,7 @@ def main():
             f'--fp_proxy_recall_floor {args.fp_proxy_recall_floor} '
             f'--fp_proxy_state_k_on {args.fp_proxy_state_k_on} '
             f'--ranking_objective {args.ranking_objective} '
+            f'--feature_selection_mode auto '
             f'{s04_skip_vif_flag} '
             f'--run_subset_search '
             f'--subset_search_max_features {args.max_features} '
@@ -2743,9 +2929,18 @@ def main():
 
     # s05
     if "s05" not in skip_set:
+        selection_args = f'--feature_selection_mode {args.feature_selection_mode} '
+        if args.feature_selection_mode == "manual":
+            selection_args += f'--manual_feature_file "{manual_feature_file}" '
+        local_swap_flag = (
+            "--no-feature_search_local_swap"
+            if args.feature_selection_mode == "manual"
+            else ("--feature_search_local_swap" if args.feature_search_local_swap else "--no-feature_search_local_swap")
+        )
         commands["s05"] = (
             f'"{PYTHON}" "{_script_path("s05_train_final_model")}" '
             f'--artifact_dir "{args.artifact_dir}" '
+            f'{selection_args}'
             f'--max_features {args.max_features} '
             f'--threshold_objective {args.threshold_objective} '
             f'--threshold_beta {args.threshold_beta} '
@@ -2757,6 +2952,7 @@ def main():
             f'--step_sec {args.stride_sec} '
             f'{stage2_ir_flag} '
             f'{model_search_flag} '
+            f'{hard_negative_flag} '
             f'--model_search_strategy {args.model_search_strategy} '
             f'--max_model_nodes {args.max_model_nodes} '
             f'--model_search_fp_cost {args.model_search_fp_cost} '
@@ -2767,7 +2963,7 @@ def main():
             f'--model_search_stage1_top_k {args.model_search_stage1_top_k} '
             f'--model_search_stage2_top_k {args.model_search_stage2_top_k} '
             f'--model_search_feature_counts "{args.model_search_feature_counts}" '
-            f'{"--feature_search_local_swap" if args.feature_search_local_swap else "--no-feature_search_local_swap"} '
+            f'{local_swap_flag} '
             f'--feature_search_swap_tail_size {args.feature_search_swap_tail_size} '
             f'--feature_search_swap_pool_size {args.feature_search_swap_pool_size} '
             f'--feature_search_swap_max_candidates {args.feature_search_swap_max_candidates} '
@@ -2869,6 +3065,7 @@ def main():
             f'--fp_cost {args.postprocess_fp_cost} '
             f'--max_sample_fp_rate {args.max_sample_fp_rate} '
             f'--max_false_worn_event_rate {args.max_false_worn_event_rate} '
+            f'--max_window_fp_rate {args.max_window_fp_rate} '
             f'--max_first_worn_output_p95_sec {args.max_first_worn_output_p95_sec} '
             f'--search_budget {args.postprocess_search_budget} '
             f'--warmup_frames {args.postprocess_warmup_frames} '
@@ -3003,6 +3200,7 @@ def main():
             t0 = time.time()
             export_deploy_cookbook(args.artifact_dir)
             if "s06_feat" in completed_keys:
+                export_stage2_feature_contracts(args.artifact_dir)
                 export_golden_vectors(args.artifact_dir)
                 validate_deploy_artifact_consistency(args.artifact_dir)
             dt = time.time() - t0
@@ -3100,7 +3298,11 @@ def main():
             continue
 
         # 特征数量搜参：先快速评估各 k（无 model_search），再对 top-N k 做完整搜参
-        if key == "s05" and args.model_search_feature_counts:
+        if (
+            key == "s05"
+            and args.feature_selection_mode == "auto"
+            and args.model_search_feature_counts
+        ):
             _counts = [int(x.strip()) for x in args.model_search_feature_counts.split(",") if x.strip()]
             _counts = sorted(set(_counts))
             if len(_counts) > 1:
@@ -3197,8 +3399,29 @@ def main():
     if stopped_at:
         print(f"[OK] 流水线已按 --stop_after={stopped_at} 结束  [{timedelta(seconds=int(total_dt))}]")
     else:
-        print(f"[OK] 全流程完成  [{timedelta(seconds=int(total_dt))}]")
+        print(f"[RUN] 执行步骤完成，开始最终验收  [{timedelta(seconds=int(total_dt))}]")
     print(f"{'=' * 70}")
+
+    acceptance_exit_code = 0
+    if not args.dry_run:
+        try:
+            from scientific_figures import export_pipeline_scientific_overview
+            overview_paths = export_pipeline_scientific_overview(args.artifact_dir)
+            print(f"[OK] scientific overview -> {overview_paths['png']}")
+        except Exception as exc:
+            print(f"[WARN] scientific overview incomplete: {exc}")
+        try:
+            from pipeline_acceptance import build_pipeline_acceptance_report
+            acceptance = build_pipeline_acceptance_report(args.artifact_dir)
+            acceptance_exit_code = pipeline_acceptance_exit_code(acceptance, stopped_at)
+            acceptance_label = "OK" if acceptance["overall_passed"] else "FAIL"
+            print(
+                f"[{acceptance_label}] pipeline acceptance -> "
+                f"overall_passed={acceptance['overall_passed']}"
+            )
+        except Exception as exc:
+            acceptance_exit_code = pipeline_acceptance_exit_code({}, stopped_at)
+            print(f"[FAIL] pipeline acceptance report failed: {exc}")
 
     if args.auto_optimize_e2e:
         export_auto_e2e_summary(
@@ -3221,6 +3444,9 @@ def main():
             for f in sorted(os.listdir(pkg)):
                 sz = os.path.getsize(os.path.join(pkg, f))
                 print(f"  {f}  ({sz:,} bytes)")
+
+    if acceptance_exit_code:
+        sys.exit(acceptance_exit_code)
 
 
 if __name__ == "__main__":

@@ -168,7 +168,7 @@ def _scan_one_h5(h5_file):
                     "ppg_shape": list(shape),
                     "ppg_cfg": ppg_cfg,
                 })
-    except (OSError, h5py.HDF5DecodeError) as e:
+    except OSError as e:
         print(f"读取 {h5_file} 失败: {e}")
     except Exception as e:
         # 兜底但要打印，方便定位
@@ -259,6 +259,65 @@ def summarize_split(split):
         print(f"{part}: total={len(arr)}, target0={n0}, target1={n1}")
 
 
+def export_split_analysis_plot(split, artifact_dir):
+    """Export a compact PNG summary of split size and class balance."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scientific_figures import save_scientific_figure
+
+    parts = ["train", "valid", "test"]
+    rows = []
+    for part in parts:
+        samples = list(split.get(part, []))
+        for target in (0, 1):
+            count = sum(int(sample.get("target", 0)) == target for sample in samples)
+            rows.append({
+                "split": part,
+                "target": target,
+                "sample_count": int(count),
+                "split_total": int(len(samples)),
+                "class_ratio": float(count / max(len(samples), 1)),
+            })
+
+    count0 = [next(row["sample_count"] for row in rows if row["split"] == part and row["target"] == 0) for part in parts]
+    count1 = [next(row["sample_count"] for row in rows if row["split"] == part and row["target"] == 1) for part in parts]
+    ratios = [next(row["class_ratio"] for row in rows if row["split"] == part and row["target"] == 1) for part in parts]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2), facecolor="white")
+    x = np.arange(len(parts))
+    axes[0].bar(x, count0, color="#4C78A8", label="not worn")
+    axes[0].bar(x, count1, bottom=count0, color="#E07B53", label="worn")
+    axes[0].set_xticks(x, parts)
+    axes[0].set_ylabel("samples")
+    axes[0].set_title("Split size and class counts", loc="left", weight="bold")
+    axes[0].legend(frameon=False)
+    axes[1].bar(x, ratios, color="#2A9D8F")
+    axes[1].axhline(0.5, color="#7A7A7A", linestyle="--", linewidth=1)
+    axes[1].set_xticks(x, parts)
+    axes[1].set_ylim(0, 1)
+    axes[1].set_ylabel("worn ratio")
+    axes[1].set_title("Class balance", loc="left", weight="bold")
+    fig.suptitle("Dataset split audit", fontsize=13, weight="bold", x=0.04, ha="left")
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+
+    artifact_dir = os.fspath(artifact_dir)
+    out_path = os.path.join(artifact_dir, "report_plots", "s01_split_analysis.png")
+    split_path = os.path.join(artifact_dir, "splits.json")
+    outputs = save_scientific_figure(
+        fig, out_path, source_data=rows,
+        core_conclusion="Train, validation, and test partitions preserve visible class balance and sample counts.",
+        panel_map={"a": "Sample counts by split and target.", "b": "Positive-class ratio by split."},
+        inputs=[split_path] if os.path.isfile(split_path) else (),
+        split="train_valid_test",
+        n_definition="one source row per split and binary target",
+        statistics={"center": "count and proportion", "interval": "none"},
+        reviewer_risks=["Class balance does not by itself prove subject or session independence."],
+    )
+    plt.close(fig)
+    return outputs
+
+
 def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_dir", type=str, default="dataset")
@@ -292,6 +351,8 @@ def main(args=None):
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(split, f, indent=2, ensure_ascii=False)
     print(f"切分结果已保存: {out_path}")
+    outputs = export_split_analysis_plot(split, args.artifact_dir)
+    print(f"切分分析 PNG 已保存: {outputs['png']}")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ import s02_ir_dc_threshold as s02
 import s03_extract_feature_pool as s03
 import s04_feature_selection as s04
 import s06_deploy_eval as s06
+from stage2_feature_catalog import FEATURE_POOL_VERSION
 
 
 ROOT = Path(__file__).resolve().parent
@@ -75,8 +76,12 @@ def test_stage1_extraction_no_longer_hard_filters_ambient_ratio(monkeypatch):
     monkeypatch.setattr(s03, "load_acc", lambda _sample: None)
     monkeypatch.setattr(
         s03,
-        "extract_feature_pool_from_window",
-        lambda *_args, **_kwargs: ({"GREEN_AC": 1.0}, {}),
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: (
+            {"GREEN_AC_RMS": 1.0},
+            {"feature_pool_version": FEATURE_POOL_VERSION},
+            {},
+        ),
     )
     monkeypatch.setattr(s03, "detect_green_mode", lambda _ppg: 1)
 

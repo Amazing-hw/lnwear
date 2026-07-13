@@ -35,13 +35,12 @@ def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
     monkeypatch.setattr(s03, "detect_green_mode", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(
         s03,
-        "get_channels_from_window",
-        lambda window, mode: (window[:, 0], window[:, 1], window[:, 2], window[:, 3], window[:, 4]),
-    )
-    monkeypatch.setattr(
-        s03,
-        "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "g_top2_bp": np.ones(75), "ir_bp": np.ones(75)}),
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: (
+            {"GREEN_CORR": 1.0},
+            {"mode": 0, "feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION},
+            {},
+        ),
     )
 
     rows = s03._extract_rows_for_sample(
@@ -198,13 +197,12 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
     monkeypatch.setattr(s03, "detect_green_mode", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(
         s03,
-        "get_channels_from_window",
-        lambda window, mode: (window[:, 0], window[:, 1], window[:, 2], window[:, 3], window[:, 4]),
-    )
-    monkeypatch.setattr(
-        s03,
-        "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g1_bp": np.ones(75), "g_top2_bp": np.ones(75), "ir_bp": np.ones(75)}),
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: (
+            {"GREEN_CORR": 1.0},
+            {"mode": 0, "feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION},
+            {},
+        ),
     )
 
     rows = s03._extract_rows_for_sample(
@@ -298,4 +296,4 @@ def test_s04_excludes_window_metadata_from_feature_candidates():
         "GREEN_CORR": [0.1, 0.9],
     })
 
-    assert set(s04.get_feature_cols(df)) == {"mode", "GREEN_CORR"}
+    assert set(s04.get_feature_cols(df)) == {"GREEN_CORR"}

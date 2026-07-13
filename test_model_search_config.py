@@ -11,9 +11,130 @@ import pytest
 import s05_train_final_model as s05
 import s08_run_pipeline as s08
 import s09_commercial_compare as s09
+from stage2_feature_catalog import FEATURE_POOL_VERSION
 
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _run_s08_dry_run(*args):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "s08_run_pipeline.py"), "--dry_run", *args],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+def test_s08_default_manual_mode_stops_after_feature_ranking():
+    result = _run_s08_dry_run(
+        "--dataset_dir", "dataset",
+        "--artifact_dir", "artifacts_manual_acceptance",
+    )
+    output = result.stdout + result.stderr
+
+    assert "--feature_selection_mode manual" in output
+    assert "manual_feature_selection.xlsx" in output
+    assert "[STOP]" in output and "s04" in output
+    assert "s05_train_final_model.py" not in output
+    assert "候选特征子集搜索" not in output
+
+
+def test_s08_explicit_auto_mode_runs_unattended_selection_and_training():
+    result = _run_s08_dry_run(
+        "--feature_selection_mode", "auto",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert output.count("--feature_selection_mode auto") >= 3
+    assert "s05_train_final_model.py" in output
+    assert "--feature_search_local_swap" in output
+    assert "manual_feature_selection.xlsx" not in output
+
+
+def test_s08_manual_resume_defaults_to_excel_selection_file(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    workbook = artifact_dir / "manual_feature_selection.xlsx"
+    workbook.write_bytes(b"placeholder for dry-run existence check")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--skip", "s01,s02,s03,s04",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert f'--manual_feature_file "{workbook}"' in output
+    assert "s05_train_final_model.py" in output
+    assert "--mine_hard_negatives" in output
+
+
+def test_s08_manual_resume_does_not_cap_user_feature_count(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    workbook = artifact_dir / "manual_feature_selection.xlsx"
+    workbook.write_bytes(b"placeholder for dry-run existence check")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(workbook),
+        "--max_features", "83",
+        "--skip", "s01,s02,s03,s04",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert "--max_features 83" in output
+    assert "capped at 18" not in output
+
+
+def test_s08_with_postprocess_preserves_manual_selection_mode(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    workbook = artifact_dir / "manual_feature_selection.xlsx"
+    workbook.write_bytes(b"placeholder for dry-run existence check")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(workbook),
+        "--with_postprocess",
+        "--skip", "s01,s02,s03,s04",
+        "--stop_after", "s07_post",
+    )
+    output = result.stdout + result.stderr
+
+    assert "--feature_selection_mode manual" in output
+    assert "--mine_hard_negatives" in output
+    assert "--max_window_fp_rate 0.01" in output
+    assert "--max_first_worn_output_p95_sec 3.0" in output
+
+
+def test_s08_manual_resume_passes_frozen_feature_contract(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    manual_file = artifact_dir / "manual_selected_features.json"
+    manual_file.write_text("{}", encoding="utf-8")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(manual_file),
+        "--skip", "s01,s02,s03,s04",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert "s05_train_final_model.py" in output
+    assert "--feature_selection_mode manual" in output
+    assert f'--manual_feature_file "{manual_file}"' in output
+    assert "--no-feature_search_local_swap" in output
+    assert "--run_subset_search" not in output
 
 
 def _model_search_args(**overrides):
@@ -83,6 +204,8 @@ def test_s08_default_pipeline_uses_5s_windows():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -108,6 +231,8 @@ def test_s08_default_runtime_profile_uses_balanced_search_budget():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--stop_after",
             "s05",
         ],
@@ -132,6 +257,8 @@ def test_s08_thorough_runtime_profile_restores_full_search_budget():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--stop_after",
             "s05",
             "--runtime_profile",
@@ -156,6 +283,8 @@ def test_s08_dry_run_prints_runtime_summary():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--stop_after",
             "s05",
         ],
@@ -176,6 +305,8 @@ def test_s08_accuracy_first_shortcut_keeps_postprocess_disabled():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -204,6 +335,8 @@ def test_s08_accuracy_first_defaults_to_three_full_searches_and_18_feature_cap()
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -234,6 +367,8 @@ def test_s08_dry_run_can_full_search_top_feature_counts():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -264,6 +399,8 @@ def test_s08_rejects_staged_e2e_optimize_shortcut():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -320,6 +457,8 @@ def test_s08_with_postprocess_forwards_search_params_without_hard_negative():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -547,6 +686,8 @@ def test_s08_postprocess_dry_run_forwards_search_budget():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -670,6 +811,8 @@ def test_default_pipeline_search_budget_stays_deployable_and_runtime_bounded():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--dataset_dir",
             "dataset",
             "--artifact_dir",
@@ -723,6 +866,7 @@ def test_s05_local_swap_search_uses_quick_scoring_before_single_full_search(monk
         feature_search_swap_tail_size=1,
         feature_search_swap_pool_size=2,
         feature_search_swap_max_candidates=2,
+        model_search_strategy="staged_group_cv",
     )
 
     def fake_train_for_k(args, k, features, *_rest, **_kwargs):
@@ -751,7 +895,7 @@ def test_s05_local_swap_search_uses_quick_scoring_before_single_full_search(monk
     assert final["search_summary"]["local_swap_search"]["best_source"] == "local_swap_1"
 
 
-def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch):
+def test_s05_local_swap_full_search_keeps_train_cv_score_as_combined_score(monkeypatch):
     calls = []
 
     args = argparse.Namespace(
@@ -760,6 +904,7 @@ def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch
         feature_search_swap_tail_size=1,
         feature_search_swap_pool_size=1,
         feature_search_swap_max_candidates=1,
+        model_search_strategy="staged_group_cv",
     )
 
     def fake_train_for_k(args, k, features, *_rest, **_kwargs):
@@ -780,7 +925,7 @@ def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch
             "search_summary": {"best": {"score": 0.0}, "feature_set_source": ""},
             "search_records": [],
             "valid_acc": 0.99 if has_swap else 0.98,
-            "search_score": 0.0,
+            "search_score": 0.70 if has_swap else 0.60,
         }
 
     ranked = [{"feature": f"f{i}"} for i in range(1, 10)]
@@ -792,7 +937,87 @@ def test_s05_local_swap_full_search_keeps_accuracy_as_combined_score(monkeypatch
     )
 
     assert "f9" in final["features"]
-    assert final["_combined_score"] == pytest.approx(0.99)
+    assert final["_combined_score"] == pytest.approx(0.80)
+    assert final["search_summary"]["feature_set_selection_metric"] == "train_cv_model_search_score"
+
+
+def test_s05_local_swap_uses_train_cv_score_not_valid_accuracy_for_selection(monkeypatch):
+    calls = []
+
+    args = argparse.Namespace(
+        model_search=True,
+        feature_search_local_swap=True,
+        feature_search_swap_tail_size=1,
+        feature_search_swap_pool_size=1,
+        feature_search_swap_max_candidates=1,
+        model_search_strategy="staged_group_cv",
+    )
+
+    def fake_train_for_k(args, k, features, *_rest, **_kwargs):
+        calls.append((bool(args.model_search), tuple(features)))
+        has_swap = "f9" in features
+        score = 0.40 if has_swap else 0.85
+        return {
+            "k": k,
+            "features": list(features),
+            "search_summary": {"best": {"score": score}, "feature_set_source": ""},
+            "search_records": [],
+            "valid_acc": 0.99 if has_swap else 0.97,
+            "search_score": score,
+        }
+
+    ranked = [{"feature": f"f{i}"} for i in range(1, 10)]
+    base = [f"f{i}" for i in range(1, 9)]
+    monkeypatch.setattr(s05, "_train_for_k", fake_train_for_k)
+
+    final = s05.train_best_local_feature_set_for_k(
+        args, 8, ranked, base, None, None, None, None, 1.0
+    )
+
+    assert calls[:2] == [(False, tuple(base)), (False, tuple([*base[:-1], "f9"]))]
+    assert calls[2] == (True, tuple(base))
+    assert final["features"] == base
+    assert final["_combined_score"] == pytest.approx(0.85)
+    assert final["search_summary"]["feature_set_selection_metric"] == "train_cv_model_search_score"
+
+
+def test_s05_fixed_params_train_cv_feature_score_is_train_only(monkeypatch):
+    args = argparse.Namespace(
+        model_search_cv_folds=2,
+        model_search_cv_repeats=1,
+        model_search_random_state=7,
+        model_search_fp_cost=2.0,
+        model_search_size_cost=0.1,
+        max_model_nodes=100,
+    )
+    X = np.asarray([[0.0], [0.1], [1.0], [1.1]], dtype=float)
+    y = np.asarray([0, 0, 1, 1], dtype=int)
+    groups = np.asarray(["n1", "n2", "p1", "p2"], dtype=object)
+    trained_shapes = []
+
+    class FakeModel:
+        def predict_proba(self, X_eval):
+            trained_shapes.append(tuple(X_eval.shape))
+            probs = (np.asarray(X_eval)[:, 0] >= 0.5).astype(float)
+            return np.column_stack([1.0 - probs, probs])
+
+    monkeypatch.setattr(s05, "train_xgb_with_params", lambda *_args, **_kwargs: FakeModel())
+
+    result = s05.score_fixed_params_with_train_cv(
+        args,
+        X,
+        y,
+        groups,
+        {"n_estimators": 1},
+        total_nodes=10,
+    )
+
+    assert result["selection_metric"] == "train_cv_fixed_params_score"
+    assert result["cv_split"]["fallback"] is False
+    assert result["cv_summary"]["mean_cv_accuracy"] == pytest.approx(1.0)
+    assert result["total_nodes"] == 10
+    assert result["score"] == pytest.approx(0.99)
+    assert trained_shapes == [(2, 1), (2, 1)]
 
 
 def test_s05_clip_outliers_logs_summary_instead_of_every_feature(caplog):
@@ -1087,6 +1312,8 @@ def test_s08_dry_run_exposes_model_search_params_to_s05():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--stop_after",
             "s05",
             "--model_search",
@@ -1142,6 +1369,8 @@ def test_s08_default_threshold_objective_optimizes_window_accuracy():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--stop_after",
             "s05",
         ],
@@ -1162,6 +1391,8 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
         ],
         cwd=str(ROOT),
         text=True,
@@ -1188,6 +1419,8 @@ def test_s08_model_search_can_explicitly_run_npz_and_postprocess_search():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--model_search",
             "--export_window_cache",
             "--optimize_postprocess",
@@ -1213,6 +1446,8 @@ def test_s08_commercial_compare_is_embedded_not_s09_subprocess():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--commercial_compare",
             "--stop_after",
             "commercial_compare",
@@ -1299,6 +1534,39 @@ def test_s09_builds_accuracy_scope_rows():
     assert rows[0]["commercial_accuracy"] == pytest.approx(0.91)
     assert rows[1]["project_accuracy"] == pytest.approx(0.89)
     assert rows[2]["delta_project_minus_commercial"] == pytest.approx(0.07)
+
+
+def test_s09_commercial_summary_keeps_majority_vote_when_stream_metrics_added():
+    details = s09._finalize_commercial_results(
+        [
+            {
+                "sample_name": "positive_recovery",
+                "target": 1,
+                "window_probs": [0.9, 0.9, 0.9, 0.1, 0.1, 0.1],
+                "stage2_enabled_flags": [1, 1, 1, 1, 1, 1],
+                "fallback": False,
+            }
+        ],
+        threshold=0.5,
+    )
+    assert details[0]["pred"] == 1
+
+    s09._apply_state_machine_to_details(
+        details,
+        threshold=0.5,
+        postprocess_cfg={"sample_pred_warmup_frames": 5, "sample_pred_strategy": "final_state"},
+    )
+
+    payload = s09._build_eval_payload(
+        details,
+        {},
+        model_threshold=0.5,
+        warmup_frames=0,
+    )
+
+    assert details[0]["pred"] == 1
+    assert payload["summary"]["recall"] == pytest.approx(1.0)
+    assert payload["window_stream_summary"]["recall"] < payload["summary"]["recall"]
 
 
 def test_s09_print_accuracy_scope_comparison_prints_three_scopes(capsys):
@@ -1454,7 +1722,10 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
     artifact_dir.mkdir()
     selected = ["GREEN_AC_RMS", "G_TOP2_CORR_MIN"]
     (artifact_dir / "selected_features.json").write_text(
-        json.dumps({"selected_features": selected}),
+        json.dumps({
+            "feature_pool_version": FEATURE_POOL_VERSION,
+            "selected_features": selected,
+        }),
         encoding="utf-8",
     )
     train_rows = []
@@ -1466,6 +1737,7 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
             "window_index": i,
             "target": target,
             "mode": i % 2,
+            "feature_pool_version": FEATURE_POOL_VERSION,
             "GREEN_AC_RMS": float(i),
             "G_TOP2_CORR_MIN": float(target) + 0.05 * i,
         })
@@ -1478,6 +1750,7 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
             "window_index": i,
             "target": target,
             "mode": i % 2,
+            "feature_pool_version": FEATURE_POOL_VERSION,
             "GREEN_AC_RMS": float(i),
             "G_TOP2_CORR_MIN": float(target) + 0.03 * i,
         })
@@ -1493,6 +1766,8 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
             str(artifact_dir),
             "--max_features",
             "2",
+            "--feature_selection_mode",
+            "auto",
             "--no-model_search",
             "--mine_hard_negatives",
             "--hard_negative_min_probability",
@@ -1513,9 +1788,13 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
 
     mining_path = artifact_dir / "hard_negative_mining_train.csv"
     weights_path = artifact_dir / "hard_negative_training_weights.csv"
+    decision_path = artifact_dir / "hard_negative_decision.json"
+    leaderboard_path = artifact_dir / "model_candidate_leaderboard.json"
     config_path = artifact_dir / "final_model_config.json"
     assert mining_path.exists()
     assert weights_path.exists()
+    assert decision_path.exists()
+    assert leaderboard_path.exists()
     config = json.loads(config_path.read_text(encoding="utf-8"))
     hn = config["hard_negative_mining"]
     assert hn["enabled"] is True
@@ -1525,6 +1804,13 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
     weights = pd.read_csv(weights_path)
     assert "sample_weight" in weights.columns
     assert float(weights["sample_weight"].max()) == 3.0
+    decision = json.loads(decision_path.read_text(encoding="utf-8"))
+    assert decision["selected_candidate"] in {"reference", "hard_negative"}
+    assert decision["reason"] in {
+        "accuracy_not_lower_and_fpr_not_higher",
+        "valid_accuracy_decreased",
+        "valid_false_positive_rate_increased",
+    }
 
 
 def test_default_feature_count_search_grid_matches_docs_and_s05():
@@ -1544,6 +1830,8 @@ def test_s08_model_search_can_be_disabled_for_fast_dry_runs():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--no-model_search",
         ],
         cwd=str(ROOT),
@@ -1563,6 +1851,8 @@ def test_s08_passes_threshold_min_precision_to_s05_for_fp_sensitive_runs():
             sys.executable,
             str(ROOT / "s08_run_pipeline.py"),
             "--dry_run",
+            "--feature_selection_mode",
+            "auto",
             "--threshold_objective",
             "precision_constrained",
             "--threshold_min_precision",
