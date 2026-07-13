@@ -19,11 +19,11 @@ def test_pipeline_acceptance_reports_sections_without_hiding_failures(tmp_path):
     from pipeline_acceptance import build_pipeline_acceptance_report
 
     (tmp_path / "feature_pool_completeness.json").write_text(json.dumps({
-        "catalog_count": 83, "ranked_count": 83, "unique_ranked_count": 83,
+        "catalog_count": 91, "ranked_count": 91, "unique_ranked_count": 91,
         "missing_from_ranking": [], "extra_in_ranking": [],
     }), encoding="utf-8")
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v3",
+        "feature_pool_version": "stage2_interpretable_v5",
         "selected_features": ["COMM_GREEN_AC"],
     }), encoding="utf-8")
     (tmp_path / "model_candidate_leaderboard.json").write_text(json.dumps({
@@ -120,8 +120,27 @@ def test_pipeline_acceptance_rejects_selection_without_frozen_provenance(tmp_pat
     from pipeline_acceptance import build_pipeline_acceptance_report
 
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v3",
+        "feature_pool_version": "stage2_interpretable_v5",
         "selected_features": ["COMM_GREEN_AC"],
+    }), encoding="utf-8")
+
+    report = build_pipeline_acceptance_report(tmp_path)
+
+    assert report["sections"]["Selection"]["passed"] is False
+
+
+def test_pipeline_acceptance_rejects_non_csv_selection_provenance(tmp_path):
+    from pipeline_acceptance import build_pipeline_acceptance_report
+
+    (tmp_path / "manual_selected_features.json").write_text(json.dumps({
+        "feature_pool_version": "stage2_interpretable_v5",
+        "selected_features": ["COMM_GREEN_AC"],
+        "selection_provenance": {
+            "selection_source_type": "xlsx",
+            "csv_schema_version": 1,
+            "manual_feature_file_sha256": "abc",
+            "ranking_source_sha256": "def",
+        },
     }), encoding="utf-8")
 
     report = build_pipeline_acceptance_report(tmp_path)
@@ -133,7 +152,7 @@ def test_pipeline_acceptance_requires_complete_c_metadata(tmp_path):
     from pipeline_acceptance import build_pipeline_acceptance_report
 
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v3",
+        "feature_pool_version": "stage2_interpretable_v5",
         "selected_features": ["COMM_GREEN_AC"],
     }), encoding="utf-8")
     (tmp_path / "stage2_c_contract.json").write_text(json.dumps({

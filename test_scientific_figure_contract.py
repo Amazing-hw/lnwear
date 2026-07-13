@@ -135,8 +135,8 @@ def test_pipeline_overview_figure_summarizes_available_contracts(tmp_path):
     from scientific_figures import export_pipeline_scientific_overview
 
     (tmp_path / "feature_pool_completeness.json").write_text(json.dumps({
-        "catalog_count": 83,
-        "ranked_count": 83,
+        "catalog_count": 91,
+        "ranked_count": 91,
         "eligible_count": 80,
         "ineligible_count": 3,
     }), encoding="utf-8")

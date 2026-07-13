@@ -35,15 +35,13 @@ from sklearn.model_selection import GroupKFold, KFold, StratifiedKFold, Stratifi
 from s03_extract_feature_pool import filter_stage2_ir_features, is_stage2_ir_feature
 from s04_feature_selection import (
     filter_features_for_deployment,
-    is_deployment_allowed_feature,
     summarize_deployment_feature_costs,
     validate_feature_pool_frames,
 )
 from stage2_feature_catalog import (
     FEATURE_POOL_VERSION,
-    is_model_candidate,
 )
-from manual_feature_selection import load_manual_selection_workbook
+from manual_feature_selection import load_manual_selection_csv
 from scientific_figures import save_scientific_figure
 
 # 配置日志
@@ -76,7 +74,7 @@ def _sha256_file(path):
 
 
 def load_manual_feature_selection(manual_path, ranking_path, df_train, df_valid):
-    """Validate a frozen manual feature list without filtering or reordering it."""
+    """Validate CSV selection and freeze its exact feature order for audit."""
     manual_path = Path(manual_path)
     ranking_path = Path(ranking_path)
     if not manual_path.exists():
@@ -89,114 +87,28 @@ def load_manual_feature_selection(manual_path, ranking_path, df_train, df_valid)
             f"full ranking file missing: {ranking_path}; run s04 before manual training."
         )
 
-    if manual_path.suffix.lower() == ".xlsx":
-        selected, provenance = load_manual_selection_workbook(
-            manual_path,
-            ranking_path,
-            train_columns=set(df_train.columns),
-            valid_columns=set(df_valid.columns),
-        )
-        frozen_path = manual_path.parent / "manual_selected_features.json"
-        frozen_payload = {
-            "schema_version": 1,
-            "feature_pool_version": FEATURE_POOL_VERSION,
-            "ranking_source": ranking_path.name,
-            "selected_features": selected,
-            "selection_notes": {},
-            "selection_provenance": provenance,
-        }
-        tmp_path = frozen_path.with_suffix(frozen_path.suffix + ".tmp")
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            json.dump(frozen_payload, handle, indent=2, ensure_ascii=False)
-        os.replace(tmp_path, frozen_path)
-        provenance["frozen_manual_feature_file"] = str(frozen_path.resolve())
-        provenance["frozen_manual_feature_file_sha256"] = _sha256_file(frozen_path)
-        return selected, provenance
-
     validate_feature_pool_frames(df_train, df_valid)
-    with manual_path.open("r", encoding="utf-8") as handle:
-        manual = json.load(handle)
-    with ranking_path.open("r", encoding="utf-8") as handle:
-        ranking_payload = json.load(handle)
-    if not isinstance(manual, dict):
-        raise ValueError("manual feature file must be a JSON object")
-    if int(manual.get("schema_version", -1)) != 1:
-        raise ValueError("manual feature file schema_version must be 1")
-    if str(manual.get("feature_pool_version", "")) != FEATURE_POOL_VERSION:
-        raise ValueError(
-            f"manual feature file feature_pool_version must be {FEATURE_POOL_VERSION}; "
-            "rerun s03-s04 and review the new ranking."
-        )
-
-    selected = manual.get("selected_features")
-    if (
-        not isinstance(selected, list)
-        or not selected
-        or any(not isinstance(name, str) or not name.strip() for name in selected)
-    ):
-        raise ValueError("manual selected_features must be a non-empty string array")
-    selected = [name.strip() for name in selected]
-    duplicates = sorted({name for name in selected if selected.count(name) > 1})
-    if duplicates:
-        raise ValueError("manual selected_features contains duplicate entries: " + ", ".join(duplicates))
-
-    if not isinstance(ranking_payload, dict):
-        raise ValueError("feature_ranking_full.json must be a versioned JSON object")
-    if str(ranking_payload.get("feature_pool_version", "")) != FEATURE_POOL_VERSION:
-        raise ValueError(
-            f"feature_ranking_full.json version does not match {FEATURE_POOL_VERSION}; rerun s04."
-        )
-    ranking = ranking_payload.get("ranking")
-    if not isinstance(ranking, list):
-        raise ValueError("feature_ranking_full.json missing ranking array")
-    ranking_by_feature = {
-        str(item.get("feature")): item
-        for item in ranking
-        if isinstance(item, dict) and item.get("feature")
-    }
-
-    errors = []
-    for name in selected:
-        if not is_model_candidate(name):
-            errors.append(f"{name}: unknown Stage2 catalog feature")
-            continue
-        record = ranking_by_feature.get(name)
-        if record is None:
-            errors.append(f"{name}: absent from feature_ranking_full.json")
-        elif not bool(record.get("eligible_for_manual_selection", False)):
-            reason = record.get("ineligible_reasons") or record.get("removed_reason") or "not eligible"
-            errors.append(f"{name}: {reason}")
-        if name not in df_train.columns:
-            errors.append(f"{name}: missing from feature_pool_train.csv")
-        if name not in df_valid.columns:
-            errors.append(f"{name}: missing from feature_pool_valid.csv")
-        if is_stage2_ir_feature(name):
-            errors.append(f"{name}: IR-derived Stage2 features are forbidden")
-        if not is_deployment_allowed_feature(name):
-            errors.append(f"{name}: not allowed by the deployment feature policy")
-    if errors:
-        raise ValueError("manual feature selection validation failed: " + "; ".join(errors))
-
-    notes = manual.get("selection_notes", {})
-    if notes is None:
-        notes = {}
-    if not isinstance(notes, dict):
-        raise ValueError("selection_notes must be a JSON object when present")
-    invalid_note_keys = sorted(set(map(str, notes)) - set(selected))
-    if invalid_note_keys:
-        raise ValueError(
-            "selection_notes references unselected features: " + ", ".join(invalid_note_keys)
-        )
-
-    provenance = {
-        "feature_selection_mode": "manual",
+    selected, provenance = load_manual_selection_csv(
+        manual_path,
+        ranking_path,
+        train_columns=set(df_train.columns),
+        valid_columns=set(df_valid.columns),
+    )
+    frozen_path = manual_path.parent / "manual_selected_features.json"
+    frozen_payload = {
+        "schema_version": 1,
         "feature_pool_version": FEATURE_POOL_VERSION,
-        "manual_feature_file": str(manual_path.resolve()),
-        "manual_feature_file_sha256": _sha256_file(manual_path),
-        "ranking_source": str(ranking_path.resolve()),
-        "ranking_source_sha256": _sha256_file(ranking_path),
-        "selection_notes": {str(key): str(value) for key, value in notes.items()},
+        "ranking_source": ranking_path.name,
+        "selected_features": selected,
+        "selection_notes": {},
+        "selection_provenance": provenance,
     }
+    tmp_path = frozen_path.with_suffix(frozen_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(frozen_payload, handle, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, frozen_path)
+    provenance["frozen_manual_feature_file"] = str(frozen_path.resolve())
+    provenance["frozen_manual_feature_file_sha256"] = _sha256_file(frozen_path)
     return selected, provenance
 
 
@@ -2776,7 +2688,7 @@ def main(args=None):
     if args.feature_selection_mode == "manual":
         manual_feature_file = (
             args.manual_feature_file
-            or os.path.join(args.artifact_dir, "manual_feature_selection.xlsx")
+            or os.path.join(args.artifact_dir, "manual_feature_selection.csv")
         )
         selected_features, selection_provenance = load_manual_feature_selection(
             manual_feature_file,

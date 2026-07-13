@@ -62,7 +62,7 @@ from stage2_feature_catalog import (
     filter_model_candidates,
     is_model_candidate,
 )
-from manual_feature_selection import export_manual_selection_workbook
+from manual_feature_selection import export_manual_selection_csv
 
 logger = logging.getLogger(__name__)
 
@@ -1477,7 +1477,11 @@ def build_full_feature_ranking(
 
     rows = []
     for catalog_index, feature in enumerate(feature_cols):
-        reasons = list(removed_reasons.get(feature, []))
+        record = catalog_feature_record(feature)
+        reasons = [
+            *removed_reasons.get(feature, []),
+            *record.get("risk_flags", []),
+        ]
         in_train = feature in df_train.columns
         in_valid = feature in df_valid.columns
         train_raw = (
@@ -1559,7 +1563,6 @@ def build_full_feature_ranking(
         if drift.get("psi") is not None and float(drift["psi"]) > 0.25:
             reasons.append("high_psi")
 
-        record = catalog_feature_record(feature)
         rows.append({
             "feature": feature,
             "catalog_index": int(catalog_index),
@@ -1618,7 +1621,6 @@ def export_full_feature_ranking(artifact_dir, ranking):
     artifact_dir.mkdir(parents=True, exist_ok=True)
     json_path = artifact_dir / "feature_ranking_full.json"
     csv_path = artifact_dir / "feature_ranking_full.csv"
-    template_path = artifact_dir / "manual_selected_features.template.json"
     completeness_path = artifact_dir / "feature_pool_completeness.json"
     payload = {
         "schema_version": 1,
@@ -1637,15 +1639,6 @@ def export_full_feature_ranking(artifact_dir, ranking):
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
     pd.DataFrame(ranking).to_csv(csv_path, index=False)
-    template = {
-        "schema_version": 1,
-        "feature_pool_version": FEATURE_POOL_VERSION,
-        "ranking_source": json_path.name,
-        "selected_features": [],
-        "selection_notes": {},
-    }
-    with template_path.open("w", encoding="utf-8") as handle:
-        json.dump(template, handle, indent=2, ensure_ascii=False)
     ranked_names = [str(item.get("feature")) for item in ranking]
     catalog_names = list(FEATURE_CATALOG)
     completeness = {
@@ -1662,13 +1655,11 @@ def export_full_feature_ranking(artifact_dir, ranking):
     }
     with completeness_path.open("w", encoding="utf-8") as handle:
         json.dump(completeness, handle, indent=2, ensure_ascii=False)
-    selection_outputs = export_manual_selection_workbook(json_path, artifact_dir)
+    selection_csv = export_manual_selection_csv(json_path, artifact_dir)
     return {
         "json": json_path,
         "csv": csv_path,
-        "template": template_path,
-        "workbook": selection_outputs["workbook"],
-        "selection_csv": selection_outputs["csv"],
+        "selection_csv": selection_csv,
         "completeness": completeness_path,
     }
 
@@ -2445,13 +2436,13 @@ def main(args=None):
     )
     print(f"[s04] full ranking -> {ranking_outputs['json']}")
     print(f"[s04] ranking table -> {ranking_outputs['csv']}")
-    print(f"[s04] manual selection workbook -> {ranking_outputs['workbook']}")
+    print(f"[s04] manual selection CSV -> {ranking_outputs['selection_csv']}")
     print(f"[s04] feature-pool completeness -> {ranking_outputs['completeness']}")
     if args.feature_selection_mode == "manual":
         print(
-            "[s04] manual mode complete. Set Selected=1 for any desired rows in "
-            "manual_feature_selection.xlsx, save it, then run s05. No feature-count "
-            "or category limit is applied to the workbook selection."
+            "[s04] manual mode complete. Set selected=1 for any desired rows in "
+            "manual_feature_selection.csv, save it, then run s05. No feature-count "
+            "or category limit is applied to the CSV selection."
         )
         return
 

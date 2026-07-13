@@ -283,7 +283,7 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
     assert result["window_targets"] == [1]
 
 
-def test_s04_excludes_window_metadata_from_feature_candidates():
+def test_s04_excludes_window_metadata_but_keeps_mode_candidate():
     import pandas as pd
 
     df = pd.DataFrame({
@@ -296,4 +296,4 @@ def test_s04_excludes_window_metadata_from_feature_candidates():
         "GREEN_CORR": [0.1, 0.9],
     })
 
-    assert set(s04.get_feature_cols(df)) == {"GREEN_CORR"}
+    assert set(s04.get_feature_cols(df)) == {"mode", "GREEN_CORR"}

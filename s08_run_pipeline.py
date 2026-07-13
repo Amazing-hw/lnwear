@@ -2523,7 +2523,7 @@ def main():
     p.add_argument(
         "--manual_feature_file",
         default=None,
-        help="manual 恢复训练时使用的 Excel/JSON 特征文件；默认 artifact_dir/manual_feature_selection.xlsx",
+        help="manual 恢复训练时使用的 CSV 特征文件；默认 artifact_dir/manual_feature_selection.csv",
     )
 
     # ── 步骤控制 ──
@@ -2795,7 +2795,7 @@ def main():
         sys.exit(2)
 
     manual_feature_file = args.manual_feature_file or os.path.join(
-        args.artifact_dir, "manual_feature_selection.xlsx"
+        args.artifact_dir, "manual_feature_selection.csv"
     )
     manual_resume = (
         args.feature_selection_mode == "manual"
@@ -2807,7 +2807,7 @@ def main():
             stop_after = "s04"
             print(
                 "[manual] feature ranking is the first phase; stopping after s04. "
-                f"Set selected=1 in {manual_feature_file} and save the workbook."
+                f"Set selected=1 in {manual_feature_file} and save the CSV."
             )
         skip_set.add("s04_search")
     elif args.feature_selection_mode == "manual":
@@ -2920,7 +2920,7 @@ def main():
             f'__feature_embedding_report__ '
             f'--methods "pca,tsne" '
             f'--dims "2,3" '
-            f'--formats "png,svg,pdf,tiff" '
+            f'--formats "png" '
             f'--max_points 0 '
             f'--perplexity 30.0 '
             f'--random_state 42 '

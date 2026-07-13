@@ -180,6 +180,10 @@ def test_s08_dry_run_can_add_feature_embedding_report_step():
     assert "s11_feature_embedding_report.py" not in result.stdout
     assert "__feature_embedding_report__" in result.stdout
     assert '--methods "pca,tsne"' in result.stdout
+    assert '--formats "png"' in result.stdout
+    assert "svg" not in result.stdout.lower()
+    assert "pdf" not in result.stdout.lower()
+    assert "tiff" not in result.stdout.lower()
     assert "--max_points" in result.stdout
 
 

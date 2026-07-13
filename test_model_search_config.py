@@ -35,7 +35,7 @@ def test_s08_default_manual_mode_stops_after_feature_ranking():
     output = result.stdout + result.stderr
 
     assert "--feature_selection_mode manual" in output
-    assert "manual_feature_selection.xlsx" in output
+    assert "manual_feature_selection.csv" in output
     assert "[STOP]" in output and "s04" in output
     assert "s05_train_final_model.py" not in output
     assert "候选特征子集搜索" not in output
@@ -51,14 +51,14 @@ def test_s08_explicit_auto_mode_runs_unattended_selection_and_training():
     assert output.count("--feature_selection_mode auto") >= 3
     assert "s05_train_final_model.py" in output
     assert "--feature_search_local_swap" in output
-    assert "manual_feature_selection.xlsx" not in output
+    assert "manual_feature_selection.csv" not in output
 
 
-def test_s08_manual_resume_defaults_to_excel_selection_file(tmp_path):
+def test_s08_manual_resume_defaults_to_csv_selection_file(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
-    workbook = artifact_dir / "manual_feature_selection.xlsx"
-    workbook.write_bytes(b"placeholder for dry-run existence check")
+    selection_csv = artifact_dir / "manual_feature_selection.csv"
+    selection_csv.write_text("placeholder for dry-run existence check", encoding="utf-8")
 
     result = _run_s08_dry_run(
         "--artifact_dir", str(artifact_dir),
@@ -68,7 +68,7 @@ def test_s08_manual_resume_defaults_to_excel_selection_file(tmp_path):
     )
     output = result.stdout + result.stderr
 
-    assert f'--manual_feature_file "{workbook}"' in output
+    assert f'--manual_feature_file "{selection_csv}"' in output
     assert "s05_train_final_model.py" in output
     assert "--mine_hard_negatives" in output
 
@@ -76,13 +76,13 @@ def test_s08_manual_resume_defaults_to_excel_selection_file(tmp_path):
 def test_s08_manual_resume_does_not_cap_user_feature_count(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
-    workbook = artifact_dir / "manual_feature_selection.xlsx"
-    workbook.write_bytes(b"placeholder for dry-run existence check")
+    selection_csv = artifact_dir / "manual_feature_selection.csv"
+    selection_csv.write_text("placeholder for dry-run existence check", encoding="utf-8")
 
     result = _run_s08_dry_run(
         "--artifact_dir", str(artifact_dir),
         "--feature_selection_mode", "manual",
-        "--manual_feature_file", str(workbook),
+        "--manual_feature_file", str(selection_csv),
         "--max_features", "83",
         "--skip", "s01,s02,s03,s04",
         "--stop_after", "s05",
@@ -96,13 +96,13 @@ def test_s08_manual_resume_does_not_cap_user_feature_count(tmp_path):
 def test_s08_with_postprocess_preserves_manual_selection_mode(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
-    workbook = artifact_dir / "manual_feature_selection.xlsx"
-    workbook.write_bytes(b"placeholder for dry-run existence check")
+    selection_csv = artifact_dir / "manual_feature_selection.csv"
+    selection_csv.write_text("placeholder for dry-run existence check", encoding="utf-8")
 
     result = _run_s08_dry_run(
         "--artifact_dir", str(artifact_dir),
         "--feature_selection_mode", "manual",
-        "--manual_feature_file", str(workbook),
+        "--manual_feature_file", str(selection_csv),
         "--with_postprocess",
         "--skip", "s01,s02,s03,s04",
         "--stop_after", "s07_post",

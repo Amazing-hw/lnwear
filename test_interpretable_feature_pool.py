@@ -1,4 +1,5 @@
 import json
+from itertools import permutations
 import warnings
 
 import numpy as np
@@ -34,10 +35,130 @@ def test_catalog_exactly_matches_generated_window_candidates():
     expected = catalog.model_candidate_names()
 
     assert s03.STAGE2_FEATURE_POOL_VERSION == catalog.FEATURE_POOL_VERSION
-    assert len(expected) == 83
+    assert len(expected) == 91
+    assert "mode" in expected
     assert list(features) == expected
     assert all(np.isfinite(value) for value in features.values())
     assert not [name for name in expected if s04.feature_to_group(name) == "other"]
+
+
+def test_three_zone_expansion_is_governed_and_complete():
+    import stage2_feature_catalog as catalog
+
+    expected_new = {
+        "GTOP2_ROBUST_SKEWNESS",
+        "GTOP2_SPECTRAL_ENTROPY",
+        "ACC_JERK_TAIL_MEAN_REL",
+        "ACC_GREEN_MAX_LAG_CORR",
+        "ACC_GREEN_PSD_SIMILARITY",
+        "G_2OF3_PERIODICITY",
+        "G_ZONE_LAG_RMS_SEC",
+    }
+
+    assert len(catalog.model_candidate_names()) == 91
+    assert expected_new <= set(catalog.model_candidate_names())
+    for name in expected_new:
+        record = catalog.feature_record(name)
+        assert record["formula"]
+        assert record["c_operators"]
+        assert record["deployment_cost"] > 0.0
+    assert "partial_sort" in catalog.feature_record("ACC_JERK_TAIL_MEAN_REL")["c_operators"]
+    assert "bounded_lag_loop" in catalog.feature_record("ACC_GREEN_MAX_LAG_CORR")["c_operators"]
+    assert "cosine_similarity" in catalog.feature_record("ACC_GREEN_PSD_SIMILARITY")["c_operators"]
+
+
+def test_raw_green_layouts_normalize_to_same_three_symmetric_zones():
+    _, _, g1, g2, g3, _, _ = _signals()
+    n = len(g1)
+    layout_3 = np.zeros((n, 6), dtype=float)
+    layout_3[:, 3:6] = np.column_stack([g1, g2, g3])
+    layout_grouped = np.zeros((n, 16), dtype=float)
+    for column in (6, 9, 12):
+        layout_grouped[:, column] = g1
+    for column in (7, 10, 13):
+        layout_grouped[:, column] = g2
+    for column in (8, 11, 14):
+        layout_grouped[:, column] = g3
+
+    zones_3 = s03.get_channels_from_window(layout_3, mode=1)[2:]
+    zones_grouped = s03.get_channels_from_window(layout_grouped, mode=2)[2:]
+
+    for actual, expected in zip(zones_grouped, zones_3):
+        assert np.allclose(actual, expected)
+
+
+def test_new_three_zone_features_are_permutation_invariant():
+    import stage2_feature_catalog as catalog
+
+    ir, ambient, g1, g2, g3, _, _ = _signals()
+    names = [
+        name for name in catalog.model_candidate_names()
+        if catalog.feature_record(name)["group"] in {"green_spatial", "spatial_coupling"}
+    ]
+    baseline = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3)
+
+    for permuted in permutations([g1, g2, g3]):
+        actual = s03.extract_feature_pool_from_window(ir, ambient, *permuted)
+        for name in names:
+            assert actual[name] == pytest.approx(baseline[name], abs=1e-12)
+
+
+def test_new_optical_features_separate_periodic_shape_noise_and_zone_delay():
+    n = 125
+    fs = 25.0
+    t = np.arange(n, dtype=float) / fs
+    rng = np.random.default_rng(17)
+    clean = np.sin(2.0 * np.pi * 1.2 * t)
+    delayed = np.sin(2.0 * np.pi * 1.2 * (t - 0.16))
+    noise = rng.normal(size=n)
+    dc = 2.0e6
+    ir = np.zeros(n)
+    ambient = np.zeros(n)
+
+    periodic = s03.extract_feature_pool_from_window(
+        ir, ambient, dc + 8000 * clean, dc + 7500 * clean, dc + 8500 * clean, fs=fs
+    )
+    noisy = s03.extract_feature_pool_from_window(
+        ir, ambient, dc + 8000 * noise, dc + 7500 * rng.normal(size=n),
+        dc + 8500 * rng.normal(size=n), fs=fs
+    )
+    asynchronous = s03.extract_feature_pool_from_window(
+        ir, ambient, dc + 8000 * clean, dc + 7500 * delayed, dc + 8500 * clean, fs=fs
+    )
+
+    assert 0.0 <= periodic["GTOP2_SPECTRAL_ENTROPY"] <= 1.0
+    assert noisy["GTOP2_SPECTRAL_ENTROPY"] > periodic["GTOP2_SPECTRAL_ENTROPY"]
+    assert periodic["G_2OF3_PERIODICITY"] > noisy["G_2OF3_PERIODICITY"]
+    assert asynchronous["G_ZONE_LAG_RMS_SEC"] > periodic["G_ZONE_LAG_RMS_SEC"]
+    assert -1.0 <= periodic["GTOP2_ROBUST_SKEWNESS"] <= 1.0
+
+
+def test_new_acc_features_capture_impulse_delay_and_spectral_motion():
+    n = 125
+    fs = 25.0
+    t = np.arange(n, dtype=float) / fs
+    green = np.sin(2.0 * np.pi * 1.2 * t)
+    green_raw = 2.0e6 + 8000.0 * green
+    same_motion = np.sin(2.0 * np.pi * 1.2 * (t - 0.16))
+    other_motion = np.sin(2.0 * np.pi * 2.7 * t)
+
+    def acc_from_motion(motion):
+        return np.column_stack([np.zeros(n), np.zeros(n), 1.0 + 0.08 * motion])
+
+    same = s03._acc_candidate_features(acc_from_motion(same_motion), green, green_raw, fs)
+    other = s03._acc_candidate_features(acc_from_motion(other_motion), green, green_raw, fs)
+    impulsive_acc = acc_from_motion(np.zeros(n))
+    impulsive_acc[n // 2, 2] += 2.0
+    impulse = s03._acc_candidate_features(impulsive_acc, green, green_raw, fs)
+    calm = s03._acc_candidate_features(acc_from_motion(np.zeros(n)), green, green_raw, fs)
+
+    assert same["ACC_GREEN_MAX_LAG_CORR"] > same["ACC_GREEN_BP_CORR"]
+    assert same["ACC_GREEN_PSD_SIMILARITY"] > other["ACC_GREEN_PSD_SIMILARITY"]
+    assert impulse["ACC_JERK_TAIL_MEAN_REL"] > calm["ACC_JERK_TAIL_MEAN_REL"]
+    missing = s03._acc_candidate_features(None, green, green_raw, fs)
+    assert all(missing[name] == 0.0 for name in (
+        "ACC_JERK_TAIL_MEAN_REL", "ACC_GREEN_MAX_LAG_CORR", "ACC_GREEN_PSD_SIMILARITY"
+    ))
 
 
 def test_commercial_eight_are_mapped_to_independent_governed_formulas():
@@ -94,7 +215,6 @@ def test_catalog_excludes_shortcuts_aliases_and_unstable_formulas():
     forbidden = {
         "SIG_LEN",
         "SIG_SEC",
-        "mode",
         "TOTAL_INVALID_COUNT",
         "PPG_INVALID_COUNT",
         "GREEN_INVALID_COUNT",
@@ -129,7 +249,7 @@ def test_catalog_excludes_shortcuts_aliases_and_unstable_formulas():
     assert not [name for name in candidates if "_X_" in name or "_Y_" in name or "_Z_" in name]
 
 
-def test_diagnostic_fields_are_not_model_candidates():
+def test_mode_is_model_candidate_while_quality_diagnostics_are_not():
     import stage2_feature_catalog as catalog
 
     df = pd.DataFrame({
@@ -148,8 +268,10 @@ def test_diagnostic_fields_are_not_model_candidates():
         "GREEN_AC_MAD": [1.0, 2.0],
     })
 
-    assert s04.get_feature_cols(df) == ["GREEN_AC_MAD"]
-    assert "mode" in catalog.DIAGNOSTIC_ONLY_FIELDS
+    assert s04.get_feature_cols(df) == ["mode", "GREEN_AC_MAD"]
+    assert "mode" not in catalog.DIAGNOSTIC_ONLY_FIELDS
+    assert catalog.is_model_candidate("mode")
+    assert catalog.feature_record("mode")["group"] == "acquisition_context"
     assert "ACC_AVAILABLE" in catalog.DIAGNOSTIC_ONLY_FIELDS
 
 
@@ -212,11 +334,12 @@ def test_every_candidate_has_preprocessing_and_c_contract_metadata():
             "pulse_detrended",
             "acc_motion",
             "cross_signal",
+            "acquisition_context",
         }, name
         assert record["formula"], name
         assert record["numerical_guard"], name
         assert record["c_operators"], name
-        assert record["accumulator"] in {"float32", "float64"}, name
+        assert record["accumulator"] in {"int32", "float32", "float64"}, name
         assert record["c_abs_tolerance"] > 0.0, name
         assert record["c_rel_tolerance"] > 0.0, name
         assert 0.0 < record["deployment_cost"] <= 4.0, name
@@ -282,6 +405,7 @@ def test_shared_window_interface_returns_candidates_diagnostics_and_preprocessed
 
     assert list(features) == catalog.model_candidate_names()
     assert diagnostics["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
+    assert features["mode"] == 0.0
     assert diagnostics["ACC_AVAILABLE"] == 1.0
     assert "AMB_STAGE1_RATIO" in diagnostics
     assert {"g_top2_bp", "g_top2_raw", "g_mean_bp"} <= set(preprocessed)
@@ -430,59 +554,15 @@ def test_full_ranking_covers_catalog_and_does_not_use_valid_labels_for_score(tmp
     green_rms = next(item for item in ranking_a if item["feature"] == "GREEN_AC_RMS")
     assert "high_corr" in green_rms["risk_flags"]
     assert green_rms["eligible_for_manual_selection"] is True
+    mode_row = next(item for item in ranking_a if item["feature"] == "mode")
+    assert {"hardware_shortcut", "cross_mode_generalization"} <= set(mode_row["risk_flags"])
 
     outputs = s04.export_full_feature_ranking(tmp_path, ranking_a)
     payload = json.loads(outputs["json"].read_text(encoding="utf-8"))
-    template = json.loads(outputs["template"].read_text(encoding="utf-8"))
     csv_df = pd.read_csv(outputs["csv"])
     assert payload["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
     assert len(payload["ranking"]) == len(catalog.model_candidate_names())
     assert len(csv_df) == len(catalog.model_candidate_names())
-    assert template["selected_features"] == []
-    assert template["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
-
-
-def test_manual_feature_file_preserves_order_and_rejects_invalid_entries(tmp_path):
-    import stage2_feature_catalog as catalog
-
-    train, valid = _ranking_frames()
-    ranking = s04.build_full_feature_ranking(
-        train, valid, catalog.model_candidate_names(), n_splits=4
-    )
-    ranking_path = tmp_path / "feature_ranking_full.json"
-    ranking_path.write_text(
-        json.dumps({
-            "schema_version": 1,
-            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
-            "ranking": ranking,
-        }),
-        encoding="utf-8",
-    )
-    manual_path = tmp_path / "manual_selected_features.json"
-    selected = ["ACC_REL_MOTION", "GREEN_AC_DC_RATIO", "G_TOP2_CORR_MIN"]
-    manual_path.write_text(
-        json.dumps({
-            "schema_version": 1,
-            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
-            "ranking_source": ranking_path.name,
-            "selected_features": selected,
-            "selection_notes": {selected[0]: "Motion robustness"},
-        }),
-        encoding="utf-8",
-    )
-
-    actual, provenance = s05.load_manual_feature_selection(
-        manual_path, ranking_path, train, valid
-    )
-    assert actual == selected
-    assert provenance["feature_selection_mode"] == "manual"
-    assert provenance["selection_notes"] == {selected[0]: "Motion robustness"}
-
-    payload = json.loads(manual_path.read_text(encoding="utf-8"))
-    payload["selected_features"] = [selected[0], selected[0]]
-    manual_path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="duplicate"):
-        s05.load_manual_feature_selection(manual_path, ranking_path, train, valid)
 
 
 def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
@@ -494,7 +574,7 @@ def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
     )
     outputs = s04.export_full_feature_ranking(tmp_path, ranking)
 
-    assert len(ranking) == 83
+    assert len(ranking) == 91
     for item in ranking:
         record = catalog.feature_record(item["feature"])
         assert item["commercial_8_member"] == record["commercial_8_member"]
@@ -505,9 +585,9 @@ def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
 
     completeness = json.loads(outputs["completeness"].read_text(encoding="utf-8"))
     assert completeness["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
-    assert completeness["catalog_count"] == 83
-    assert completeness["ranked_count"] == 83
-    assert completeness["unique_ranked_count"] == 83
+    assert completeness["catalog_count"] == 91
+    assert completeness["ranked_count"] == 91
+    assert completeness["unique_ranked_count"] == 91
     assert completeness["missing_from_ranking"] == []
     assert completeness["extra_in_ranking"] == []
     assert completeness["commercial_8_mapping"] == dict(catalog.COMMERCIAL_8_FEATURE_MAPPING)

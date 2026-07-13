@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from stage2_feature_catalog import FEATURE_POOL_VERSION
+from stage2_feature_catalog import FEATURE_POOL_VERSION, model_candidate_names
 
 
 SECTION_ORDER = [
@@ -104,10 +104,11 @@ def build_pipeline_acceptance_report(artifact_dir):
     })
     c_path = artifact_dir / "stage2_c_contract.json"
     completeness = _read_json(completeness_path) or {}
+    expected_feature_count = len(model_candidate_names())
     feature_pass = bool(
-        int(completeness.get("catalog_count", 0)) == 83
-        and int(completeness.get("ranked_count", 0)) == 83
-        and int(completeness.get("unique_ranked_count", 0)) == 83
+        int(completeness.get("catalog_count", 0)) == expected_feature_count
+        and int(completeness.get("ranked_count", 0)) == expected_feature_count
+        and int(completeness.get("unique_ranked_count", 0)) == expected_feature_count
         and not completeness.get("missing_from_ranking")
         and not completeness.get("extra_in_ranking")
     )
@@ -117,6 +118,8 @@ def build_pipeline_acceptance_report(artifact_dir):
         selection.get("feature_pool_version") == FEATURE_POOL_VERSION
         and selection.get("selected_features")
         and isinstance(selection_provenance, dict)
+        and selection_provenance.get("selection_source_type") == "csv"
+        and int(selection_provenance.get("csv_schema_version", -1)) == 1
         and selection_provenance.get("manual_feature_file_sha256")
         and selection_provenance.get("ranking_source_sha256")
     )

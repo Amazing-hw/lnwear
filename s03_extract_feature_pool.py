@@ -16,8 +16,8 @@
 3. 对通过 Stage1 IR DC/ACDC 阈值的样本提取 5s/25Hz Stage2 特征
 4. 复用原始 H5 读取方式
 5. 复用原始绿光通道构建方式：
-   - mode=1: ch3/ch4/ch5 为三通道绿光
-   - mode=2: ch2 作为绿光，退化为 g1=g2=g3
+   - mode=1: ch3/ch4/ch5 已表示三个中心对称光区
+   - mode=2: 原始分组通道先按光区平均，再归一化为三个中心对称光区
 6. 加入鲁棒预处理：
    - 去毛刺
    - 去跳变
@@ -533,13 +533,13 @@ def get_channels_from_window(window, mode):
     
     Ambient: ch1（如果没有则退化为ch0）
     
-    绿光（3通道独立）：
+    绿光（统一输出三个中心对称光区；g1/g2/g3 不表示绝对方向）：
         mode=1 且通道数>=6:
-            g1=ch3, g2=ch4, g3=ch5
+            g1=ch3, g2=ch4, g3=ch5（三个光区已直接给出）
         mode=2 且通道数>=16:
-            g1=(ch7+ch10+ch13)/3
-            g2=(ch8+ch11+ch14)/3
-            g3=(ch9+ch12+ch15)/3
+            g1=(ch6+ch9+ch12)/3
+            g2=(ch7+ch10+ch13)/3
+            g3=(ch8+ch11+ch14)/3
         否则:
             ch2作为绿光，退化为g1=g2=g3
     """
@@ -1089,6 +1089,34 @@ def max_norm_xcorr(x, y, max_lag_samples):
         return 0.0
 
     return float(np.max(np.abs(corr)))
+
+
+def bounded_xcorr_peak_lag_samples(x, y, max_lag_samples):
+    """Return absolute peak lag without assigning direction to symmetric zones."""
+    x = finite_signal(x)
+    y = finite_signal(y)
+    n = min(len(x), len(y))
+    if n < 8:
+        return 0
+    x = x[:n]
+    y = y[:n]
+    best_score = -1.0
+    best_abs_lag = 0
+    for lag in range(-int(max_lag_samples), int(max_lag_samples) + 1):
+        if lag < 0:
+            left, right = x[-lag:], y[:n + lag]
+        elif lag > 0:
+            left, right = x[:n - lag], y[lag:]
+        else:
+            left, right = x, y
+        score = abs(guarded_corr(left, right))
+        abs_lag = abs(lag)
+        if score > best_score + 1e-12 or (
+            abs(score - best_score) <= 1e-12 and abs_lag < best_abs_lag
+        ):
+            best_score = score
+            best_abs_lag = abs_lag
+    return int(best_abs_lag)
 
 def smooth_envelope(x, fs, win_sec=0.25):
     x = np.abs(np.asarray(x, dtype=np.float64))
@@ -2560,6 +2588,50 @@ def _channel_candidate_features(raw, pulse, prefix, fs, fft_cache):
     ])
 
 
+def normalized_spectral_entropy(fft_cache):
+    """Normalized entropy of in-band spectral power, finite and bounded [0, 1]."""
+    band_spec = fft_cache.get("band_spec")
+    if band_spec is None or len(band_spec) < 2:
+        return 0.0
+    power = np.asarray(band_spec, dtype=np.float64) ** 2
+    total = float(np.sum(power))
+    if total <= _scale_floor(power):
+        return 0.0
+    probabilities = power / total
+    entropy = -float(np.sum(probabilities * np.log(probabilities + EPS)))
+    return float(np.clip(entropy / np.log(len(probabilities)), 0.0, 1.0))
+
+
+def robust_quantile_skewness(x):
+    """Outlier-resistant Bowley-like skewness using P10/P50/P90."""
+    values = finite_signal(x)
+    if len(values) < 4:
+        return 0.0
+    p10, p50, p90 = np.percentile(values, [10, 50, 90])
+    value = guarded_ratio(p90 + p10 - 2.0 * p50, p90 - p10, scale=values)
+    return float(np.clip(value, -1.0, 1.0))
+
+
+def spectral_power_cosine(x, y, fs):
+    """Cosine similarity of two aligned 0.5-5 Hz power spectra."""
+    n = min(len(x), len(y))
+    if n < 16:
+        return 0.0
+    x_cache = compute_fft_cache(np.asarray(x)[:n], fs, fmin=0.5, fmax=5.0)
+    y_cache = compute_fft_cache(np.asarray(y)[:n], fs, fmin=0.5, fmax=5.0)
+    x_spec = x_cache.get("band_spec")
+    y_spec = y_cache.get("band_spec")
+    if x_spec is None or y_spec is None:
+        return 0.0
+    count = min(len(x_spec), len(y_spec))
+    x_power = np.asarray(x_spec[:count], dtype=np.float64) ** 2
+    y_power = np.asarray(y_spec[:count], dtype=np.float64) ** 2
+    denominator = float(np.linalg.norm(x_power) * np.linalg.norm(y_power))
+    if denominator <= _scale_floor(np.concatenate([x_power, y_power])):
+        return 0.0
+    return float(np.clip(np.dot(x_power, y_power) / denominator, 0.0, 1.0))
+
+
 def _fft_shape_features(fft_cache):
     spec = fft_cache.get("spec")
     freqs = fft_cache.get("freqs")
@@ -2580,7 +2652,7 @@ def _fft_shape_features(fft_cache):
     return width, snr
 
 
-def _green_spatial_candidates(g_raw, g_pulse):
+def _green_spatial_candidates(g_raw, g_pulse, fs):
     raw_stack = np.vstack(g_raw)
     pulse_stack = np.vstack(g_pulse)
     spatial_mean = np.mean(raw_stack, axis=0)
@@ -2596,6 +2668,16 @@ def _green_spatial_candidates(g_raw, g_pulse):
         guarded_corr(pulse_stack[0], pulse_stack[1]),
         guarded_corr(pulse_stack[1], pulse_stack[2]),
         guarded_corr(pulse_stack[2], pulse_stack[0]),
+    ], dtype=np.float64)
+    periodicity = np.asarray([
+        autocorr_periodicity_features(channel, fs, bpm_min=40.0, bpm_max=180.0)[0]
+        for channel in pulse_stack
+    ], dtype=np.float64)
+    max_lag = max(1, int(round(0.4 * float(fs))))
+    pair_lags = np.asarray([
+        bounded_xcorr_peak_lag_samples(pulse_stack[0], pulse_stack[1], max_lag),
+        bounded_xcorr_peak_lag_samples(pulse_stack[1], pulse_stack[2], max_lag),
+        bounded_xcorr_peak_lag_samples(pulse_stack[2], pulse_stack[0], max_lag),
     ], dtype=np.float64)
     max_ac = float(np.max(channel_ac))
     total_ac = float(np.sum(channel_ac))
@@ -2649,6 +2731,8 @@ def _green_spatial_candidates(g_raw, g_pulse):
         ("G_WEAK_CHANNEL_GAP", weak_gap),
         ("G_TOP1_TO_TOP2_AC_RATIO", top1_top2),
         ("G_TOP2_RANK_STABILITY", rank_stability),
+        ("G_2OF3_PERIODICITY", float(np.median(periodicity))),
+        ("G_ZONE_LAG_RMS_SEC", float(np.sqrt(np.mean(pair_lags ** 2)) / float(fs))),
     ]), imbalance, channel_ac
 
 
@@ -2674,10 +2758,23 @@ def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs):
     motion = np.clip(motion, -clip_limit, clip_limit)
     motion_rms = float(np.sqrt(np.mean(motion ** 2)))
     mean_mag = float(np.mean(magnitude))
+    jerk = np.abs(np.diff(magnitude))
+    jerk_tail_count = max(1, int(np.ceil(0.1 * len(jerk)))) if len(jerk) else 0
+    jerk_tail_mean = (
+        float(np.mean(np.partition(jerk, len(jerk) - jerk_tail_count)[-jerk_tail_count:]))
+        if jerk_tail_count else 0.0
+    )
     relative_motion = guarded_ratio(motion_rms, mean_mag, scale=magnitude)
     n = min(len(motion), len(green_top2_pulse))
     acc_green_corr = (
         abs(guarded_corr(motion[:n], green_top2_pulse[:n])) if n >= 8 else 0.0
+    )
+    acc_green_max_lag_corr = (
+        max_norm_xcorr(motion[:n], green_top2_pulse[:n], max(1, int(round(0.4 * fs))))
+        if n >= 8 else 0.0
+    )
+    acc_green_psd_similarity = (
+        spectral_power_cosine(motion[:n], green_top2_pulse[:n], fs) if n >= 16 else 0.0
     )
     green_ratio = guarded_ratio(
         float(np.sqrt(np.mean(green_top2_pulse ** 2))),
@@ -2702,6 +2799,13 @@ def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs):
         "ACC_GREEN_REL_MOTION_GAP": float(
             abs(np.log1p(max(0.0, relative_motion)) - np.log1p(max(0.0, green_ratio)))
         ),
+        "ACC_JERK_TAIL_MEAN_REL": guarded_ratio(
+            jerk_tail_mean,
+            mean_mag,
+            scale=magnitude,
+        ),
+        "ACC_GREEN_MAX_LAG_CORR": acc_green_max_lag_corr,
+        "ACC_GREEN_PSD_SIMILARITY": acc_green_psd_similarity,
     }
     return OrderedDict((name, float(values.get(name, 0.0))) for name in names)
 
@@ -2790,6 +2894,7 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     spatial, imbalance, _ = _green_spatial_candidates(
         [g1_raw, g2_raw, g3_raw],
         [g1_pulse, g2_pulse, g3_pulse],
+        fs,
     )
     features.update(spatial)
     features["corr_Ambient_Gmean"] = guarded_corr(ambient_raw, green_raw)
@@ -2815,9 +2920,12 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         ambient_raw, green_top2_raw
     )
     features["corr_Gmean_G_imbalance"] = guarded_corr(green_raw, imbalance)
+    features["GTOP2_ROBUST_SKEWNESS"] = robust_quantile_skewness(green_top2_pulse)
+    features["GTOP2_SPECTRAL_ENTROPY"] = normalized_spectral_entropy(top2_fft)
 
     ordered_names = [
-        name for name in stage2_model_candidate_names() if not name.startswith("ACC_")
+        name for name in stage2_model_candidate_names()
+        if not name.startswith("ACC_") and name != "mode"
     ]
     missing = [name for name in ordered_names if name not in features]
     if missing:
@@ -2847,6 +2955,7 @@ def assemble_stage2_feature_candidates(
     g2,
     g3,
     *,
+    mode,
     fs=25.0,
     acc_window=None,
 ):
@@ -2859,7 +2968,8 @@ def assemble_stage2_feature_candidates(
         fs=fs,
         return_preprocessed=True,
     )
-    combined = OrderedDict(optical)
+    combined = OrderedDict([("mode", float(mode))])
+    combined.update(optical)
     combined.update(_acc_candidate_features(
         acc_window,
         preprocessed["g_top2_bp"],
@@ -2915,6 +3025,7 @@ def extract_stage2_window(
         g1,
         g2,
         g3,
+        mode=mode,
         fs=fs,
         acc_window=acc_window,
     )

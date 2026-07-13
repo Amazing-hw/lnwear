@@ -1,34 +1,27 @@
-"""Excel-first manual Stage2 feature selection contract."""
+"""CSV-only manual Stage2 feature-selection contract."""
 
 from __future__ import annotations
 
 import csv
 import hashlib
-import json
 import math
 import numbers
-from datetime import datetime, timezone
 from pathlib import Path
-
-from openpyxl import Workbook, load_workbook
-from openpyxl.formatting.rule import CellIsRule, FormulaRule
-from openpyxl.styles import Alignment, Font, PatternFill, Protection
-from openpyxl.worksheet.datavalidation import DataValidation
 
 from stage2_feature_catalog import FEATURE_POOL_VERSION, feature_record, is_model_candidate
 
 
-WORKBOOK_SCHEMA_VERSION = 1
-FEATURE_SHEET = "Feature Selection"
-SUMMARY_SHEET = "Selection Summary"
-CONTRACT_SHEET = "Instructions & Contract"
-
+CSV_SCHEMA_VERSION = 1
+CONTRACT_COLUMNS = [
+    "csv_schema_version", "feature_pool_version", "ranking_sha256",
+]
 SELECTION_COLUMNS = [
-    "selected", "rank", "feature", "eligible", "group", "commercial_8_member",
-    "commercial_original_name", "ranking_score", "train_group_fold_auc_mean",
-    "valid_auc", "fp_proxy_sample_fp_rate", "valid_psi", "deployment_cost",
-    "signal_source", "preprocessing", "unit", "formula", "fft", "buffer_samples",
-    "accumulator", "c_operators", "risk_flags", "ineligible_reasons",
+    "selected", *CONTRACT_COLUMNS, "rank", "feature", "eligible", "group",
+    "commercial_8_member", "commercial_original_name", "ranking_score",
+    "train_group_fold_auc_mean", "valid_auc", "fp_proxy_sample_fp_rate",
+    "valid_psi", "deployment_cost", "signal_source", "preprocessing", "unit",
+    "formula", "fft", "buffer_samples", "accumulator", "c_operators",
+    "risk_flags", "ineligible_reasons",
 ]
 
 
@@ -41,6 +34,8 @@ def _sha256(path: Path) -> str:
 
 
 def _load_ranking(path: Path) -> dict:
+    import json
+
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict) or not isinstance(payload.get("ranking"), list):
@@ -52,11 +47,14 @@ def _load_ranking(path: Path) -> dict:
     return payload
 
 
-def _row_for_feature(item: dict) -> dict:
+def _row_for_feature(item: dict, ranking_sha256: str) -> dict:
     name = str(item["feature"])
     record = feature_record(name)
     return {
         "selected": 0,
+        "csv_schema_version": CSV_SCHEMA_VERSION,
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "ranking_sha256": ranking_sha256,
         "rank": int(item.get("rank", 0)),
         "feature": name,
         "eligible": int(bool(item.get("eligible_for_manual_selection", False))),
@@ -77,196 +75,100 @@ def _row_for_feature(item: dict) -> dict:
         "buffer_samples": int(record["buffer_samples"]),
         "accumulator": str(record["accumulator"]),
         "c_operators": ", ".join(map(str, record["c_operators"])),
-        "risk_flags": ", ".join(map(str, item.get("risk_flags") or [])),
+        "risk_flags": ", ".join(map(str, item.get("risk_flags") or record.get("risk_flags") or [])),
         "ineligible_reasons": ", ".join(map(str, item.get("ineligible_reasons") or [])),
     }
 
 
-def export_manual_selection_workbook(ranking_path, output_dir):
+def export_manual_selection_csv(ranking_path, output_dir) -> Path:
+    """Write the only user-editable manual-selection artifact."""
     ranking_path = Path(ranking_path).resolve()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = _load_ranking(ranking_path)
-    rows = [_row_for_feature(item) for item in payload["ranking"]]
     ranking_sha = _sha256(ranking_path)
-
-    workbook_path = output_dir / "manual_feature_selection.xlsx"
+    rows = [_row_for_feature(item, ranking_sha) for item in payload["ranking"]]
     csv_path = output_dir / "manual_feature_selection.csv"
-    wb = Workbook()
-    ws = wb.active
-    ws.title = FEATURE_SHEET
-    ws.append(SELECTION_COLUMNS)
-    for row in rows:
-        ws.append([row[column] for column in SELECTION_COLUMNS])
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    for cell in ws[1]:
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.freeze_panes = "C2"
-    ws.auto_filter.ref = ws.dimensions
-    ws.row_dimensions[1].height = 34
-    widths = {
-        "A": 11, "B": 8, "C": 32, "D": 10, "E": 22, "F": 18, "G": 25,
-        "Q": 65, "U": 45, "V": 30, "W": 42,
-    }
-    for column, width in widths.items():
-        ws.column_dimensions[column].width = width
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.protection = Protection(locked=True)
-        row[0].protection = Protection(locked=False)
-    validation = DataValidation(type="list", formula1='"0,1"', allow_blank=False)
-    validation.error = "selected must be 0 or 1"
-    validation.errorTitle = "Invalid selection"
-    ws.add_data_validation(validation)
-    validation.add(f"A2:A{ws.max_row}")
-    ws.conditional_formatting.add(
-        f"A2:A{ws.max_row}", CellIsRule(operator="equal", formula=["1"], fill=PatternFill("solid", fgColor="C6EFCE"))
-    )
-    ws.conditional_formatting.add(
-        f"D2:D{ws.max_row}", CellIsRule(operator="equal", formula=["0"], fill=PatternFill("solid", fgColor="FFC7CE"))
-    )
-    ws.protection.sheet = True
-    ws.protection.enable()
-
-    summary = wb.create_sheet(SUMMARY_SHEET)
-    summary.append(["Metric", "Value", "Status / interpretation"])
-    summary.append(["Selected features", f"=SUM('{FEATURE_SHEET}'!A2:A{ws.max_row})", "No count limit; must be non-empty"])
-    summary.append(["Selected FFT features", f'=SUMPRODUCT(\'{FEATURE_SHEET}\'!A2:A{ws.max_row},\'{FEATURE_SHEET}\'!R2:R{ws.max_row})', "Engineering warning only"])
-    summary.append(["Maximum selected buffer samples", f'=MAXIFS(\'{FEATURE_SHEET}\'!S2:S{ws.max_row},\'{FEATURE_SHEET}\'!A2:A{ws.max_row},1)', "Engineering warning only"])
-    summary.append(["Feature-pool version", FEATURE_POOL_VERSION, "Immutable contract"])
-    summary.freeze_panes = "A2"
-    summary.column_dimensions["A"].width = 34
-    summary.column_dimensions["B"].width = 26
-    summary.column_dimensions["C"].width = 44
-    for cell in summary[1]:
-        cell.font = Font(color="FFFFFF", bold=True)
-        cell.fill = header_fill
-    summary.conditional_formatting.add(
-        "B2", CellIsRule(operator="equal", formula=["0"], fill=PatternFill("solid", fgColor="FFC7CE"))
-    )
-
-    contract = wb.create_sheet(CONTRACT_SHEET)
-    contract_rows = [
-        ("Instruction", "Set selected=1 only in the Feature Selection sheet, then save the workbook."),
-        ("workbook_schema_version", WORKBOOK_SCHEMA_VERSION),
-        ("feature_pool_version", FEATURE_POOL_VERSION),
-        ("ranking_source", ranking_path.name),
-        ("ranking_sha256", ranking_sha),
-        ("generated_utc", datetime.now(timezone.utc).isoformat()),
-        ("selection_policy", "Any non-empty set of eligible governed features; engineering costs are warnings only."),
-    ]
-    for key, value in contract_rows:
-        contract.append([key, value])
-    contract.column_dimensions["A"].width = 30
-    contract.column_dimensions["B"].width = 110
-    for row in contract.iter_rows():
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-            cell.protection = Protection(locked=True)
-    contract.protection.sheet = True
-
-    wb.save(workbook_path)
     with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SELECTION_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
-    return {"workbook": workbook_path, "csv": csv_path}
+    return csv_path
 
 
-def _contract_values(workbook) -> dict:
-    sheet = workbook[CONTRACT_SHEET]
-    return {
-        str(sheet.cell(row=row, column=1).value): sheet.cell(row=row, column=2).value
-        for row in range(1, sheet.max_row + 1)
-    }
+def _contract_cells_equal(actual, expected) -> bool:
+    if expected is None or expected == "":
+        return actual in (None, "")
+    if isinstance(expected, bool):
+        expected = int(expected)
+    if isinstance(expected, numbers.Real):
+        try:
+            return math.isclose(float(actual), float(expected), rel_tol=1e-12, abs_tol=1e-12)
+        except (TypeError, ValueError):
+            return False
+    return str(actual) == str(expected)
 
 
-def _normalized_contract_cell(value):
-    if value is None or value == "":
-        return ""
-    if isinstance(value, bool):
-        return int(value)
-    return value
-
-
-def _contract_cells_equal(actual, expected):
-    actual = _normalized_contract_cell(actual)
-    expected = _normalized_contract_cell(expected)
-    if isinstance(actual, numbers.Real) and isinstance(expected, numbers.Real):
-        return math.isclose(float(actual), float(expected), rel_tol=1e-12, abs_tol=1e-12)
-    return actual == expected
-
-
-def load_manual_selection_workbook(path, ranking_path, train_columns, valid_columns):
+def load_manual_selection_csv(path, ranking_path, train_columns, valid_columns):
+    """Validate a CSV where only the ``selected`` column may be edited."""
     path = Path(path).resolve()
     ranking_path = Path(ranking_path).resolve()
-    payload = _load_ranking(ranking_path)
-    wb = load_workbook(path, data_only=False)
-    required_sheets = {FEATURE_SHEET, SUMMARY_SHEET, CONTRACT_SHEET}
-    if not required_sheets <= set(wb.sheetnames):
-        raise ValueError(f"workbook missing sheets: {sorted(required_sheets - set(wb.sheetnames))}")
-    contract = _contract_values(wb)
-    if int(contract.get("workbook_schema_version", -1)) != WORKBOOK_SCHEMA_VERSION:
-        raise ValueError("Instructions & Contract workbook_schema_version mismatch")
-    if contract.get("feature_pool_version") != FEATURE_POOL_VERSION:
-        raise ValueError("Instructions & Contract feature_pool_version mismatch")
-    if contract.get("ranking_sha256") != _sha256(ranking_path):
-        raise ValueError("Instructions & Contract ranking SHA256 mismatch")
+    if path.suffix.lower() != ".csv":
+        raise ValueError("manual feature selection is CSV-only; rerun s04 and edit manual_feature_selection.csv")
 
-    ranking_by_feature = {str(item["feature"]): item for item in payload["ranking"]}
-    ws = wb[FEATURE_SHEET]
-    headers = [str(cell.value) for cell in ws[1]]
-    if headers != SELECTION_COLUMNS:
+    payload = _load_ranking(ranking_path)
+    ranking_sha = _sha256(ranking_path)
+    expected_rows = [_row_for_feature(item, ranking_sha) for item in payload["ranking"]]
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != SELECTION_COLUMNS:
+            raise ValueError(
+                f"manual selection CSV columns changed; expected immutable order {SELECTION_COLUMNS}"
+            )
+        rows = list(reader)
+    if len(rows) != len(expected_rows):
         raise ValueError(
-            f"{FEATURE_SHEET} columns changed; expected immutable order {SELECTION_COLUMNS}"
+            f"manual selection CSV row count changed; expected {len(expected_rows)} governed features"
         )
-    index = {name: headers.index(name) + 1 for name in headers}
-    expected_rows = [_row_for_feature(item) for item in payload["ranking"]]
-    if ws.max_row != len(expected_rows) + 1:
-        raise ValueError(
-            f"{FEATURE_SHEET} row count changed; expected {len(expected_rows)} governed features"
-        )
-    for row_number, expected in enumerate(expected_rows, start=2):
+    if any(row.get("ranking_sha256") != ranking_sha for row in rows):
+        raise ValueError("manual selection CSV ranking SHA256 mismatch; rerun s04")
+
+    selected = []
+    errors = []
+    train_columns = set(train_columns)
+    valid_columns = set(valid_columns)
+    for row_number, (row, expected) in enumerate(zip(rows, expected_rows), start=2):
         for field in SELECTION_COLUMNS:
             if field == "selected":
                 continue
-            actual_value = ws.cell(row=row_number, column=index[field]).value
-            expected_value = expected[field]
-            if not _contract_cells_equal(actual_value, expected_value):
-                raise ValueError(
-                    f"{FEATURE_SHEET} row {row_number} field {field} for "
-                    f"{expected['feature']} changed immutable contract value"
+            if not _contract_cells_equal(row.get(field), expected[field]):
+                errors.append(
+                    f"CSV row {row_number} field {field} for {expected['feature']} "
+                    "changed immutable contract value"
                 )
-    selected = []
-    errors = []
-    for row in range(2, ws.max_row + 1):
-        selected_value = ws.cell(row=row, column=index["selected"]).value
-        if selected_value not in (0, 1, "0", "1", False, True):
-            errors.append(f"{FEATURE_SHEET} row {row} selected must be 0 or 1")
+        selected_value = row.get("selected")
+        if selected_value not in ("0", "1"):
+            errors.append(f"CSV row {row_number} selected must be 0 or 1")
             continue
-        if int(selected_value) != 1:
+        if selected_value == "0":
             continue
-        name = str(ws.cell(row=row, column=index["feature"]).value or "").strip()
+        name = str(row.get("feature") or "").strip()
         if name in selected:
-            errors.append(f"{FEATURE_SHEET} row {row} duplicate feature {name}")
+            errors.append(f"CSV row {row_number} duplicate feature {name}")
             continue
-        item = ranking_by_feature.get(name)
-        if not is_model_candidate(name) or item is None:
-            errors.append(f"{FEATURE_SHEET} row {row} unknown feature {name}")
+        item = payload["ranking"][row_number - 2]
+        if not is_model_candidate(name):
+            errors.append(f"CSV row {row_number} unknown feature {name}")
             continue
         if not bool(item.get("eligible_for_manual_selection", False)):
-            errors.append(f"{FEATURE_SHEET} row {row} ineligible feature {name}")
-        if name not in set(train_columns) or name not in set(valid_columns):
-            errors.append(f"{FEATURE_SHEET} row {row} feature {name} missing from train/valid")
+            errors.append(f"CSV row {row_number} ineligible feature {name}")
+        if name not in train_columns or name not in valid_columns:
+            errors.append(f"CSV row {row_number} feature {name} missing from train/valid")
         selected.append(name)
     if errors:
-        raise ValueError("manual workbook validation failed: " + "; ".join(errors))
+        raise ValueError("manual CSV validation failed: " + "; ".join(errors))
     if not selected:
-        raise ValueError("manual workbook has empty selection")
+        raise ValueError("manual CSV has empty selection")
 
     selected_records = [feature_record(name) for name in selected]
     fft_sources = sorted({str(record["signal_source"]) for record in selected_records if record["fft"]})
@@ -275,14 +177,17 @@ def load_manual_selection_workbook(path, ranking_path, train_columns, valid_colu
         f"fft_sources={fft_sources or []} (engineering warning only)",
         f"max_buffer_samples={max(int(record['buffer_samples']) for record in selected_records)}",
     ]
+    if "mode" in selected:
+        warnings.append("mode_selected=true (audit subject/device/session/mode generalization)")
     provenance = {
         "feature_selection_mode": "manual",
-        "selection_source_type": "xlsx",
+        "selection_source_type": "csv",
+        "csv_schema_version": CSV_SCHEMA_VERSION,
         "feature_pool_version": FEATURE_POOL_VERSION,
         "manual_feature_file": str(path),
         "manual_feature_file_sha256": _sha256(path),
         "ranking_source": str(ranking_path),
-        "ranking_source_sha256": _sha256(ranking_path),
+        "ranking_source_sha256": ranking_sha,
         "engineering_warnings": warnings,
     }
     return selected, provenance

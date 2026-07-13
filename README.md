@@ -9,7 +9,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
 默认采用人工固化特征流程，运行到 `s04` 后暂停。直接在
-`artifacts/manual_feature_selection.xlsx` 的 `Selected` 列填写 `1`，保存后再恢复训练。
+`artifacts/manual_feature_selection.csv` 的 `selected` 列填写 `1`，保存后再恢复训练。除 `selected` 外的列属于不可变契约，不应修改。
 选择数量、信号类别和 FFT 类别完全由用户决定；工程代价只给警告，不修改选择。
 需要无人值守基线时显式使用：
 
@@ -33,7 +33,9 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 - 不加 `--auto_optimize_e2e` 时，阈值目标仍是 `accuracy`，`threshold_min_precision=0.95`，`model_search_fp_cost=2.0`，不会自动导出窗口 NPZ，也不会跑 `s07` 后处理搜索。
 - 加 `--auto_optimize_e2e` 后，会自动切换为 `feature_selection_mode=auto`，并进入产品指标优先的端到端优化链路：启用模型搜索、窗口 NPZ 导出、`s07` 后处理搜索，并把阈值目标改成 `precision_constrained`。
 - `--with_postprocess` 只是打开后处理搜索；它不会改成 auto E2E 的精度约束策略，也不会写 `auto_optimize/` 汇总。
-- 商用 8 特征全部进入 83 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。
+- 商用 8 特征全部进入 91 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。采集 `mode` 也作为可选候选参与排序；若选中，必须重点审计跨 subject/device/session/mode 泛化，防止硬件捷径。
+- 原始绿光布局统一映射成三个中心对称光区。光区特征仅使用置换不变的聚合、三对相关性、周期支持和绝对时延，不依赖绝对方位、顺逆时针方向或原始通道编号。
+- 新增 7 项互补候选：top2 稳健偏度与谱熵、ACC jerk 尾部均值、ACC–PPG 有限延迟相关与 PSD 相似度、三光区 2-of-3 周期性和三对时延 RMS。
 - 手动特征会冻结为 `manual_selected_features.json`，随后驱动模型搜参、复杂度约束、hard-negative 候选和 C 部署特征顺序。
 - hard-negative 候选只使用 train OOF 误报；只有 valid accuracy 不下降且 FPR 不恶化才接受，否则自动回滚参考模型。
 
@@ -78,8 +80,8 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 s01 → s02 → s03 → s04 → 暂停，等待人工固化特征
 ```
 
-`s04` 输出完整 83 特征的 `feature_ranking_full.json/csv`、
-`manual_feature_selection.xlsx`、`manual_feature_selection.csv` 和
+`s04` 输出完整 91 特征的 `feature_ranking_full.json/csv`、
+`manual_feature_selection.csv` 和
 `feature_pool_completeness.json`。默认流程不会用 Top-K、分组上限或 FFT 上限覆写人工选择。
 
 创建人工文件后恢复：
@@ -88,7 +90,7 @@ s01 → s02 → s03 → s04 → 暂停，等待人工固化特征
 python s08_run_pipeline.py \
   --artifact_dir artifacts \
   --feature_selection_mode manual \
-  --manual_feature_file artifacts/manual_feature_selection.xlsx \
+  --manual_feature_file artifacts/manual_feature_selection.csv \
   --skip s01,s02,s03,s04 \
   --stop_after s06_cb
 ```
@@ -586,7 +588,7 @@ python s02_ir_dc_threshold.py \
 
 ### `s03_extract_feature_pool.py`
 
-作用：提取 83 项 Stage2 特征池 CSV，包括环境光、绿光、ACC，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
+作用：提取 91 项 Stage2 特征池 CSV，包括采集 `mode`、三个中心对称绿光区、环境光、ACC，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
 
 ```bash
 python s03_extract_feature_pool.py \
@@ -601,7 +603,7 @@ python s03_extract_feature_pool.py \
 
 ### `s04_feature_selection.py`
 
-作用：清洗并完整排序 83 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 Excel 选择接口。manual 模式不应用分组或数量上限。
+作用：清洗并完整排序 91 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 CSV 选择接口。manual 模式不应用分组或数量上限；CSV 中只允许修改 `selected` 列。
 
 ```bash
 python s04_feature_selection.py \
@@ -623,7 +625,7 @@ python s04_feature_selection.py \
 ```bash
 python s05_train_final_model.py \
   --artifact_dir artifacts \
-  --manual_feature_file artifacts/manual_feature_selection.xlsx \
+  --manual_feature_file artifacts/manual_feature_selection.csv \
   --threshold_objective accuracy \
   --model_search \
   --mine_hard_negatives \
@@ -778,9 +780,9 @@ artifacts/
   feature_embedding_report/embedding_report.md
   feature_embedding_report/embedding_summary.json
   feature_embedding_report/embedding_source_data.csv
-  feature_embedding_report/pca_2d / pca_3d (png, svg, pdf, tiff)
-  feature_embedding_report/tsne_2d / tsne_3d (png, svg, pdf, tiff)
-  feature_embedding_report/umap_2d / umap_3d (png, svg, pdf, tiff, 需 umap-learn)
+  feature_embedding_report/pca_2d.png / pca_3d.png
+  feature_embedding_report/tsne_2d.png / tsne_3d.png
+  feature_embedding_report/umap_2d.png / umap_3d.png（需 umap-learn）
   feature_embedding_report/embedding_panel_2d / embedding_panel_3d
   feature_embedding_report/selected_feature_correlation_heatmap
   feature_embedding_report/selected_feature_split_auc_heatmap
@@ -816,7 +818,7 @@ artifacts/
 
 | 图片 | 说明 |
 |---|---|
-| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、83 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
+| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、91 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
 | `report_plots/s04_feature_selection_report.png` | 三栏：左栏 Top 20 特征排名柱状（已选深色标记 + 综合得分折线），右上选入特征的群组分布，右下 Top 12 特征 FP Proxy 风险双柱 |
 | `report_plots/s04_shap_importance.png` | 四栏 SHAP 报告：左上 Top 20 特征 mean(\|SHAP\|) 柱状（已选特征深色），右上 Train vs Valid SHAP 散点 + Spearman ρ 标注，左下 Top-K 重叠率柱状，右下可疑 Train-only 强特征红色柱状 |
 
@@ -854,27 +856,27 @@ artifacts/
 
 | 图片 | 说明 |
 |---|---|
-| `feature_embedding_report/pca_2d.{png,svg,pdf,tiff}` | PCA 2D 散点图（全部数据） |
-| `feature_embedding_report/pca_3d.{png,svg,pdf,tiff}` | PCA 3D 散点图（全部数据） |
-| `feature_embedding_report/tsne_2d.{png,svg,pdf,tiff}` | t-SNE 2D 散点图（全部数据） |
-| `feature_embedding_report/tsne_3d.{png,svg,pdf,tiff}` | t-SNE 3D 散点图（全部数据） |
-| `feature_embedding_report/umap_2d.{png,svg,pdf,tiff}` | UMAP 2D 散点图（全部数据，需 umap-learn） |
-| `feature_embedding_report/umap_3d.{png,svg,pdf,tiff}` | UMAP 3D 散点图（全部数据，需 umap-learn） |
-| `feature_embedding_report/pca_2d_balanced.{png,...}` | PCA 2D 散点图（正样本降采样至与负样本同数量） |
-| `feature_embedding_report/pca_3d_balanced.{png,...}` | PCA 3D 散点图（正负样本平衡） |
-| `feature_embedding_report/tsne_2d_balanced.{png,...}` | t-SNE 2D 散点图（正负样本平衡） |
-| `feature_embedding_report/tsne_3d_balanced.{png,...}` | t-SNE 3D 散点图（正负样本平衡） |
-| `feature_embedding_report/umap_2d_balanced.{png,...}` | UMAP 2D 散点图（正负样本平衡，需 umap-learn） |
-| `feature_embedding_report/umap_3d_balanced.{png,...}` | UMAP 3D 散点图（正负样本平衡，需 umap-learn） |
-| `feature_embedding_report/embedding_panel_2d.{png,...}` | PCA+t-SNE+UMAP 并排 2D 面板（全部数据） |
-| `feature_embedding_report/embedding_panel_3d.{png,...}` | PCA+t-SNE+UMAP 并排 3D 面板（全部数据） |
-| `feature_embedding_report/embedding_panel_2d_balanced.{png,...}` | PCA+t-SNE+UMAP 并排 2D 面板（正负样本平衡） |
-| `feature_embedding_report/embedding_panel_3d_balanced.{png,...}` | PCA+t-SNE+UMAP 并排 3D 面板（正负样本平衡） |
+| `feature_embedding_report/pca_2d.png` | PCA 2D 散点图（全部数据） |
+| `feature_embedding_report/pca_3d.png` | PCA 3D 散点图（全部数据） |
+| `feature_embedding_report/tsne_2d.png` | t-SNE 2D 散点图（全部数据） |
+| `feature_embedding_report/tsne_3d.png` | t-SNE 3D 散点图（全部数据） |
+| `feature_embedding_report/umap_2d.png` | UMAP 2D 散点图（全部数据，需 umap-learn） |
+| `feature_embedding_report/umap_3d.png` | UMAP 3D 散点图（全部数据，需 umap-learn） |
+| `feature_embedding_report/pca_2d_balanced.png` | PCA 2D 散点图（正样本降采样至与负样本同数量） |
+| `feature_embedding_report/pca_3d_balanced.png` | PCA 3D 散点图（正负样本平衡） |
+| `feature_embedding_report/tsne_2d_balanced.png` | t-SNE 2D 散点图（正负样本平衡） |
+| `feature_embedding_report/tsne_3d_balanced.png` | t-SNE 3D 散点图（正负样本平衡） |
+| `feature_embedding_report/umap_2d_balanced.png` | UMAP 2D 散点图（正负样本平衡，需 umap-learn） |
+| `feature_embedding_report/umap_3d_balanced.png` | UMAP 3D 散点图（正负样本平衡，需 umap-learn） |
+| `feature_embedding_report/embedding_panel_2d.png` | PCA+t-SNE+UMAP 并排 2D 面板（全部数据） |
+| `feature_embedding_report/embedding_panel_3d.png` | PCA+t-SNE+UMAP 并排 3D 面板（全部数据） |
+| `feature_embedding_report/embedding_panel_2d_balanced.png` | PCA+t-SNE+UMAP 并排 2D 面板（正负样本平衡） |
+| `feature_embedding_report/embedding_panel_3d_balanced.png` | PCA+t-SNE+UMAP 并排 3D 面板（正负样本平衡） |
 | `feature_embedding_report/embedding_source_data_balanced.csv` | 平衡版本的降维坐标和元数据 |
-| `feature_embedding_report/selected_feature_correlation_heatmap.{png,...}` | 入选特征 Pearson 相关性热图，用于检查冗余和特征簇 |
-| `feature_embedding_report/selected_feature_split_auc_heatmap.{png,...}` | 入选特征在 train/valid/test 各 split 的单变量 AUC separation 热图，用于检查分布漂移和泛化稳定性 |
-| `feature_embedding_report/pca_loading_top_features.{png,...}` | PCA 前两主成分 loading 贡献最高的特征条形图，用于解释降维分离来源 |
-| `feature_embedding_report/feature_distribution_{序号}_{特征名}.{png,...}` | 每个入选特征在 target=0/1 两类的分布对比箱线图 + 散点覆盖 |
+| `feature_embedding_report/selected_feature_correlation_heatmap.png` | 入选特征 Pearson 相关性热图，用于检查冗余和特征簇 |
+| `feature_embedding_report/selected_feature_split_auc_heatmap.png` | 入选特征在 train/valid/test 各 split 的单变量 AUC separation 热图，用于检查分布漂移和泛化稳定性 |
+| `feature_embedding_report/pca_loading_top_features.png` | PCA 前两主成分 loading 贡献最高的特征条形图，用于解释降维分离来源 |
+| `feature_embedding_report/feature_distribution_{序号}_{特征名}.png` | 每个入选特征在 target=0/1 两类的分布对比箱线图 + 散点覆盖 |
 
 UMAP 需安装 `umap-learn` 包。如未安装，报告仍会输出 PCA 和 t-SNE 图，并在 `embedding_summary.json` 中记录 UMAP 跳过原因。
 
@@ -952,7 +954,7 @@ artifacts/deploy_package/
 建议 Python 3.9+。
 
 ```bash
-pip install numpy scipy pandas scikit-learn xgboost joblib h5py matplotlib pillow openpyxl pytest
+pip install numpy scipy pandas scikit-learn xgboost joblib h5py matplotlib pillow pytest
 ```
 
 常用依赖：
@@ -967,7 +969,6 @@ joblib
 h5py
 matplotlib
 pillow
-openpyxl
 pytest
 ```
 

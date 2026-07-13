@@ -6,7 +6,7 @@ from collections import OrderedDict
 from typing import Iterable, Mapping
 
 
-FEATURE_POOL_VERSION = "stage2_interpretable_v3"
+FEATURE_POOL_VERSION = "stage2_interpretable_v5"
 
 COMMERCIAL_8_FEATURE_MAPPING = OrderedDict([
     ("GREEN_CORR", "GREEN_CORR"),
@@ -29,7 +29,6 @@ ROW_METADATA_FIELDS = {
 }
 
 DIAGNOSTIC_ONLY_FIELDS = {
-    "mode",
     "feature_pool_version",
     "TOTAL_INVALID_COUNT",
     "PPG_INVALID_COUNT",
@@ -44,7 +43,6 @@ REMOVED_FEATURES = {
     "SIG_LEN": "constant for a fixed window configuration",
     "SIG_SEC": "constant for a fixed window configuration",
     "G_TOP2_CHANNEL_COUNT": "constant by construction",
-    "mode": "hardware/acquisition shortcut; diagnostic only",
     "TOTAL_INVALID_COUNT": "data-quality diagnostic; not a liveness signal",
     "PPG_INVALID_COUNT": "data-quality diagnostic; not a liveness signal",
     "GREEN_INVALID_COUNT": "data-quality diagnostic; not a liveness signal",
@@ -96,6 +94,7 @@ def _record(
     c_abs_tolerance: float = 1e-6,
     c_rel_tolerance: float = 1e-5,
     deployment_cost: float | None = None,
+    risk_flags: Iterable[str] = (),
     commercial_8_member: bool = False,
     commercial_original_name: str | None = None,
 ) -> dict:
@@ -112,6 +111,7 @@ def _record(
             "acc_motion": 1.6,
             "acc_green_coupling": 1.8,
             "frequency": 2.8,
+            "acquisition_context": 0.1,
         }.get(str(group), 2.0)
     return {
         "group": str(group),
@@ -129,6 +129,7 @@ def _record(
         "c_abs_tolerance": float(c_abs_tolerance),
         "c_rel_tolerance": float(c_rel_tolerance),
         "deployment_cost": float(deployment_cost),
+        "risk_flags": list(risk_flags),
         "commercial_8_member": bool(commercial_8_member),
         "commercial_original_name": (
             str(commercial_original_name) if commercial_original_name is not None else None
@@ -143,6 +144,22 @@ def _add(name: str, **record) -> None:
     if name in FEATURE_CATALOG:
         raise ValueError(f"duplicate Stage2 feature catalog entry: {name}")
     FEATURE_CATALOG[name] = _record(**record)
+
+
+_add(
+    "mode",
+    group="acquisition_context",
+    preprocessing="acquisition_context",
+    formula="integer acquisition mode selected by detect_green_mode (0, 1, or 2)",
+    c_operators=_ops("identity", "integer_compare"),
+    unit="category_code",
+    signal_source="acquisition_mode",
+    buffer_samples=0,
+    accumulator="int32",
+    bounded_range=[0.0, 2.0],
+    deployment_cost=0.1,
+    risk_flags=("hardware_shortcut", "cross_mode_generalization"),
+)
 
 
 for _name, _source, _formula in [
@@ -268,6 +285,27 @@ for _name, _formula, _ops_list in [
         signal_source="green" if _name == "GREEN_CORR" else "green_top2",
     )
 
+_add(
+    "GTOP2_ROBUST_SKEWNESS",
+    group="pulse_shape",
+    preprocessing="pulse_detrended",
+    formula="(P90(top2_pulse)+P10(top2_pulse)-2*P50(top2_pulse))/guarded(P90-P10)",
+    c_operators=_ops("percentile", "safe_ratio"),
+    signal_source="green_top2",
+    bounded_range=[-1.0, 1.0],
+)
+_add(
+    "GTOP2_SPECTRAL_ENTROPY",
+    group="frequency",
+    preprocessing="pulse_detrended",
+    formula="normalized Shannon entropy of top2 spectral power over 0.5-5Hz",
+    c_operators=_ops("hamming", "rfft", "sum_squares", "log", "safe_ratio"),
+    signal_source="green_top2",
+    bounded_range=[0.0, 1.0],
+    fft=True,
+    accumulator="float64",
+)
+
 for _name, _formula, _bounded in [
     ("G_imbalance_mean", "mean(std(g1,g2,g3)/guarded_abs(mean(g1,g2,g3)))", None),
     ("G_imbalance_p90", "P90(std(g1,g2,g3)/guarded_abs(mean(g1,g2,g3)))", None),
@@ -296,6 +334,28 @@ for _name, _formula, _bounded in [
         signal_source="green_3ch",
         bounded_range=_bounded,
     )
+
+_add(
+    "G_2OF3_PERIODICITY",
+    group="green_spatial",
+    preprocessing="pulse_detrended",
+    formula="median of three symmetric-zone autocorrelation peaks over 40-180 bpm lags",
+    c_operators=_ops("three_channel_loop", "autocorrelation", "argmax", "median"),
+    signal_source="green_3zone",
+    bounded_range=[-1.0, 1.0],
+    deployment_cost=1.8,
+)
+_add(
+    "G_ZONE_LAG_RMS_SEC",
+    group="green_spatial",
+    preprocessing="pulse_detrended",
+    formula="RMS absolute bounded cross-correlation peak lag across all three zone pairs",
+    c_operators=_ops("three_channel_loop", "bounded_lag_loop", "correlation", "sum_squares", "sqrt"),
+    unit="s",
+    signal_source="green_3zone",
+    bounded_range=[0.0, 0.4],
+    deployment_cost=1.8,
+)
 
 for _name, _formula, _preprocessing in [
     ("corr_Ambient_Gmean", "corr(ambient_raw, green_raw)", "contact_raw"),
@@ -328,13 +388,25 @@ for _name, _formula, _unit, _bounded, _scale_dep in [
     ("ACC_GREEN_BP_CORR", "abs(corr(acc_motion, green_top2_pulse))", "correlation", [0.0, 1.0], False),
     ("ACC_REL_MOTION", "RMS(acc_motion)/guarded_mean(acc_magnitude)", "ratio", None, False),
     ("ACC_GREEN_REL_MOTION_GAP", "abs(log1p(ACC_REL_MOTION)-log1p(GTOP2_AC_DC_RATIO))", "log-ratio", None, False),
+    ("ACC_JERK_TAIL_MEAN_REL", "mean(largest 10% abs(diff(acc_magnitude)))/guarded_mean(acc_magnitude)", "ratio/sample", None, False),
+    ("ACC_GREEN_MAX_LAG_CORR", "max abs corr(acc_motion, green_top2_pulse) over +/-0.4s", "correlation", [0.0, 1.0], False),
+    ("ACC_GREEN_PSD_SIMILARITY", "cosine similarity of acc-motion and green-top2 spectral power over 0.5-5Hz", "similarity", [0.0, 1.0], False),
 ]:
+    _acc_ops = _ops(
+        "vector_norm", "rolling_median", "difference", "rms", "safe_ratio", "correlation"
+    )
+    if _name == "ACC_JERK_TAIL_MEAN_REL":
+        _acc_ops = _ops("vector_norm", "difference", "absolute", "partial_sort", "mean", "safe_ratio")
+    elif _name == "ACC_GREEN_MAX_LAG_CORR":
+        _acc_ops = _ops("vector_norm", "rolling_median", "bounded_lag_loop", "correlation", "absolute")
+    elif _name == "ACC_GREEN_PSD_SIMILARITY":
+        _acc_ops = _ops("vector_norm", "rolling_median", "hamming", "rfft", "sum_squares", "cosine_similarity")
     _add(
         _name,
         group="acc_motion" if not _name.startswith("ACC_GREEN") else "acc_green_coupling",
         preprocessing="acc_motion" if not _name.startswith("ACC_GREEN") else "cross_signal",
         formula=_formula,
-        c_operators=_ops("vector_norm", "rolling_median", "difference", "rms", "safe_ratio", "correlation"),
+        c_operators=_acc_ops,
         unit=_unit,
         signal_source="acc" if not _name.startswith("ACC_GREEN") else "acc+green_top2",
         bounded_range=_bounded,
@@ -376,6 +448,10 @@ def selected_catalog(selected_features: Iterable[str]) -> OrderedDict:
 
 
 SHARED_PREPROCESSING = OrderedDict([
+    ("acquisition_context", {
+        "steps": ["reuse_detected_mode", "integer_range_check_0_2"],
+        "purpose": "expose the acquisition/channel-layout mode as an optional governed feature",
+    }),
     ("quality_raw", {
         "steps": ["finite_replace"],
         "purpose": "measure flatness and isolated spikes before repair",
