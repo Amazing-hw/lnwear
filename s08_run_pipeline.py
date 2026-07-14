@@ -2070,14 +2070,16 @@ def export_deploy_cookbook(artifact_dir):
 
         # ---- Section D: Stage1 & Stage3 ----
         "D_stage1_gate": {
-            "_note": "XGBoost 之前先跑 IR 粗筛",
+            "_note": "IR 快速门控与 Stage2 持续推理并行运行；这里只屏蔽最终对外输出",
             "ir_5hz": "resample(ir_raw_100Hz -> 5Hz)",
             "primitive_window": "1s stride=1s (5 points @5Hz)",
             "decision_window": "3 consecutive primitive decisions",
             "dc_formula": "min(neighbor_mean) where neighbor_mean[i]=(x[i]+x[i+1])/2",
             "ac_formula": "median(|diff(x)|)",
             "rule": "dc > dc_thresh AND ac/|dc| < acdc_thresh",
-            "streaming_gate_rule": "open Stage2 after 3 consecutive pass primitives; close after 3 consecutive fail primitives",
+            "streaming_gate_rule": "set stage1_gate=1 after 3 consecutive pass primitives; set it to 0 after 3 consecutive fail primitives",
+            "fusion_rule": "output_state[t] = stage1_gate[t] AND stage2_state[t]",
+            "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
             "thresholds": {},
         },
         "D_stage3_postprocess": {
@@ -2088,6 +2090,7 @@ def export_deploy_cookbook(artifact_dir):
                 "score[t] = alpha * quality[t] * proba[t] + (1-alpha*quality[t]) * score[t-1]",
                 "IF state==0 and count(score>T_on) >= K_on and cooldown_expired: state=1, reset counter",
                 "IF state==1 and count(score<T_off) >= K_off and cooldown_expired: state=0, reset counter",
+                "output_state[t] = stage1_gate[t] AND state[t]  // gate never pauses or resets Stage2",
                 "quality[t] from Ambient_std / G_mean_mean thresholds (from bundle)",
             ],
             "quality_thresholds": bundle.get("quality_thresholds", {}),
@@ -2166,18 +2169,18 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
 
     1. per_sample_xgboost_windows.csv   — Stage2 单窗 XGBoost 准确率
        与 compute_window_model_metrics 一致：
-         - 跳过 fallback / Stage1 失败 / 无窗口的样本
-         - 所有通过 Stage1 的窗口全部参与，不做 warmup 跳过
+         - 仅跳过 fallback / 无窗口的样本
+         - 所有合法 Stage2 窗口参与，不按 Stage1 过滤
 
     2. per_sample_statemachine_windows.csv — 状态机后处理窗口准确率
        与 compute_window_stream_metrics 一致：
-         - 跳过 fallback / Stage1 失败的样本
+         - 仅跳过 fallback 的样本，并使用独立 Stage2 状态
          - 按 warmup_frames 跳过每条样本前 N 个窗口（消除冷启动）
          - 逐窗比较 state[i] vs window_targets[i]
 
     3. per_sample_final_prediction.csv  — 样本级最终预测结果
        与 compute_sample_metrics 一致：
-         - fallback / Stage1 失败一律 pred=0 参与统计
+         - pred 是 Stage1 门控与持续 Stage2 状态融合后的最终输出
     """
     import os as _os
     import json as _json
@@ -2196,12 +2199,12 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
         warmup_frames = int((eval_payload.get("window_stream_summary") or {}).get("warmup_frames", 5))
 
     # ---- CSV 1: XGBoost 单窗预测 ----
-    # 与 compute_window_model_metrics 一致：跳过 fallback / Stage1 失败 / 无窗口的样本
+    # 与 compute_window_model_metrics 一致：Stage2 独立窗口指标不按 Stage1 过滤。
     rows_xgb = []
     for d in details:
         name = d.get("sample_name", "")
         wpreds = d.get("window_preds", [])
-        if d.get("fallback", False) or not d.get("stage1_pass", False) or len(wpreds) == 0:
+        if d.get("fallback", False) or len(wpreds) == 0:
             continue
         wtargs = d.get("window_targets", [])
         sample_target = int(d.get("target", 0))
@@ -2236,8 +2239,8 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
     rows_sm_detail = []
     for d in details:
         name = d.get("sample_name", "")
-        states = d.get("window_states", [])
-        if d.get("fallback", False) or not d.get("stage1_pass", False) or len(states) == 0:
+        states = d.get("stage2_states", d.get("window_states", []))
+        if d.get("fallback", False) or len(states) == 0:
             continue
         wtargs = d.get("window_targets", [])
         sample_target = int(d.get("target", 0))
@@ -2282,7 +2285,7 @@ def generate_eval_csv(artifact_dir, split="test", method="state_machine"):
           f"global_acc={round(sm_global_acc, 6) if total_sm_wins > 0 else 0})")
 
     # ---- CSV 3: 样本级最终预测 ----
-    # 与 compute_sample_metrics 一致：fallback / Stage1 失败一律 pred=0
+    # 与 compute_sample_metrics 一致：pred 是 Stage1 AND Stage2 的最终融合输出。
     rows_sample = []
     for d in details:
         name = d.get("sample_name", "")

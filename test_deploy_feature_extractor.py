@@ -612,7 +612,7 @@ def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_
         tmp_path / "model_bundle.pkl",
     )
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":1.0}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":100000,"ac_dc_threshold":1.0}}',
         encoding="utf-8",
     )
 
@@ -642,7 +642,7 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
     model.fit(np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float), np.asarray([0, 1]))
 
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":1.0}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":100000,"ac_dc_threshold":1.0}}',
         encoding="utf-8",
     )
     (tmp_path / "selected_features.json").write_text(
@@ -695,7 +695,7 @@ def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(t
     model.fit(np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=float), np.asarray([0, 1]))
 
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":1.0}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":100000,"ac_dc_threshold":1.0}}',
         encoding="utf-8",
     )
     joblib.dump(
@@ -757,7 +757,7 @@ def test_export_golden_vectors_and_validate_feature_order(tmp_path):
         np.asarray([0, 1]),
     )
     (tmp_path / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":1500000,"ac_dc_threshold":1.0}}',
+        '{"deploy_stage1_threshold":{"dc_threshold":100000,"ac_dc_threshold":1.0}}',
         encoding="utf-8",
     )
     joblib.dump(

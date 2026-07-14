@@ -25,6 +25,7 @@ def _base_payload() -> dict:
             "fallback": False,
             "window_preds": [0, 1, 1],
             "window_states": [0, 1, 1],
+            "stage2_states": [0, 1, 1],
             "window_targets": [0, 1, 1],
             "window_probs": [0.1, 0.9, 0.9],
         },
@@ -35,7 +36,8 @@ def _base_payload() -> dict:
             "stage1_pass": False,
             "fallback": False,
             "window_preds": [1],
-            "window_states": [1],
+            "window_states": [0],
+            "stage2_states": [1],
             "window_targets": [0],
             "window_probs": [0.9],
         },
@@ -47,6 +49,7 @@ def _base_payload() -> dict:
             "fallback": True,
             "window_preds": [1],
             "window_states": [1],
+            "stage2_states": [1],
             "window_targets": [1],
             "window_probs": [0.8],
         },
@@ -58,6 +61,7 @@ def _base_payload() -> dict:
             "fallback": False,
             "window_preds": [],
             "window_states": [],
+            "stage2_states": [],
             "window_targets": [],
             "window_probs": [],
         },
@@ -69,9 +73,9 @@ def _base_payload() -> dict:
         },
         "window_model_summary": {
             "warmup_frames": 0,
-            "total_windows": 3,
-            "accuracy": 1.0,
-            "confusion_matrix": {"TN": 1, "FP": 0, "FN": 0, "TP": 2},
+            "total_windows": 4,
+            "accuracy": 0.75,
+            "confusion_matrix": {"TN": 1, "FP": 1, "FN": 0, "TP": 2},
         },
         "window_stream_summary": {
             "warmup_frames": 1,
@@ -94,18 +98,18 @@ def test_generate_eval_csv_matches_official_metric_summaries(tmp_path):
     sm_detail = pd.read_csv(tmp_path / "statemachine_window_details.csv")
     sample = pd.read_csv(tmp_path / "per_sample_final_prediction.csv")
 
-    assert xgb["total_windows"].sum() == 3
+    assert xgb["total_windows"].sum() == 4
     assert xgb["correct_windows"].sum() == 3
-    assert set(xgb["sample_name"]) == {"mixed-pass"}
+    assert set(xgb["sample_name"]) == {"mixed-pass", "stage1-fail"}
 
-    assert sm["raw_windows"].sum() == 3
-    assert sm["skipped_warmup_windows"].sum() == 1
+    assert sm["raw_windows"].sum() == 4
+    assert sm["skipped_warmup_windows"].sum() == 2
     assert sm["total_windows"].sum() == 2
     assert sm["correct_windows"].sum() == 2
     assert sm["output_valid_windows"].sum() == 2
-    assert set(sm["sample_name"]) == {"mixed-pass"}
-    assert sm_detail["output_valid"].tolist() == [0, 1, 1]
-    assert sm_detail["state_output"].isna().tolist() == [True, False, False]
+    assert set(sm["sample_name"]) == {"mixed-pass", "stage1-fail"}
+    assert sm_detail["output_valid"].tolist() == [0, 1, 1, 0]
+    assert sm_detail["state_output"].isna().tolist() == [True, False, False, True]
 
     assert len(sample) == 4
     assert sample["is_correct"].sum() == 3

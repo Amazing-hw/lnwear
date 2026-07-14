@@ -80,12 +80,17 @@ def _figure_quartet(png_path: Path):
 
 def _test_evaluation_passed(payload):
     contract = payload.get("evaluation_contract", {}) if isinstance(payload, dict) else {}
+    summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
     return bool(
         contract.get("split") == "test"
         and contract.get("test_read_only") is True
         and contract.get("configuration_frozen") is True
         and contract.get("selection_performed") is False
-        and isinstance(payload.get("summary"), dict)
+        and isinstance(summary, dict)
+        and summary.get("parallel_semantics_version") == "stage1_mask_stage2_continuous_v1"
+        and isinstance(summary.get("stage1_only"), dict)
+        and isinstance(summary.get("stage2_independent"), dict)
+        and isinstance(summary.get("fused_output"), dict)
         and isinstance(payload.get("window_model_summary"), dict)
         and isinstance(payload.get("window_stream_summary"), dict)
     )

@@ -6,14 +6,14 @@
 
 输入支持两种形态：
 - 3D 预切窗 PPG：直接逐个使用 H5 中已有窗口，不再二次滑窗。
-- 连续时序 PPG：通过 Stage1 后降采样到 25Hz，再按 5s/1s 滑窗（可显式切到 3s）。
+- 连续时序 PPG：独立降采样到 25Hz，再按 5s/1s 滑窗（可显式切到 3s）。
 - grouped-window H5：一个 record 下多个窗口 group，窗口名末尾为 *_w20_1；
   读取时按 w 后数字排序，label 来自最后一段。
 
 功能：
 1. 读取 artifacts/splits.json
 2. 读取 artifacts/stage1_threshold.json
-3. 对通过 Stage1 IR DC/ACDC 阈值的样本提取 5s/25Hz Stage2 特征
+3. 对全部合法样本/窗口提取 5s/25Hz Stage2 特征；Stage1 仅独立统计，不过滤 Stage2
 4. 复用原始 H5 读取方式
 5. 复用原始绿光通道构建方式：
    - mode=1: ch3/ch4/ch5 已表示三个中心对称光区
@@ -3077,10 +3077,11 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                               use_stage2_ir=DEFAULT_USE_STAGE2_IR):
     """
-    单样本抽窗特征。返回 rows list（失败时返回 []）。
+    单样本全量抽窗特征。返回 rows list（失败时返回 []）。
 
-    3D 预切窗样本直接使用已有窗口；连续时序样本在 Stage1 后降采样
-    ppg 到 25Hz 再滑窗，大幅降低计算量。
+    Stage1 与 Stage2 并行运行；dc_threshold/ac_dc_threshold 仅为旧调用接口
+    兼容参数，不过滤 Stage2 训练、验证或测试窗口。3D 预切窗样本直接使用
+    已有窗口；连续时序样本降采样到 25Hz 后滑窗。
     fs 参数为降采样后目标采样率 (25Hz)。
     """
     FEATURE_FS = 25  # 特征提取统一采样率
@@ -3106,8 +3107,6 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
             window_target = int(window_labels[win_idx]) if window_labels and win_idx < len(window_labels) else int(sample["target"])
             raw_window = ppg[win_idx]
             if raw_window.shape[0] < 2:
-                continue
-            if not stage1_sample_pass(raw_window, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs):
                 continue
             if native_25hz:
                 window = raw_window.astype(np.float64, copy=False)
@@ -3159,8 +3158,6 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
     native_25hz = _is_25hz_sample(sample)
     ppg_src_fs = 25 if native_25hz else 100
 
-    if not stage1_sample_pass(ppg, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs):
-        return []
     mode = detect_green_mode(ppg)
     sample_target = int(sample.get("target", 0))
 

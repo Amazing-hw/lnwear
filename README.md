@@ -38,16 +38,19 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 - 新增 7 项互补候选：top2 稳健偏度与谱熵、ACC jerk 尾部均值、ACC–PPG 有限延迟相关与 PSD 相似度、三光区 2-of-3 周期性和三对时延 RMS。
 - 手动特征会冻结为 `manual_selected_features.json`，随后驱动模型搜参、复杂度约束、hard-negative 候选和 C 部署特征顺序。
 - hard-negative 候选只使用 train OOF 误报；只有 valid accuracy 不下降且 FPR 不恶化才接受，否则自动回滚参考模型。
+- Stage1 与 Stage2 是两条并行方法：Stage2 对全量合法窗口持续完成特征、模型和 EMA/投票/状态机更新；Stage1 只在最终对外输出端做快速门控，不过滤 Stage2 数据，也不暂停或重置 Stage2 状态。
 
 ## 2. 三阶段架构
 
 ```text
 原始 H5
   → s01 数据扫描与 train/valid/test 切分
-  → s02 Stage1 IR DC/ACDC 固定阈值门控
-  → s03 Stage2 特征池提取
+  ├→ s02 Stage1 IR DC/ACDC 固定阈值快速门控 ───────────────┐
+  └→ s03 Stage2 全量特征池提取
   → s04 稳定性特征筛选与候选子集搜索
   → s05 XGBoost 训练、校准、阈值选择、模型搜索
+  → s06 Stage2 持续后处理 ───────────────────────────────┤
+                                                      └→ Stage1 AND Stage2 最终输出
   → s06 部署式端到端评估与部署产物导出
   → s07 可选：基于窗口 NPZ 的后处理状态机搜索
   → s09 可选：商业 AdaBoost baseline 对比
@@ -56,11 +59,14 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 
 ### Stage1
 
-`s02_ir_dc_threshold.py` 使用 IR DC/ACDC 做快速门控。它是前置过滤层，不是最终 XGBoost 输入特征的一部分。
+`s02_ir_dc_threshold.py` 使用 IR DC/ACDC 做快速门控。固定部署阈值为
+`dc_threshold=0.1e6`（100,000）、`ac_dc_threshold=1.0`；训练侧仍记录按
+`train_dc_ratio=0.90` 派生的 `dc_threshold=0.09e6`（90,000），用于 Stage1 独立统计。
+它不是 Stage2 数据过滤器，也不是最终 XGBoost 输入特征的一部分。
 
 ### Stage2
 
-`s03_extract_feature_pool.py` 从通过 Stage1 的窗口中提取环境光、三路绿光和 ACC 特征。当前 Stage2 固定不使用 IR 派生特征；`--use_stage2_ir` 只保留为兼容旧命令的参数，不建议作为新实验方向。
+`s03_extract_feature_pool.py` 从所有合法窗口中提取环境光、三路绿光和 ACC 特征，train/valid/test 均不按 Stage1 过滤。推理时 Stage2 模型及后处理也始终持续执行；`stage1_gate_flags` 只用于生成最终融合输出。当前 Stage2 固定不使用 IR 派生特征；`--use_stage2_ir` 只保留为兼容旧命令的参数，不建议作为新实验方向。
 
 ### Stage3
 
@@ -578,7 +584,8 @@ python s01_data_split.py \
 
 ### `s02_ir_dc_threshold.py`
 
-作用：生成 Stage1 IR DC/ACDC 固定门控统计和阈值产物。
+作用：使用部署 DC=`0.1e6`、AC/DC=`1.0` 生成 Stage1 固定门控统计和阈值产物；
+默认训练门控 DC 按 0.90 比例派生为 `0.09e6`。
 
 ```bash
 python s02_ir_dc_threshold.py \

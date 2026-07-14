@@ -14,6 +14,92 @@ import s07_postprocess_optimize as s07
 ROOT = Path(__file__).resolve().parent
 
 
+def test_window_model_metrics_include_stage1_closed_windows():
+    metrics = s06.compute_window_model_metrics([
+        {
+            "sample_name": "closed_but_computed",
+            "target": 1,
+            "stage1_pass": False,
+            "fallback": False,
+            "window_preds": [1, 1],
+            "window_targets": [1, 1],
+        }
+    ])
+
+    assert metrics["total_windows"] == 2
+    assert metrics["accuracy"] == 1.0
+
+
+def test_stage2_state_warms_while_stage1_masks_external_output():
+    cfg = {
+        **s06.DEFAULT_POSTPROCESS_CONFIG,
+        "alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.2,
+        "K_on": 2,
+        "K_off": 2,
+        "cooldown_sec": 0,
+    }
+    summary, details = s06.compute_sample_metrics(
+        [{
+            "sample_name": "parallel",
+            "target": 1,
+            "stage1_pass": True,
+            "fallback": False,
+            "window_probs": [0.9, 0.9, 0.9],
+            "window_preds": [1, 1, 1],
+            "quality_metas": [{}, {}, {}],
+            "stage1_gate_flags": [0, 0, 1],
+        }],
+        method="state_machine",
+        cfg=cfg,
+        model_threshold=0.5,
+        stride_sec=1.0,
+    )
+
+    detail = details[0]
+    assert detail["stage2_states"] == [0, 1, 1]
+    assert detail["output_states"] == [0, 0, 1]
+    assert detail["window_states"] == detail["output_states"]
+    assert detail["stage2_pred"] == 1
+    assert detail["pred"] == 1
+    assert summary["stage2_independent"]["accuracy"] == 1.0
+    assert summary["fused_output"]["accuracy"] == 1.0
+
+
+def test_stage1_closed_masks_output_without_changing_stage2_prediction():
+    cfg = {
+        **s06.DEFAULT_POSTPROCESS_CONFIG,
+        "alpha": 1.0,
+        "T_on": 0.5,
+        "T_off": 0.2,
+        "K_on": 1,
+        "K_off": 1,
+        "cooldown_sec": 0,
+    }
+    _summary, details = s06.compute_sample_metrics(
+        [{
+            "sample_name": "closed",
+            "target": 1,
+            "stage1_pass": False,
+            "fallback": False,
+            "window_probs": [0.9, 0.9],
+            "window_preds": [1, 1],
+            "quality_metas": [{}, {}],
+            "stage1_gate_flags": [0, 0],
+        }],
+        method="state_machine",
+        cfg=cfg,
+        model_threshold=0.5,
+    )
+
+    assert details[0]["stage2_pred"] == 1
+    assert details[0]["pred"] == 0
+    assert details[0]["stage2_states"] == [1, 1]
+    assert details[0]["output_states"] == [0, 0]
+
+
 class _DeployTestBooster:
     def get_dump(self, with_stats=True):
         return ["0:leaf=0.0,cover=1.0"]
@@ -198,6 +284,7 @@ def test_window_cache_preserves_window_indices_and_targets(tmp_path):
         "mode": 0,
         "window_probs": [0.2, 0.8],
         "window_preds": [0, 1],
+        "stage1_gate_flags": [0, 1],
         "stage2_enabled_flags": [1, 1],
         "window_start_sec": [3.0, 20.0],
         "window_end_sec": [6.0, 23.0],
@@ -217,6 +304,7 @@ def test_window_cache_preserves_window_indices_and_targets(tmp_path):
 
     assert cache["window_indices"].tolist() == [3, 20]
     assert cache["window_targets"].tolist() == [0, 1]
+    assert cache["stage1_gate"].tolist() == [0, 1]
 
 
 def test_window_cache_export_removes_only_top_level_obsolete_npz(tmp_path):

@@ -59,9 +59,12 @@ from s06_deploy_eval import (
     apply_postprocess,
     compute_window_model_metrics,
     compute_window_stream_metrics,
+    fuse_stage1_stage2_states,
     get_deploy_stage1_threshold,
     load_bundle,
+    resolve_stage1_gate_flags,
     resolve_use_stage2_ir,
+    sample_pred_from_states,
 )
 from scientific_figures import save_scientific_figure
 
@@ -301,13 +304,18 @@ def _commercial_stage1_window_pass(window, dc_threshold, ppg_src_fs):
 
 
 def infer_one_sample_commercial(sample, dc_threshold: float):
-    """Run commercial Stage1 and collect Stage2 feature vectors for one sample."""
+    """Run both commercial stages in parallel for one sample.
+
+    Stage1 records a fast gate only. Stage2 features are extracted for every
+    valid evaluation window, including windows for which the gate is closed.
+    """
     base = {
         "sample_name": sample.get("sample_name", "unknown"),
         "target": int(sample.get("target", 0)),
-        "stage1_pass": True,
+        "stage1_pass": False,
         "features": [],
         "window_targets": [],
+        "stage1_gate_flags": [],
         "stage2_enabled_flags": [],
         "fallback": False,
         "fallback_reason": None,
@@ -321,10 +329,8 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
                 raw_window = ppg[idx]
                 window_25, ppg_src_fs = _prewindow_to_25hz(sample, raw_window, window_sec=COMMERCIAL_WIN_SEC)
                 enabled = _commercial_stage1_window_pass(raw_window, dc_threshold, ppg_src_fs)
+                base["stage1_gate_flags"].append(int(enabled))
                 base["stage2_enabled_flags"].append(int(enabled))
-                if not enabled:
-                    base["features"].append(None)
-                    continue
                 try:
                     ir, ambient, g1, g2, g3 = get_channels_from_window(window_25, mode)
                     acc_seg = None
@@ -333,6 +339,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
                     base["features"].append(extract_8_commercial_features(ir, ambient, g1, g2, g3, acc_seg))
                 except Exception:
                     base["features"].append(None)
+            base["stage1_pass"] = bool(any(base["stage1_gate_flags"]))
             return base
         ppg_25, acc_25, ppg_src_fs = _to_25hz(sample, ppg, acc)
     except Exception as exc:
@@ -361,10 +368,8 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
         enabled, last_s1_step = _advance_stage1_gate_to_step(
             gate, ir_5hz, s1_win, s1_stride, last_s1_step, target_s1_step
         )
+        base["stage1_gate_flags"].append(int(enabled))
         base["stage2_enabled_flags"].append(int(enabled))
-        if not enabled:
-            base["features"].append(None)
-            continue
         try:
             window = ppg_25[s2_start:s2_start + s2_win, :]
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
@@ -372,6 +377,7 @@ def infer_one_sample_commercial(sample, dc_threshold: float):
             base["features"].append(extract_8_commercial_features(ir, ambient, g1, g2, g3, acc_seg))
         except Exception:
             base["features"].append(None)
+    base["stage1_pass"] = bool(any(base["stage1_gate_flags"]))
     return base
 
 
@@ -391,13 +397,13 @@ def collect_commercial_training_windows(samples, dc_threshold: float):
         if result.get("fallback"):
             diag["fallback_samples"] += 1
             continue
-        enabled_flags = result.get("stage2_enabled_flags", [])
+        enabled_flags = resolve_stage1_gate_flags(result, len(result.get("features", [])))
         for idx, feature_vec in enumerate(result.get("features", [])):
             stage2_enabled = enabled_flags[idx] if idx < len(enabled_flags) else False
-            if not stage2_enabled:
+            if stage2_enabled:
+                diag["stage1_pass_windows"] += 1
+            else:
                 diag["stage1_fail_windows"] += 1
-                continue
-            diag["stage1_pass_windows"] += 1
             if feature_vec is None:
                 diag["extract_error_windows"] += 1
                 continue
@@ -413,19 +419,18 @@ def collect_commercial_training_windows(samples, dc_threshold: float):
             "commercial baseline has no valid training windows",
             f"  total samples: {diag['total_samples']}",
             f"  fallback/load-failure samples: {diag['fallback_samples']}",
-            f"  Stage1-passed windows: {diag['stage1_pass_windows']}",
-            f"  Stage1-failed windows: {diag['stage1_fail_windows']}",
+            f"  Stage1-open windows (diagnostic only): {diag['stage1_pass_windows']}",
+            f"  Stage1-closed windows (diagnostic only): {diag['stage1_fail_windows']}",
             f"  feature extraction errors: {diag['extract_error_windows']}",
             f"  invalid (shape/NaN) features: {diag['invalid_feature_windows']}",
             f"  valid windows collected: {diag['valid_windows']}",
             f"  dc_threshold used: {dc_threshold}",
             "",
             "常见原因与排查:",
-            "  1. IR DC 值过低 — 尝试降低 --commercial_dc_threshold（当前 {:.1e}）".format(float(dc_threshold)),
-            "  2. 训练集样本数不足或全部加载失败 — 检查 splits.json 中 train split 是否包含有效 H5",
-            "  3. 窗口太短无法提取 8 个商业特征 — 确认 window_sec >= 5 且 PPG 采样率 100Hz",
-            "  4. 若项目流水线 (s01-s06) 正常运行但 s09 报此错，说明 DC 阈值对商业 baseline 偏严",
-            "     （项目 Stage1 同时检查 AC/DC 比值且有训练宽松阈值，商业 baseline 仅检查 DC）",
+            "  1. 训练集样本数不足或全部加载失败 — 检查 splits.json 中 train split 是否包含有效 H5",
+            "  2. 窗口太短无法提取 8 个商业特征 — 确认 window_sec >= 5 且采样率元数据正确",
+            "  3. 特征含 NaN/inf 或通道布局无法解析 — 检查 H5 通道、mode 和预切窗形状",
+            "  注：Stage1 DC 阈值仅用于门控诊断，不会过滤商业 Stage2 的训练窗口。",
         ]
         raise RuntimeError("\n".join(msg_lines))
     return np.asarray(X, dtype=float), np.asarray(y, dtype=int)
@@ -464,23 +469,32 @@ def _finalize_commercial_results(raw_results, threshold: float):
     for raw in raw_results:
         probs = [float(p) for p in raw.get("window_probs", [])]
         window_preds = [int(p >= threshold) for p in probs]
+        gate_flags = resolve_stage1_gate_flags(raw, len(window_preds))
+        output_states = fuse_stage1_stage2_states(window_preds, gate_flags)
         if raw.get("fallback") or not window_preds:
+            stage2_pred = 0
             final_pred = 0
         else:
-            final_pred = int(np.mean(window_preds) >= 0.5)
+            stage2_pred = int(np.mean(window_preds) >= 0.5)
+            final_pred = int(np.mean(output_states) >= 0.5)
         details.append({
             "sample_name": raw.get("sample_name"),
             "target": int(raw.get("target", 0)),
             "pred": int(final_pred),
-            "stage1_pass": bool(any(raw.get("stage2_enabled_flags", []))),
+            "stage2_pred": int(stage2_pred),
+            "stage1_pred": int(bool(any(gate_flags))),
+            "stage1_pass": bool(any(gate_flags)),
             "fallback": bool(raw.get("fallback", False)),
             "fallback_reason": raw.get("fallback_reason"),
             "window_probs": probs,
             "window_preds": window_preds,
             "window_targets": [int(value) for value in raw.get("window_targets", [])],
-            "window_states": [],
+            "window_states": [int(s) for s in output_states],
+            "stage2_states": [int(s) for s in window_preds],
+            "output_states": [int(s) for s in output_states],
             "window_scores": [],
-            "stage2_enabled_flags": list(raw.get("stage2_enabled_flags", [])),
+            "stage1_gate_flags": list(gate_flags),
+            "stage2_enabled_flags": list(gate_flags),
             "n_windows": int(len(probs)),
         })
     return details
@@ -507,20 +521,33 @@ def _apply_state_machine_to_details(details, threshold: float, postprocess_cfg):
         cfg.update(postprocess_cfg)
     for detail in details:
         probs = [float(p) for p in detail.get("window_probs", [])]
-        if detail.get("fallback") or not detail.get("stage1_pass", False) or len(probs) == 0:
+        if detail.get("fallback") or len(probs) == 0:
             detail["stream_pred"] = 0
+            detail["stage2_stream_pred"] = 0
             detail["window_states"] = []
+            detail["stage2_states"] = []
+            detail["output_states"] = []
             detail["window_scores"] = []
             continue
-        pred, states, _window_preds, scores = apply_postprocess(
+        _pred, states, _window_preds, scores = apply_postprocess(
             probs,
             [{} for _ in probs],
             "state_machine",
             cfg,
             threshold,
         )
-        detail["stream_pred"] = int(pred)
-        detail["window_states"] = [int(s) for s in states]
+        gate_flags = resolve_stage1_gate_flags(detail, len(states))
+        output_states = fuse_stage1_stage2_states(states, gate_flags)
+        strategy = cfg.get("sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"])
+        warmup_frames = cfg.get(
+            "sample_pred_warmup_frames",
+            DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"],
+        )
+        detail["stage2_stream_pred"] = int(sample_pred_from_states(states, strategy, warmup_frames))
+        detail["stream_pred"] = int(sample_pred_from_states(output_states, strategy, warmup_frames))
+        detail["window_states"] = [int(s) for s in output_states]
+        detail["stage2_states"] = [int(s) for s in states]
+        detail["output_states"] = [int(s) for s in output_states]
         detail["window_scores"] = [float(s) for s in scores]
     return cfg
 
@@ -534,6 +561,20 @@ def _build_eval_payload(details, postprocess_cfg, model_threshold, warmup_frames
     except (TypeError, ValueError):
         warmup_frames = 5
     summary = metrics_from_details(details)
+    stage1_summary = _metrics(
+        [int(d.get("target", 0)) for d in details],
+        [int(d.get("stage1_pred", d.get("stage1_pass", False))) for d in details],
+    )
+    stage2_summary = _metrics(
+        [int(d.get("target", 0)) for d in details],
+        [int(d.get("stage2_pred", d.get("pred", 0))) for d in details],
+    )
+    summary.update({
+        "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
+        "stage1_only": stage1_summary,
+        "stage2_independent": stage2_summary,
+        "fused_output": dict(summary),
+    })
     window_model_summary = compute_window_model_metrics(details)
     window_stream_summary = compute_window_stream_metrics(
         details,
@@ -661,11 +702,12 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
     base = {
         "sample_name": sample.get("sample_name", "unknown"),
         "target": int(sample.get("target", 0)),
-        "stage1_pass": True,
+        "stage1_pass": False,
         "mode": 0,
         "window_probs": [],
         "window_preds": [],
         "window_targets": [],
+        "stage1_gate_flags": [],
         "stage2_enabled_flags": [],
         "fallback": False,
         "fallback_reason": None,
@@ -694,8 +736,6 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
                     ppg_fs=ppg_src_fs,
                 )
                 flags.append(int(enabled))
-                if not enabled:
-                    continue
                 try:
                     ir, ambient, g1, g2, g3 = get_channels_from_window(window_25, mode)
                     acc_seg = None
@@ -716,7 +756,9 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
                     window_preds[idx] = int(pred_probs[row_i] >= model_threshold)
             base["window_probs"] = probs.tolist()
             base["window_preds"] = window_preds.tolist()
+            base["stage1_gate_flags"] = flags
             base["stage2_enabled_flags"] = flags
+            base["stage1_pass"] = bool(any(flags))
             return _finalize_project_detail(base, method, postprocess_cfg, model_threshold)
         ppg_25, acc_25, ppg_src_fs = _to_25hz(sample, ppg, acc)
     except Exception as exc:
@@ -758,8 +800,6 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
             gate, ir_5hz, s1_win, s1_stride, last_s1_step, target_s1_step
         )
         flags[step] = int(enabled)
-        if not enabled:
-            continue
         try:
             window = ppg_25[s2_start:s2_start + s2_win, :]
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
@@ -781,39 +821,62 @@ def infer_one_sample_project(sample, artifacts, window_sec=None, stride_sec=None
 
     base["window_probs"] = probs.tolist()
     base["window_preds"] = window_preds.tolist()
+    base["stage1_gate_flags"] = flags
     base["stage2_enabled_flags"] = flags
+    base["stage1_pass"] = bool(any(flags))
     return _finalize_project_detail(base, method, postprocess_cfg, model_threshold)
 
 
 def _finalize_project_detail(base, method, postprocess_cfg, model_threshold):
     probs = base.get("window_probs", [])
-    if base.get("fallback") or not base.get("stage1_pass", False) or len(probs) == 0:
+    gate_flags = resolve_stage1_gate_flags(base, len(probs))
+    if base.get("fallback") or len(probs) == 0:
         pred = 0
+        stage2_pred = 0
         states = []
+        output_states = []
         scores = []
         window_preds = list(base.get("window_preds", []))
     else:
-        pred, states, window_preds, scores = apply_postprocess(
+        stage2_pred, states, window_preds, scores = apply_postprocess(
             probs,
             [{} for _ in probs],
             method,
             postprocess_cfg,
             model_threshold,
         )
+        states = list(states) if len(states) == len(probs) else list(window_preds)
+        output_states = fuse_stage1_stage2_states(states, gate_flags)
+        cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
+        if postprocess_cfg:
+            cfg.update(postprocess_cfg)
+        pred = sample_pred_from_states(
+            output_states,
+            cfg.get("sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]),
+            cfg.get(
+                "sample_pred_warmup_frames",
+                DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"],
+            ),
+        )
     return {
         "sample_name": base.get("sample_name"),
         "target": int(base.get("target", 0)),
         "pred": int(pred),
-        "stage1_pass": bool(base.get("stage1_pass", False)),
+        "stage2_pred": int(stage2_pred),
+        "stage1_pred": int(bool(any(gate_flags))),
+        "stage1_pass": bool(any(gate_flags)),
         "fallback": bool(base.get("fallback", False)),
         "fallback_reason": base.get("fallback_reason"),
         "mode": int(base.get("mode", 0)),
         "window_probs": [float(p) for p in probs],
         "window_preds": [int(p) for p in window_preds],
         "window_targets": [int(value) for value in base.get("window_targets", [])],
-        "window_states": [int(s) for s in states],
+        "window_states": [int(s) for s in output_states],
+        "stage2_states": [int(s) for s in states],
+        "output_states": [int(s) for s in output_states],
         "window_scores": [float(s) for s in scores],
-        "stage2_enabled_flags": list(base.get("stage2_enabled_flags", [])),
+        "stage1_gate_flags": list(gate_flags),
+        "stage2_enabled_flags": list(gate_flags),
         "n_windows": int(len(probs)),
     }
 
@@ -1195,7 +1258,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Compare commercial AdaBoost baseline with deployed XGBoost artifacts.")
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument("--split", type=str, default="test", choices=["train", "valid", "test"])
-    parser.add_argument("--commercial_dc_threshold", type=float, default=1.5e6)
+    parser.add_argument("--commercial_dc_threshold", type=float, default=0.1e6)
     parser.add_argument("--fp_cost", type=float, default=1.5)
     parser.add_argument("--method", type=str, default="state_machine", choices=["state_machine", "mean_vote", "prob_mean"])
     parser.add_argument("--window_sec", type=float, default=None, help="Override deployed XGBoost window seconds.")

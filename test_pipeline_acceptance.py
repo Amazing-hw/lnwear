@@ -190,7 +190,13 @@ def test_pipeline_acceptance_recognizes_frozen_read_only_test_evaluation(tmp_pat
             "split": "test", "test_read_only": True,
             "configuration_frozen": True, "selection_performed": False,
         },
-        "summary": {"accuracy": 0.9},
+        "summary": {
+            "accuracy": 0.9,
+            "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
+            "stage1_only": {"accuracy": 0.8},
+            "stage2_independent": {"accuracy": 0.9},
+            "fused_output": {"accuracy": 0.9},
+        },
         "window_model_summary": {"accuracy": 0.9},
         "window_stream_summary": {"accuracy": 0.9},
     }), encoding="utf-8")
@@ -198,6 +204,24 @@ def test_pipeline_acceptance_recognizes_frozen_read_only_test_evaluation(tmp_pat
     report = build_pipeline_acceptance_report(tmp_path)
 
     assert report["sections"]["Test"]["passed"] is True
+
+
+def test_pipeline_acceptance_rejects_evaluation_without_parallel_metric_scopes(tmp_path):
+    from pipeline_acceptance import build_pipeline_acceptance_report
+
+    (tmp_path / "end_to_end_eval_test_state_machine.json").write_text(json.dumps({
+        "evaluation_contract": {
+            "split": "test", "test_read_only": True,
+            "configuration_frozen": True, "selection_performed": False,
+        },
+        "summary": {"accuracy": 0.9},
+        "window_model_summary": {"accuracy": 0.9},
+        "window_stream_summary": {"accuracy": 0.9},
+    }), encoding="utf-8")
+
+    report = build_pipeline_acceptance_report(tmp_path)
+
+    assert report["sections"]["Test"]["passed"] is False
 
 
 def test_s06_builds_explicit_read_only_test_contract():

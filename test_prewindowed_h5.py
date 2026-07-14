@@ -22,7 +22,7 @@ def test_s03_normalizes_h5_prewindowed_channel_points_layout():
     assert float(normalized[0, 0, 0]) == 4.0e6
 
 
-def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
+def test_s03_prewindowed_sample_uses_all_windows_when_stage1_is_closed(monkeypatch):
     ppg_windows = np.zeros((4, 40, 300), dtype=float)
     ppg_windows[:, 0, :] = 4.0e6
     ppg_windows[:, 1, :] = 1.0e5
@@ -30,7 +30,7 @@ def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
 
     monkeypatch.setattr(s03, "load_ppg", lambda sample: s03.normalize_ppg_array(ppg_windows))
     monkeypatch.setattr(s03, "load_acc", lambda sample: None)
-    monkeypatch.setattr(s03, "stage1_sample_pass", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(s03, "stage1_sample_pass", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(s03, "stage1_ambient_check", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(s03, "detect_green_mode", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(
@@ -45,7 +45,7 @@ def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
 
     rows = s03._extract_rows_for_sample(
         {"sample_name": "sample_a", "h5_file": "x.h5", "target": 1},
-        dc_threshold=1.5e6,
+        dc_threshold=0.1e6,
         ac_dc_threshold=1.0,
         window_len=300,
         stride_len=100,
@@ -61,7 +61,7 @@ def test_s03_prewindowed_sample_uses_existing_windows(monkeypatch):
     assert [r["start_100hz"] for r in rows] == [100, 200, 300]
 
 
-def test_s06_prewindowed_inference_emits_existing_windows(monkeypatch):
+def test_s06_prewindowed_inference_runs_stage2_when_stage1_is_closed(monkeypatch):
     ppg_windows = np.zeros((4, 40, 300), dtype=float)
     ppg_windows[:, 0, :] = 4.0e6
     ppg_windows[:, 1, :] = 1.0e5
@@ -82,7 +82,7 @@ def test_s06_prewindowed_inference_emits_existing_windows(monkeypatch):
         "window_end_sec": [],
     }
 
-    monkeypatch.setattr(s06, "stage1_sample_pass", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(s06, "stage1_sample_pass", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(s06, "stage1_ambient_check", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(s06, "detect_green_mode", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(
@@ -105,7 +105,7 @@ def test_s06_prewindowed_inference_emits_existing_windows(monkeypatch):
         base,
         normalized_ppg,
         acc=None,
-        dc_threshold=1.5e6,
+        dc_threshold=0.1e6,
         ac_dc_threshold=1.0,
         window_sec=3,
         stride_sec=1,
@@ -117,6 +117,57 @@ def test_s06_prewindowed_inference_emits_existing_windows(monkeypatch):
     assert result["window_start_sec"] == [1.0, 2.0, 3.0]
     assert result["window_end_sec"] == [4.0, 5.0, 6.0]
     assert result["window_preds"] == [1, 1, 1]
+    assert result["window_probs"] == [0.8, 0.8, 0.8]
+    assert result["stage1_gate_flags"] == [0, 0, 0]
+    assert result["stage2_enabled_flags"] == result["stage1_gate_flags"]
+
+
+def test_s06_continuous_inference_runs_stage2_when_stage1_is_closed(monkeypatch):
+    ppg = np.zeros((600, 40), dtype=float)
+    ppg[:, 0] = 4.0e6
+    ppg[:, 1] = 1.0e5
+    ppg[:, 2:] = 2.0e6
+
+    monkeypatch.setattr(s06, "validate_h5_file", lambda *_args, **_kwargs: (True, None))
+    monkeypatch.setattr(s06, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s06, "load_acc", lambda _sample: None)
+    monkeypatch.setattr(s06, "detect_green_mode", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        s06,
+        "_advance_stage1_gate_to_step",
+        lambda _gate, _ir, _win, _stride, _last, target: (False, target),
+    )
+    monkeypatch.setattr(
+        s06,
+        "get_channels_from_window",
+        lambda window, mode: (window[:, 0], window[:, 1], window[:, 2], window[:, 3], window[:, 4]),
+    )
+    monkeypatch.setattr(
+        s06,
+        "extract_feature_pool_from_window",
+        lambda **_kwargs: ({"GREEN_CORR": 1.0}, {"g_top2_bp": np.ones(75)}),
+    )
+    monkeypatch.setattr(
+        s06,
+        "predict_label_windows",
+        lambda feats, bundle: (np.ones(len(feats), dtype=int), np.full(len(feats), 0.8)),
+    )
+
+    result = s06._infer_one_sample(
+        {"sample_name": "continuous", "h5_file": "x.h5", "target": 1},
+        dc_threshold=0.1e6,
+        ac_dc_threshold=1.0,
+        window_sec=3,
+        stride_sec=1,
+        bundle={"feature_quantiles": None, "feature_names": []},
+        skip_initial_windows=0,
+        use_stage2_ir=False,
+    )
+
+    assert result["window_probs"] == [0.8, 0.8, 0.8, 0.8]
+    assert result["window_preds"] == [1, 1, 1, 1]
+    assert result["stage1_gate_flags"] == [0, 0, 0, 0]
+    assert result["stage2_enabled_flags"] == result["stage1_gate_flags"]
 
 
 def test_s01_scans_grouped_window_h5_layout(tmp_path):
@@ -207,7 +258,7 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
 
     rows = s03._extract_rows_for_sample(
         sample,
-        dc_threshold=1.5e6,
+        dc_threshold=0.1e6,
         ac_dc_threshold=1.0,
         window_len=300,
         stride_len=100,
@@ -268,7 +319,7 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
 
     result = s06._infer_one_sample(
         sample,
-        dc_threshold=1.5e6,
+        dc_threshold=0.1e6,
         ac_dc_threshold=1.0,
         window_sec=3,
         stride_sec=1,

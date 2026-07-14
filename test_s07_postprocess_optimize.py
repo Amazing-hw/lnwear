@@ -510,6 +510,37 @@ def test_s07_any_worn_strategy_keeps_positive_sample_after_late_drop():
     assert detail["pred"] == 1
 
 
+def test_s07_stage2_state_warms_while_stage1_masks_output():
+    cache = {
+        "sample_name": "gate-opens-after-warmup",
+        "target": 1,
+        "window_end_sec": np.arange(1, 4, dtype=float),
+        "stage1_enabled": np.array([0, 0, 1], dtype=int),
+        "prob_raw": np.array([0.9, 0.9, 0.9]),
+        "quality": np.ones(3),
+        "stride_sec": 1.0,
+        "window_targets": np.ones(3, dtype=int),
+    }
+    params = {
+        "ema_alpha": 1.0,
+        "median_k": 1,
+        "T_on": 0.5,
+        "T_off": 0.5,
+        "K_on": 2,
+        "K_off": 1,
+        "cooldown_sec": 0.0,
+        "sample_pred_strategy": "final_state",
+        "sample_pred_warmup_frames": 0,
+    }
+
+    detail = s07.run_postprocess_on_cache(cache, params)
+
+    assert detail["stage2_states"] == [0, 1, 1]
+    assert detail["states"] == [0, 0, 1]
+    assert detail["stage2_pred"] == 1
+    assert detail["pred"] == 1
+
+
 def test_s07_postprocess_handles_empty_window_cache_without_unbound_state():
     params = {
         "ema_alpha": 1.0,

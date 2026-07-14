@@ -25,8 +25,16 @@ def test_s02_uses_fixed_stage1_deploy_threshold_constants():
 
     dc, acdc = s02.resolve_fixed_deploy_thresholds(args)
 
-    assert dc == 1.5e6
+    assert dc == 0.1e6
     assert acdc == 1.0
+
+
+def test_s02_train_gate_is_derived_from_new_deploy_dc_threshold():
+    deploy_dc, deploy_acdc = s02.resolve_fixed_deploy_thresholds()
+    train_gate = s02.make_train_threshold(deploy_dc, deploy_acdc)
+
+    assert train_gate["dc_threshold"] == 0.09e6
+    assert train_gate["ac_dc_threshold"] == 1.1
 
 
 def test_s02_cli_does_not_expose_stage1_threshold_args():
@@ -66,7 +74,7 @@ def test_stage1_ambient_check_uses_configured_ratio_threshold():
     assert s03.stage1_ambient_check(ppg, ambient_ratio_threshold=1.0) is True
 
 
-def test_stage1_extraction_no_longer_hard_filters_ambient_ratio(monkeypatch):
+def test_stage2_training_extraction_uses_all_windows_independent_of_stage1(monkeypatch):
     ppg = np.zeros((3, 300, 6), dtype=float)
     ppg[:, :, 0] = 2.0e6
     ppg[:, :, 1] = 1.9e6
@@ -87,7 +95,7 @@ def test_stage1_extraction_no_longer_hard_filters_ambient_ratio(monkeypatch):
 
     rows = s03._extract_rows_for_sample(
         sample,
-        dc_threshold=1.5e6,
+        dc_threshold=1.0e12,
         ac_dc_threshold=1.0,
         window_len=75,
         stride_len=25,
