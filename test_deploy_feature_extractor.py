@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib.util
 import json
 import py_compile
+import re
 import subprocess
 import sys
 
@@ -48,7 +49,33 @@ def test_all_s03_window_features_have_deploy_formulas():
         formula = str(info.get("formula", ""))
         assert not s03.is_stage2_ir_feature(name), name
         assert not any(token in deps for token in forbidden_dep_tokens), name
-        assert "IR_" not in formula and "ir_" not in formula, name
+        assert re.search(r"(?<![A-Za-z])ir_", formula, flags=re.IGNORECASE) is None, name
+
+
+def test_full_feature_recipe_uses_catalog_and_current_preprocessing_for_entire_pool():
+    selected = catalog.model_candidate_names()
+
+    recipes, _, _, steps, outputs, composites, _ = s08._build_full_feature_recipe(
+        selected
+    )
+
+    assert list(recipes) == selected
+    assert all(not str(recipes[name]["formula"]).startswith("[") for name in selected)
+    assert [name for name, _ in steps] == [
+        "finite_replacement",
+        "isolated_spike_repair",
+        "rolling_median_detrend",
+        "optional_short_smoothing",
+    ]
+    serialized = json.dumps(
+        {"steps": steps, "outputs": outputs, "composites": composites},
+        ensure_ascii=False,
+    ).lower()
+    assert "remove_step" not in serialized
+    assert "bandpass" not in serialized
+    assert "medfilt" not in serialized
+    assert "rolling_median" in serialized
+    assert "tie-aware" in serialized
 
 
 def test_green_reliability_features_capture_three_channel_failure_modes():
@@ -120,7 +147,7 @@ def test_green_reliability_features_have_deploy_formulas():
     assert set(formulas) == set(selected)
     for info in formulas.values():
         text = json.dumps(info, ensure_ascii=False)
-        assert "ir_" not in text
+        assert re.search(r"(?<![A-Za-z])ir_", text, flags=re.IGNORECASE) is None
         assert "IR_" not in text
 
 
@@ -256,7 +283,15 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
 
 
 def test_export_feature_contract_files_and_golden_raw_values(tmp_path):
-    selected = ["GREEN_AC_DC_RATIO", "G_TOP2_CORR_MIN", "ACC_REL_MOTION"]
+    selected = [
+        "GREEN_AC_DC_RATIO",
+        "G_TOP2_CORR_MIN",
+        "GMEDIAN_AC_DC_RATIO",
+        "G_PAIR_PERIODICITY_MEDIAN",
+        "G_AMB_RESIDUAL_PAIR_CORR_MAX",
+        "G_ZONE_PHASE_CONCENTRATION",
+        "ACC_REL_MOTION",
+    ]
     model = XGBClassifier(
         n_estimators=1,
         max_depth=1,
@@ -480,7 +515,11 @@ def test_s03_feature_pool_source_keys_are_stage2_ir_free_even_with_acc():
 
     assert not [name for name in pool if s03.is_stage2_ir_feature(name)]
     assert not [name for name in window_features if s03.is_stage2_ir_feature(name)]
-    assert not any("IR" in name for name in window_features)
+    # Match IR as a feature-name token; ``PAIR`` is unrelated to the IR sensor.
+    assert not any(
+        name.startswith("IR_") or "_IR_" in name or name.endswith("_IR")
+        for name in window_features
+    )
     assert "GREEN_SEG_ACDC_CV" in pool
     assert "GTOP2_BAND_ENERGY_RATIO" in pool
     assert "G_TOP2_CORR_MIN" in pool
@@ -678,6 +717,10 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
 
     assert '"selected_features": [\n    "GREEN_CORR",\n    "GREEN_AC_RMS"\n  ]' in model_params
     assert '"n_selected_features": 2' in feature_formulas
+    assert "rolling_median" in feature_formulas
+    assert "remove_step" not in feature_formulas
+    assert "bandpass_filter" not in feature_formulas
+    assert "medfilt" not in feature_formulas
     assert '"names": [\n      "GREEN_CORR",\n      "GREEN_AC_RMS"\n    ]' in deploy_config
     assert "AMBX_AC_RMS" not in model_params
     assert "AMBX_AC_RMS" not in deploy_config

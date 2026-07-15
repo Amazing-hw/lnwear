@@ -1,7 +1,7 @@
 # Manual Feature Training and Scientific Figures Implementation Plan
 
 > Historical plan. The active CSV-only contract is defined in
-> `2026-07-13-mode-feature-and-csv-selection.md`, and the current 91-feature
+> `2026-07-13-mode-feature-and-csv-selection.md`, and the current 111-feature
 > three-zone pool in `2026-07-13-three-zone-feature-expansion.md`;
 > Excel/OpenPyXL steps below are no longer operational requirements.
 

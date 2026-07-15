@@ -348,8 +348,8 @@ LEGACY_FEATURE_GROUPS = {
     "mode": ["mode"],
 }
 
-# Runtime groups are derived from the catalog. The commercial baseline remains
-# a separate s09 comparison surface and is never treated as Stage2 candidates.
+# Runtime groups are derived from the catalog. The retained commercial-eight
+# name set is only an internal candidate subset; there is no comparison runtime.
 FEATURE_GROUPS = {"commercial_baseline": list(LEGACY_FEATURE_GROUPS["commercial_baseline"])}
 for _feature_name, _feature_record in FEATURE_CATALOG.items():
     FEATURE_GROUPS.setdefault(str(_feature_record["group"]), []).append(_feature_name)
@@ -481,13 +481,22 @@ DEPLOYMENT_FFT_FEATURE_SOURCES = {
     "GREEN_FFT_PEAK_MEDIAN_RATIO": "green",
     "GREEN_DOM_FREQ": "green",
     "FFT_PEAK_MEDIAN_RATIO": "green",
+    "GMEDIAN_FFT_PEAK_MEDIAN_RATIO": "green_median",
+    "G_ZONE_DOM_FREQ_MAD_HZ": "green_zones",
+    "G_ZONE_HR_SUPPORT_RATIO": "green_zones",
+    "G_PAIR_FREQ_GAP_MIN_HZ": "green_zones",
+    "G_PAIR_FREQ_GAP_MEDIAN_HZ": "green_zones",
+    "G_ZONE_PHASE_CONCENTRATION": "green_zones",
+    "G_PAIR_SPECTRAL_CONSENSUS": "green_zones",
 }
 
 DEPLOYMENT_FORBIDDEN_TOKENS = (
     "coherence",  # Welch PSD + cross-spectrum, C-port hard
 )
 
-DEPLOYMENT_ALLOWED_FFT_SOURCES = {"green_top2", "green", "ambient"}
+DEPLOYMENT_ALLOWED_FFT_SOURCES = {
+    "green_top2", "green", "ambient", "green_median", "green_zones"
+}
 
 # s03 is the source of truth for the model-facing deployment-friendly feature pool.
 # s04 may rank and select features, but it must not define a second allowlist.
@@ -496,7 +505,13 @@ DEPLOYMENT_ALLOWED_FFT_FEATURES = S03_DEPLOYMENT_ALLOWED_FFT_FEATURES
 
 
 def _deployment_fft_source_rank(source):
-    order = {"green_top2": 0, "ambient": 1}
+    order = {
+        "green_top2": 0,
+        "ambient": 1,
+        "green": 2,
+        "green_median": 3,
+        "green_zones": 4,
+    }
     return order.get(source, 99)
 
 
@@ -1289,10 +1304,15 @@ def compute_drift_metrics(x_train, x_valid, n_bins=10):
     }
 
 
-DEPLOYMENT_COST_BY_GROUP = {
-    catalog_feature_group(name): float(catalog_feature_record(name)["deployment_cost"])
+DEPLOYMENT_COST_BY_FEATURE = {
+    name: float(catalog_feature_record(name)["deployment_cost"])
     for name in FEATURE_CATALOG
 }
+
+
+def deployment_cost_for_feature(feature, default=2.0):
+    """Return the governed per-feature cost without collapsing by group."""
+    return float(DEPLOYMENT_COST_BY_FEATURE.get(str(feature), default))
 
 
 def deployment_feature_summary(feature):
@@ -1799,7 +1819,7 @@ def compute_all_feature_diagnostics(df_train, df_valid, feature_cols, fill_value
 # ─────────────────────────────────────────────────────────────
 
 def _commercial_8_feature_names():
-    """返回商业8特征名称列表（从 FEATURE_GROUPS 中获取）。"""
+    """返回保留的商用八特征候选集合（从 FEATURE_GROUPS 中获取）。"""
     return list(FEATURE_GROUPS.get("commercial_baseline", [
         "GREEN_CORR", "GREEN_AC", "AMB_AC", "ACC_YSUM",
         "GREEN_DC", "AMB_DC", "GREEN_XCORR", "FFT_PEAK_MEDIAN_RATIO",
@@ -1860,7 +1880,7 @@ def generate_feature_subset_candidates(combined_summary, kept_features, max_feat
         if "group" not in e:
             e["group"] = feature_to_group(e["feature"])
         if "deployment_cost" not in e:
-            e["deployment_cost"] = DEPLOYMENT_COST_BY_GROUP.get(e["group"], 2.0)
+            e["deployment_cost"] = deployment_cost_for_feature(e["feature"])
         if "fp_proxy_sample_fp_rate" not in e:
             e["fp_proxy_sample_fp_rate"] = 0.5
         enriched.append(e)
@@ -1894,7 +1914,10 @@ def generate_feature_subset_candidates(combined_summary, kept_features, max_feat
     }
 
     # 4. balanced_15: 准确率 + FP安全 + 成本 加权
-    max_cost = max(DEPLOYMENT_COST_BY_GROUP.values()) if DEPLOYMENT_COST_BY_GROUP else 4.0
+    max_cost = (
+        max(DEPLOYMENT_COST_BY_FEATURE.values())
+        if DEPLOYMENT_COST_BY_FEATURE else 4.0
+    )
     balanced_items = []
     for item in enriched:
         cs = item.get("combined_score", 0)
@@ -1948,12 +1971,12 @@ def generate_feature_subset_candidates(combined_summary, kept_features, max_feat
         "description": "Balanced 策略压缩到 12 特征",
     }
 
-    # 6. commercial_8_baseline: 硬编码商业8特征
+    # 6. commercial_8_baseline: 保留的商用八特征内部候选子集
     comm_8_names = _commercial_8_feature_names()
     comm_8 = [f for f in comm_8_names if f in kept_features]
     candidates["commercial_8_baseline"] = {
         "features": comm_8,
-        "description": "商业 8 特征 baseline（参照组）",
+        "description": "保留的商用八特征候选子集（使用同一 XGBoost 评估口径）",
     }
 
     return candidates
@@ -2038,8 +2061,7 @@ def evaluate_feature_subsets(df_train, df_valid, candidates):
         for f in feats:
             group_count[feature_to_group(f)] += 1
 
-        deploy_costs = [DEPLOYMENT_COST_BY_GROUP.get(feature_to_group(f), 2.0)
-                        for f in feats]
+        deploy_costs = [deployment_cost_for_feature(feature) for feature in feats]
         scale_dep = sum(1 for f in feats if f in SCALE_DEPENDENT_FEATURES)
 
         denom = max(tn + fp, 1)

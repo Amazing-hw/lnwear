@@ -18,12 +18,9 @@
 5. 复用原始绿光通道构建方式：
    - mode=1: ch3/ch4/ch5 已表示三个中心对称光区
    - mode=2: 原始分组通道先按光区平均，再归一化为三个中心对称光区
-6. 加入鲁棒预处理：
-   - 去毛刺
-   - 去跳变
-   - median filter
-   - moving average
-   - bandpass
+6. 模型候选使用与部署一致的短窗预处理：有限值替换、孤立毛刺修复、
+   0.8s 滚动中位数去趋势；仅当 round(0.04*fs)>=2 时做短窗均值平滑。
+   文件内保留的旧研究辅助函数不属于当前 111 项受治理候选的提取链路。
 7. 输出特征池 CSV：
    - feature_pool_train.csv
    - feature_pool_valid.csv
@@ -57,6 +54,8 @@ from stage2_feature_catalog import (
 # =========================================================
 
 EPS = 1e-12
+MIN_ZONE_RELATIVE_AC_RMS = 1e-8
+MIN_ZONE_ABSOLUTE_AC_RMS = 1e-9
 DEFAULT_FS = 100.0
 STAGE1_PRIMITIVE_SEC = 1.0
 STAGE1_DECISION_SEC = 3.0
@@ -938,13 +937,17 @@ def fft_peak_features(x, fs, fmin=0.5, fmax=5.0):
     band_freqs = freqs[mask]
 
     med = np.median(band_spec)
+    peak = float(np.max(band_spec))
 
-    if med < EPS:
+    if peak <= EPS:
         peak_ratio = 0.0
+        dom_freq = 0.0
+    elif med < EPS:
+        peak_ratio = 0.0
+        dom_freq = float(band_freqs[np.argmax(band_spec)])
     else:
-        peak_ratio = float(np.max(band_spec) / (med + EPS))
-
-    dom_freq = float(band_freqs[np.argmax(band_spec)])
+        peak_ratio = float(peak / (med + EPS))
+        dom_freq = float(band_freqs[np.argmax(band_spec)])
 
     return peak_ratio, dom_freq
 
@@ -962,8 +965,10 @@ def compute_fft_cache(x, fs, fmin=0.5, fmax=5.0):
         'peak_ratio': 0.0,
         'dom_freq': 0.0,
         'spec': None,
+        'complex_spec': None,
         'freqs': None,
         'band_spec': None,
+        'band_complex': None,
         'band_freqs': None
     }
     
@@ -979,13 +984,15 @@ def compute_fft_cache(x, fs, fmin=0.5, fmax=5.0):
     
     nfft = max(256, nfft)
     
-    spec = np.abs(np.fft.rfft(xw, n=nfft))
+    complex_spec = np.fft.rfft(xw, n=nfft)
+    spec = np.abs(complex_spec)
     freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
     
     mask = (freqs >= fmin) & (freqs <= fmax)
     
     if not np.any(mask):
         result['spec'] = spec
+        result['complex_spec'] = complex_spec
         result['freqs'] = freqs
         return result
     
@@ -993,19 +1000,25 @@ def compute_fft_cache(x, fs, fmin=0.5, fmax=5.0):
     band_freqs = freqs[mask]
     
     med = np.median(band_spec)
-    
-    if med < EPS:
+    peak = float(np.max(band_spec))
+
+    if peak <= EPS:
         peak_ratio = 0.0
+        dom_freq = 0.0
+    elif med < EPS:
+        peak_ratio = 0.0
+        dom_freq = float(band_freqs[np.argmax(band_spec)])
     else:
-        peak_ratio = float(np.max(band_spec) / (med + EPS))
-    
-    dom_freq = float(band_freqs[np.argmax(band_spec)])
+        peak_ratio = float(peak / (med + EPS))
+        dom_freq = float(band_freqs[np.argmax(band_spec)])
     
     result['peak_ratio'] = peak_ratio
     result['dom_freq'] = dom_freq
     result['spec'] = spec
+    result['complex_spec'] = complex_spec
     result['freqs'] = freqs
     result['band_spec'] = band_spec
+    result['band_complex'] = complex_spec[mask]
     result['band_freqs'] = band_freqs
     
     return result
@@ -2531,6 +2544,123 @@ def guarded_corr(x, y, relative_std_floor=1e-6):
     return value if np.isfinite(value) else 0.0
 
 
+def _top2_candidate_pairs(scores, relative_tolerance=1e-9):
+    """Return every maximal two-zone pair, including exact/near ties."""
+    values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if len(values) != 3:
+        raise ValueError("three-zone top2 aggregation requires exactly 3 scores")
+    values = np.where(np.isfinite(values), values, 0.0)
+    pairs = ((0, 1), (1, 2), (2, 0))
+    pair_scores = np.asarray(
+        [values[left] + values[right] for left, right in pairs],
+        dtype=np.float64,
+    )
+    best = float(np.max(pair_scores))
+    tolerance = max(abs(best) * float(relative_tolerance), 1e-12)
+    return tuple(
+        pair for pair, score in zip(pairs, pair_scores)
+        if best - float(score) <= tolerance
+    )
+
+
+def _tie_aware_top2_composite(raw_stack, pulse_stack, scores):
+    """Average all equally optimal top2 pair views to remove index tie bias."""
+    raw = np.asarray(raw_stack, dtype=np.float64)
+    pulse = np.asarray(pulse_stack, dtype=np.float64)
+    pairs = _top2_candidate_pairs(scores)
+    raw_pair_means = [0.5 * (raw[left] + raw[right]) for left, right in pairs]
+    pulse_pair_means = [
+        0.5 * (pulse[left] + pulse[right]) for left, right in pairs
+    ]
+    return (
+        np.mean(np.vstack(raw_pair_means), axis=0),
+        np.mean(np.vstack(pulse_pair_means), axis=0),
+        pairs,
+    )
+
+
+def _frequency_evidence_valid(raw, pulse, fft_cache, fs):
+    """Require amplitude, spectral-peak, and autocorrelation evidence."""
+    raw = finite_signal(raw)
+    pulse = finite_signal(pulse)
+    pulse_rms = float(np.sqrt(np.mean(pulse ** 2))) if len(pulse) else 0.0
+    raw_level = float(np.median(np.abs(raw))) if len(raw) else 0.0
+    amplitude_floor = max(
+        raw_level * MIN_ZONE_RELATIVE_AC_RMS,
+        MIN_ZONE_ABSOLUTE_AC_RMS,
+    )
+    if pulse_rms <= amplitude_floor:
+        return False
+    band_spec = fft_cache.get("band_spec")
+    if band_spec is None or len(band_spec) == 0:
+        return False
+    if float(fft_cache.get("dom_freq", 0.0)) <= 0.0:
+        return False
+    if float(fft_cache.get("peak_ratio", 0.0)) < 3.0:
+        return False
+    periodicity = autocorr_periodicity_features(pulse, fs)[0]
+    return bool(np.isfinite(periodicity) and periodicity >= 0.20)
+
+
+def _ambient_projection_residual(zone_pulse, ambient_pulse):
+    """Remove the guarded linear ambient component while preserving zone mean."""
+    zone = finite_signal(zone_pulse)
+    ambient = finite_signal(ambient_pulse)
+    n = min(len(zone), len(ambient))
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    zone = zone[:n]
+    ambient = ambient[:n]
+    zone_centered = zone - np.mean(zone)
+    ambient_centered = ambient - np.mean(ambient)
+    ambient_var = float(np.mean(ambient_centered ** 2))
+    variance_floor = max(float(np.mean(ambient ** 2)) * 1e-12, 1e-18)
+    if ambient_var <= variance_floor:
+        return finite_signal(zone.copy())
+    beta = float(np.mean(zone_centered * ambient_centered) / ambient_var)
+    return finite_signal(zone - beta * ambient_centered)
+
+
+def _phase_concentration(fft_caches, reference_hz):
+    """Permutation-invariant phase concentration at a shared frequency bin."""
+    if not np.isfinite(reference_hz) or float(reference_hz) <= 0.0:
+        return 0.0
+    phasors = []
+    for cache in fft_caches:
+        freqs = cache.get("band_freqs")
+        values = cache.get("band_complex")
+        if freqs is None or values is None or len(freqs) == 0 or len(values) == 0:
+            return 0.0
+        idx = int(np.argmin(np.abs(np.asarray(freqs, dtype=float) - float(reference_hz))))
+        value = complex(values[idx])
+        magnitude = abs(value)
+        band_scale = float(np.max(np.abs(values))) if len(values) else 0.0
+        if magnitude <= max(band_scale * 1e-9, 1e-12):
+            return 0.0
+        phasors.append(value / magnitude)
+    if not phasors:
+        return 0.0
+    return float(np.clip(abs(np.mean(np.asarray(phasors, dtype=np.complex128))), 0.0, 1.0))
+
+
+def _spectral_power_cosine_from_cache(left_cache, right_cache):
+    """Cosine similarity between aligned cached 0.5-5 Hz power spectra."""
+    left = left_cache.get("band_spec")
+    right = right_cache.get("band_spec")
+    if left is None or right is None:
+        return 0.0
+    count = min(len(left), len(right))
+    if count < 2:
+        return 0.0
+    left_power = np.asarray(left[:count], dtype=np.float64) ** 2
+    right_power = np.asarray(right[:count], dtype=np.float64) ** 2
+    denominator = float(np.linalg.norm(left_power) * np.linalg.norm(right_power))
+    floor = max(float(np.max(np.concatenate([left_power, right_power]))) * 1e-12, 1e-18)
+    if denominator <= floor:
+        return 0.0
+    return float(np.clip(np.dot(left_power, right_power) / denominator, 0.0, 1.0))
+
+
 def _contact_raw_signal(x):
     """Minimal raw path: finite replacement plus isolated-spike repair only."""
     return remove_burr(finite_signal(x), burr_k=6.0)
@@ -2689,28 +2819,36 @@ def _green_spatial_candidates(g_raw, g_pulse, fs):
         top1_top2 = 0.0
         rank_stability = 0.0
     else:
-        top2_idx = np.argsort(channel_ac)[-2:]
-        top2_values = channel_ac[top2_idx]
-        top2_mean = float(np.mean(top2_values))
+        top2_pairs = _top2_candidate_pairs(channel_ac)
+        top2_pair_sums = [
+            float(channel_ac[left] + channel_ac[right])
+            for left, right in top2_pairs
+        ]
+        top2_sum = float(np.max(top2_pair_sums))
+        top2_mean = 0.5 * top2_sum
         support = float(np.mean(channel_ac >= 0.5 * max_ac))
-        top2_ratio = guarded_ratio(float(np.sum(top2_values)), total_ac, scale=channel_ac)
-        top2_corr = guarded_corr(
-            pulse_stack[int(top2_idx[0])],
-            pulse_stack[int(top2_idx[1])],
-        )
+        top2_ratio = guarded_ratio(top2_sum, total_ac, scale=channel_ac)
+        top2_corr = float(np.median([
+            guarded_corr(pulse_stack[left], pulse_stack[right])
+            for left, right in top2_pairs
+        ]))
         weak_gap = max(
             0.0,
-            guarded_ratio(top2_mean - float(np.min(channel_ac)), top2_mean, scale=channel_ac),
+            guarded_ratio(
+                top2_mean - float(np.min(channel_ac)),
+                top2_mean,
+                scale=channel_ac,
+            ),
         )
         top1_top2 = guarded_ratio(max_ac, top2_mean, scale=channel_ac)
-        global_top2 = set(int(i) for i in top2_idx)
+        global_top2 = set(top2_pairs)
         switches = []
         n = pulse_stack.shape[1]
         for indices in np.array_split(np.arange(n), 3):
             if len(indices) < 4:
                 continue
             seg_ac = np.sqrt(np.mean(pulse_stack[:, indices] ** 2, axis=1))
-            switches.append(set(int(i) for i in np.argsort(seg_ac)[-2:]) != global_top2)
+            switches.append(set(_top2_candidate_pairs(seg_ac)) != global_top2)
         rank_stability = float(1.0 - np.mean(switches)) if switches else 0.0
     imbalance_mean = float(np.mean(imbalance))
     return OrderedDict([
@@ -2834,6 +2972,10 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     g3_pulse = _pulse_signal(g3_raw, fs)
     green_pulse = (g1_pulse + g2_pulse + g3_pulse) / 3.0
     ambient_pulse = _pulse_signal(ambient_raw, fs)
+    raw_stack = np.vstack([g1_raw, g2_raw, g3_raw])
+    pulse_stack = np.vstack([g1_pulse, g2_pulse, g3_pulse])
+    green_median_raw = np.median(raw_stack, axis=0)
+    green_median_pulse = np.median(pulse_stack, axis=0)
 
     features["COMM_GREEN_AC"] = float(
         0.5 * np.sqrt(np.mean(green_pulse ** 2))
@@ -2849,16 +2991,18 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         float(np.sqrt(np.mean(g2_pulse ** 2))),
         float(np.sqrt(np.mean(g3_pulse ** 2))),
     ])
-    top2_idx = np.argsort(channel_ac)[-2:]
-    green_top2_raw = np.mean([g1_raw[int(i)] if False else [g1_raw, g2_raw, g3_raw][int(i)] for i in top2_idx], axis=0)
-    green_top2_pulse = np.mean([g1_pulse, g2_pulse, g3_pulse][0:0], axis=0) if False else np.mean(
-        [[g1_pulse, g2_pulse, g3_pulse][int(i)] for i in top2_idx],
-        axis=0,
+    green_top2_raw, green_top2_pulse, _ = _tie_aware_top2_composite(
+        raw_stack, pulse_stack, channel_ac
     )
 
     green_fft = compute_fft_cache(green_pulse, fs, fmin=0.5, fmax=5.0)
     ambient_fft = compute_fft_cache(ambient_pulse, fs, fmin=0.5, fmax=5.0)
     top2_fft = compute_fft_cache(green_top2_pulse, fs, fmin=0.5, fmax=5.0)
+    median_fft = compute_fft_cache(green_median_pulse, fs, fmin=0.5, fmax=5.0)
+    zone_ffts = [
+        compute_fft_cache(zone, fs, fmin=0.5, fmax=5.0)
+        for zone in pulse_stack
+    ]
 
     for name, raw, pulse, prefix, cache in [
         ("green", green_raw, green_pulse, "GREEN", green_fft),
@@ -2923,6 +3067,118 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
     features["GTOP2_ROBUST_SKEWNESS"] = robust_quantile_skewness(green_top2_pulse)
     features["GTOP2_SPECTRAL_ENTROPY"] = normalized_spectral_entropy(top2_fft)
 
+    # Three-zone robust evidence.  These candidates retain the mean and
+    # AC-RMS top2 views, while adding median, pair-order-statistic, ambient-
+    # residual, phase, and spectral-consensus views.  Every aggregation is
+    # independent of the physical numbering of the three symmetric zones.
+    smooth_window = max(2, int(round(0.15 * float(fs))))
+    median_ac = float(np.sqrt(np.mean(green_median_pulse ** 2)))
+    features["GMEDIAN_AC_DC_RATIO"] = guarded_ratio(
+        median_ac,
+        abs(float(np.median(green_median_raw))),
+        scale=green_median_raw,
+    )
+    features["GMEDIAN_CORR"] = guarded_corr(
+        green_median_pulse,
+        moving_average_filter(green_median_pulse, smooth_window),
+    )
+    features["GMEDIAN_AUTO_CORR_PEAK"] = autocorr_periodicity_features(
+        green_median_pulse, fs
+    )[0]
+    features["GMEDIAN_FFT_PEAK_MEDIAN_RATIO"] = float(median_fft["peak_ratio"])
+    features["GTOP2_CORR"] = guarded_corr(
+        green_top2_pulse,
+        moving_average_filter(green_top2_pulse, smooth_window),
+    )
+    features["G_TOP2_ALL_CORR"] = guarded_corr(green_top2_pulse, green_pulse)
+    weakest_ac = float(np.min(channel_ac))
+    weakest_tolerance = max(abs(weakest_ac) * 1e-9, 1e-12)
+    weakest_indices = np.flatnonzero(channel_ac - weakest_ac <= weakest_tolerance)
+    features["G_WEAK_TO_TOP2_CORR"] = float(np.median([
+        guarded_corr(pulse_stack[int(index)], green_top2_pulse)
+        for index in weakest_indices
+    ]))
+
+    zone_dom_freqs = np.asarray(
+        [float(cache["dom_freq"]) for cache in zone_ffts], dtype=np.float64
+    )
+    valid_spectrum = np.asarray([
+        _frequency_evidence_valid(raw_stack[index], pulse_stack[index], cache, fs)
+        for index, cache in enumerate(zone_ffts)
+    ], dtype=bool)
+    valid_dom_freqs = zone_dom_freqs[valid_spectrum]
+    reference_hz = (
+        float(np.median(valid_dom_freqs)) if len(valid_dom_freqs) else 0.0
+    )
+    features["G_ZONE_DOM_FREQ_MAD_HZ"] = (
+        float(np.mean(np.abs(valid_dom_freqs - reference_hz)))
+        if len(valid_dom_freqs) else 0.0
+    )
+    features["G_ZONE_HR_SUPPORT_RATIO"] = (
+        float(np.mean(valid_spectrum & (np.abs(zone_dom_freqs - reference_hz) <= 0.20)))
+        if reference_hz > 0.0 else 0.0
+    )
+
+    pair_indices = ((0, 1), (1, 2), (2, 0))
+    pair_periodicity = []
+    pair_freq_gaps = []
+    pair_acdc = []
+    pair_ambient_abs_corr = []
+    pair_spectral_consensus = []
+    for left, right in pair_indices:
+        pair_raw = 0.5 * (raw_stack[left] + raw_stack[right])
+        pair_pulse = 0.5 * (pulse_stack[left] + pulse_stack[right])
+        pair_periodicity.append(autocorr_periodicity_features(pair_pulse, fs)[0])
+        if valid_spectrum[left] and valid_spectrum[right]:
+            pair_freq_gaps.append(abs(zone_dom_freqs[left] - zone_dom_freqs[right]))
+        pair_acdc.append(guarded_ratio(
+            float(np.sqrt(np.mean(pair_pulse ** 2))),
+            abs(float(np.median(pair_raw))),
+            scale=pair_raw,
+        ))
+        pair_ambient_abs_corr.append(abs(guarded_corr(pair_pulse, ambient_pulse)))
+        if valid_spectrum[left] and valid_spectrum[right]:
+            pair_spectral_consensus.append(
+                _spectral_power_cosine_from_cache(zone_ffts[left], zone_ffts[right])
+            )
+    features["G_PAIR_PERIODICITY_MAX"] = float(np.max(pair_periodicity))
+    features["G_PAIR_PERIODICITY_MEDIAN"] = float(np.median(pair_periodicity))
+    features["G_PAIR_FREQ_GAP_MIN_HZ"] = (
+        float(np.min(pair_freq_gaps)) if pair_freq_gaps else 0.0
+    )
+    features["G_PAIR_FREQ_GAP_MEDIAN_HZ"] = (
+        float(np.median(pair_freq_gaps)) if pair_freq_gaps else 0.0
+    )
+    features["G_PAIR_ACDC_MEDIAN"] = float(np.median(pair_acdc))
+    features["G_PAIR_AMB_ABS_CORR_MIN"] = float(np.min(pair_ambient_abs_corr))
+    features["G_PAIR_AMB_ABS_CORR_MEDIAN"] = float(np.median(pair_ambient_abs_corr))
+
+    residuals = [
+        _ambient_projection_residual(zone, ambient_pulse) for zone in pulse_stack
+    ]
+    residual_periodicity = [
+        autocorr_periodicity_features(residual, fs)[0] for residual in residuals
+    ]
+    residual_pair_corr = [
+        guarded_corr(residuals[left], residuals[right])
+        for left, right in pair_indices
+    ]
+    features["G_AMB_RESIDUAL_2OF3_PERIODICITY"] = float(
+        np.median(residual_periodicity)
+    )
+    features["G_AMB_RESIDUAL_PAIR_CORR_MAX"] = float(np.max(residual_pair_corr))
+    valid_zone_ffts = [
+        cache for cache, is_valid in zip(zone_ffts, valid_spectrum) if is_valid
+    ]
+    features["G_ZONE_PHASE_CONCENTRATION"] = (
+        _phase_concentration(valid_zone_ffts, reference_hz)
+        if len(valid_zone_ffts) >= 2 else 0.0
+    )
+    features["G_PAIR_SPECTRAL_CONSENSUS"] = (
+        float(np.median(pair_spectral_consensus))
+        if pair_spectral_consensus else 0.0
+    )
+
     ordered_names = [
         name for name in stage2_model_candidate_names()
         if not name.startswith("ACC_") and name != "mode"
@@ -2940,6 +3196,8 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         "g3_bp": g3_pulse,
         "g_top2_bp": green_top2_pulse,
         "g_top2_raw": green_top2_raw,
+        "g_median_bp": green_median_pulse,
+        "g_median_raw": green_median_raw,
         "amb_bp": ambient_pulse,
         "g_mean_bp": green_pulse,
         "g_mean_raw": green_raw,

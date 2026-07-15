@@ -33,9 +33,10 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 - 不加 `--auto_optimize_e2e` 时，阈值目标仍是 `accuracy`，`threshold_min_precision=0.95`，`model_search_fp_cost=2.0`，不会自动导出窗口 NPZ，也不会跑 `s07` 后处理搜索。
 - 加 `--auto_optimize_e2e` 后，会自动切换为 `feature_selection_mode=auto`，并进入产品指标优先的端到端优化链路：启用模型搜索、窗口 NPZ 导出、`s07` 后处理搜索，并把阈值目标改成 `precision_constrained`。
 - `--with_postprocess` 只是打开后处理搜索；它不会改成 auto E2E 的精度约束策略，也不会写 `auto_optimize/` 汇总。
-- 商用 8 特征全部进入 91 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。采集 `mode` 也作为可选候选参与排序；若选中，必须重点审计跨 subject/device/session/mode 泛化，防止硬件捷径。
+- 商用 8 特征全部进入 111 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。采集 `mode` 也作为可选候选参与排序；若选中，必须重点审计跨 subject/device/session/mode 泛化，防止硬件捷径。
 - 原始绿光布局统一映射成三个中心对称光区。光区特征仅使用置换不变的聚合、三对相关性、周期支持和绝对时延，不依赖绝对方位、顺逆时针方向或原始通道编号。
 - 新增 7 项互补候选：top2 稳健偏度与谱熵、ACC jerk 尾部均值、ACC–PPG 有限延迟相关与 PSD 相似度、三光区 2-of-3 周期性和三对时延 RMS。
+- v7 包含 20 项三光区鲁棒候选：逐点中位波形、按 AC-RMS 能量排序且对并列值无编号偏置的 top2 复合波形、三种两区组合的周期性/主频差/ACDC/环境相关顺序统计、环境光线性投影残差、三光区相位集中度和频谱共识。RMS 只用于衡量脉动能量，不等同于信号质量；频率、相位和谱共识只使用同时通过相对 AC 幅值、频谱峰值与自相关三重有效性门控的光区。特征只依赖置换不变聚合，不依赖光区编号；相位与频谱共识带 `experimental_high_cost` 风险标记，供人工选择时单独审计。
 - 手动特征会冻结为 `manual_selected_features.json`，随后驱动模型搜参、复杂度约束、hard-negative 候选和 C 部署特征顺序。
 - hard-negative 候选只使用 train OOF 误报；只有 valid accuracy 不下降且 FPR 不恶化才接受，否则自动回滚参考模型。
 - Stage1 与 Stage2 是两条并行方法：Stage2 对全量合法窗口持续完成特征、模型和 EMA/投票/状态机更新；Stage1 只在最终对外输出端做快速门控，不过滤 Stage2 数据，也不暂停或重置 Stage2 状态。
@@ -53,7 +54,6 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
                                                       └→ Stage1 AND Stage2 最终输出
   → s06 部署式端到端评估与部署产物导出
   → s07 可选：基于窗口 NPZ 的后处理状态机搜索
-  → s09 可选：商业 AdaBoost baseline 对比
   → s06 可选：泛化审计
 ```
 
@@ -86,7 +86,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 s01 → s02 → s03 → s04 → 暂停，等待人工固化特征
 ```
 
-`s04` 输出完整 91 特征的 `feature_ranking_full.json/csv`、
+`s04` 输出完整 111 特征的 `feature_ranking_full.json/csv`、
 `manual_feature_selection.csv` 和
 `feature_pool_completeness.json`。默认流程不会用 Top-K、分组上限或 FFT 上限覆写人工选择。
 
@@ -129,7 +129,6 @@ effective stop_after:          s04（没有人工文件时）
 s06_cache / s06_replay_cache   逐窗 NPZ 缓存导出
 s07_post                       后处理状态机搜索
 s06_audit                      s06 内嵌泛化审计
-s09_cmp                        商业 baseline 对比
 auto_optimize/                 auto E2E 汇总产物
 ```
 
@@ -456,27 +455,6 @@ python s08_run_pipeline.py \
 
 当 `--stop_after s06_audit` 被指定时，`s08` 会自动打开 `--run_generalization_audit`。
 
-### 5.12 商业 baseline 对比
-
-```bash
-python s08_run_pipeline.py \
-  --dataset_dir dataset \
-  --artifact_dir artifacts \
-  --commercial_compare \
-  --stop_after s09_cmp
-```
-
-保留逐窗概率细节：
-
-```bash
-python s08_run_pipeline.py \
-  --dataset_dir dataset \
-  --artifact_dir artifacts \
-  --commercial_compare \
-  --keep_window_probs \
-  --stop_after s09_cmp
-```
-
 ## 6. `s08_run_pipeline.py` 步骤控制
 
 可用 `--stop_after`：
@@ -501,7 +479,6 @@ s06_xpt
 s06_feat
 s06_plot
 s06_cb
-s09_cmp
 ```
 
 示例：
@@ -525,7 +502,6 @@ python s08_run_pipeline.py \
 - `--stop_after s06_cache`、`s06_replay_cache` 或 `s07_post` 会按需打开 `--export_window_cache`。
 - `--stop_after s07_post` 会按需打开 `--optimize_postprocess`。
 - `--stop_after s06_audit` 会按需打开 `--run_generalization_audit`。
-- `--stop_after s09_cmp` 会按需打开 `--commercial_compare`。
 
 这些是 step target 的便利联动，不等同于 `--auto_optimize_e2e`。
 
@@ -595,7 +571,7 @@ python s02_ir_dc_threshold.py \
 
 ### `s03_extract_feature_pool.py`
 
-作用：提取 91 项 Stage2 特征池 CSV，包括采集 `mode`、三个中心对称绿光区、环境光、ACC，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
+作用：提取 111 项 Stage2 特征池 CSV，包括采集 `mode`、三个中心对称绿光区、环境光、ACC、三光区鲁棒共识/局部异常特征，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
 
 ```bash
 python s03_extract_feature_pool.py \
@@ -610,7 +586,7 @@ python s03_extract_feature_pool.py \
 
 ### `s04_feature_selection.py`
 
-作用：清洗并完整排序 91 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 CSV 选择接口。manual 模式不应用分组或数量上限；CSV 中只允许修改 `selected` 列。
+作用：清洗并完整排序 111 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 CSV 选择接口。manual 模式不应用分组或数量上限；CSV 中只允许修改 `selected` 列。
 
 ```bash
 python s04_feature_selection.py \
@@ -702,24 +678,6 @@ python s07_postprocess_optimize.py \
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
-### `s09_commercial_compare.py`
-
-作用：比较当前项目模型与商业 AdaBoost baseline。
-
-```bash
-python s09_commercial_compare.py \
-  --artifact_dir artifacts \
-  --split test \
-  --method state_machine \
-  --fp_cost 4.0
-```
-
-输出重点：
-- `commercial_compare/commercial_compare.json`：商业 AdaBoost 与当前部署模型的完整对比报告。
-- `commercial_compare/window_level_compare.csv`：逐指标对比 sample、window model、streaming window 三个口径。
-- `commercial_compare/accuracy_scope_compare.csv`：只抽取三种口径的 accuracy，便于快速检查口径差异。
-- `commercial_compare/commercial_compare_summary.png`：左上为 sample-level 指标，右上为 streaming window 指标。
-
 `s06_deploy_eval.py` 也内嵌泛化审计入口，用于读取已有评估产物并输出分层审计结果：
 
 ```bash
@@ -768,7 +726,6 @@ artifacts/
   postprocess_opt/
   postprocess_opt/postprocess_search_summary.png
   auto_optimize/
-  commercial_compare/
   generalization_audit/
   generalization_audit/audit_strata_heatmap.png
   generalization_audit/audit_ranked_error_bars.png
@@ -825,7 +782,7 @@ artifacts/
 
 | 图片 | 说明 |
 |---|---|
-| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、91 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
+| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、111 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
 | `report_plots/s04_feature_selection_report.png` | 三栏：左栏 Top 20 特征排名柱状（已选深色标记 + 综合得分折线），右上选入特征的群组分布，右下 Top 12 特征 FP Proxy 风险双柱 |
 | `report_plots/s04_shap_importance.png` | 四栏 SHAP 报告：左上 Top 20 特征 mean(\|SHAP\|) 柱状（已选特征深色），右上 Train vs Valid SHAP 散点 + Spearman ρ 标注，左下 Top-K 重叠率柱状，右下可疑 Train-only 强特征红色柱状 |
 
@@ -886,14 +843,6 @@ artifacts/
 | `feature_embedding_report/feature_distribution_{序号}_{特征名}.png` | 每个入选特征在 target=0/1 两类的分布对比箱线图 + 散点覆盖 |
 
 UMAP 需安装 `umap-learn` 包。如未安装，报告仍会输出 PCA 和 t-SNE 图，并在 `embedding_summary.json` 中记录 UMAP 跳过原因。
-
-### 10.8 商业对比图（s09）
-
-| 图片 | 说明 |
-|---|---|
-| `commercial_compare/commercial_compare_summary.png` | 2×2 对比：左上 Sample 指标柱状对比，右上 Streaming window 指标柱状对比，左下商业方案混淆矩阵，右下部署方案混淆矩阵 |
-| `commercial_compare/commercial_compare_probabilities.png` | 1×2 窗口概率直方图：左为商业 AdaBoost，右为部署 XGBoost，红=target0，绿=target1 |
-| `commercial_compare/commercial_compare_disagreements.png` | 水平柱状：配对的 6 类样本结果（both correct / ours only / commercial only / both wrong / 各方案专属 FP），标注每类样本数 |
 
 ## 11. 部署交付要点
 

@@ -27,10 +27,7 @@ legacy s06 状态机优化、NPZ 缓存导出和 s07 后处理搜参很耗时，
 泛化审计只读取已有评估 artifacts，不重新训练；需要时显式运行：
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --run_generalization_audit --stop_after s06_audit
 
-商用 baseline 对比暂不属于默认全流程；需要时显式运行：
-    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_compare --stop_after s09_cmp
-
-如果 --stop_after 直接指向 s07_post/s06_audit/s09_cmp，脚本会视为显式请求并自动打开对应可选步骤。
+如果 --stop_after 直接指向 s07_post/s06_audit，脚本会视为显式请求并自动打开对应可选步骤。
 
 Full optimization shortcut:
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --full_optimize
@@ -41,7 +38,7 @@ Stage2 no-IR policy:
     golden_vectors.json use only ambient, green, and ACC features.
 
 Preflight gates before a real-data run:
-    python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py s09_commercial_compare.py
+    python -m py_compile s01_data_split.py s02_ir_dc_threshold.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py
     python -m pytest test_deploy_feature_extractor.py test_end_to_end_pipeline_guard.py -q --basetemp .pytest_tmp_deploy_guard
 
 Do not pass an empty string to --model_search_feature_counts. For a fixed feature
@@ -49,7 +46,7 @@ count, pass one explicit value, for example:
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --max_features 15 --model_search_feature_counts 15
 
 用法:
-    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/泛化审计/商用对比）
+    # 主流程运行（含 XGBoost 搜参、评估和部署导出；不含 NPZ/s07 搜参/泛化审计）
     python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
     # 需要时再打开 NPZ 缓存导出和 s07 后处理搜参
@@ -76,7 +73,6 @@ count, pass one explicit value, for example:
     s06_eval: 端到端评估
     s06_audit: 泛化审计（默认不跑；需 --run_generalization_audit，由 s06_deploy_eval 内嵌执行）
     s06_xpt: 导出部署产物 (--export_deploy)
-    s09_cmp: 我们方案 vs 商用方案对比（默认不跑；需 --commercial_compare --stop_after s09_cmp）
 """
 
 import argparse
@@ -364,126 +360,6 @@ def export_auto_e2e_summary(artifact_dir, postprocess_split="valid", split="test
     print(f"[OK] auto E2E candidate manifest -> {candidate_manifest_path}")
     return summary_path
 
-
-EXTRA_FEATURE_FORMULAS = {
-    "GREEN_CORR": {
-        "formula": "safe_corr(g_mean_bp, moving_average(g_mean_bp, window=round(0.15*fs)))",
-        "intermediate_signals": {"g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3"},
-    },
-    "GREEN_AC": {
-        "formula": "0.5*sqrt(mean(g_mean_bp^2)) + 0.5*1.4826*robust_mad(g_mean_bp)",
-        "intermediate_signals": {"g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3"},
-    },
-    "AMB_AC": {
-        "formula": "0.5*sqrt(mean(amb_bp^2)) + 0.5*1.4826*robust_mad(amb_bp)",
-        "intermediate_signals": {"amb_bp": "preprocessed ambient bandpass signal"},
-    },
-    "ACC_YSUM": {
-        "formula": "mean(sqrt(acc_x^2 + acc_y^2 + acc_z^2))",
-        "intermediate_signals": {"acc_mag": "sqrt(acc_x^2 + acc_y^2 + acc_z^2)"},
-    },
-    "GREEN_DC": {
-        "formula": "median(g_mean_raw)",
-        "intermediate_signals": {"g_mean_raw": "(g1_raw + g2_raw + g3_raw) / 3"},
-    },
-    "AMB_DC": {
-        "formula": "median(raw ambient input)",
-        "intermediate_signals": {"ambient": "raw input ambient window"},
-    },
-    "GREEN_XCORR": {
-        "formula": "max(normalized_autocorr(g_mean_bp)[lag_min:lag_max]) for 40-180 bpm",
-        "intermediate_signals": {"g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3"},
-    },
-    "FFT_PEAK_MEDIAN_RATIO": {
-        "formula": "fft_peak_features(g_mean_bp, 25, 0.5, 5.0)[0]",
-        "intermediate_signals": {"g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3"},
-    },
-    "GREEN_FFT_harmonic_ratio": {
-        "formula": "max_power_near(2*GREEN_DOM_FREQ, +/-0.3Hz) / (GREEN_DOM_FREQ_power + 1e-12)",
-        "intermediate_signals": {
-            "g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3",
-            "band_spec": "FFT spectrum over 0.5-5Hz",
-        },
-    },
-    "GREEN_FFT_harmonic_present": {
-        "formula": "1 if second_harmonic_power > 0.1 * fundamental_power else 0",
-        "intermediate_signals": {
-            "g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3",
-            "band_spec": "FFT spectrum over 0.5-5Hz",
-        },
-    },
-    "ACC_PPG_coherence_mean": {
-        "formula": "legacy research feature; excluded from the deployment-friendly Stage2 pool",
-        "intermediate_signals": {
-            "acc_mag": "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
-            "g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3",
-        },
-    },
-    "ACC_PPG_coherence_max": {
-        "formula": "legacy research feature; excluded from the deployment-friendly Stage2 pool",
-        "intermediate_signals": {
-            "acc_mag": "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
-            "g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3",
-        },
-    },
-    "SIG_LEN": {"formula": "len(window)", "intermediate_signals": {}},
-    "SIG_SEC": {"formula": "len(window) / fs", "intermediate_signals": {}},
-    "start_sec": {"formula": "window start time in seconds (fs-independent)", "intermediate_signals": {}},
-    "mode": {
-        "formula": "green-channel hardware mode supplied by caller",
-        "intermediate_signals": {},
-    },
-    "SQI_FLAT_RATIO": {
-        "formula": "mean(diff-flat-ratio over Ambient and GreenMean before artifact removal)",
-        "intermediate_signals": {
-            "ambient": "raw input ambient window",
-            "g_mean": "(g1 + g2 + g3) / 3 before preprocessing",
-        },
-    },
-    "SQI_SPIKE_RATIO": {
-        "formula": "mean(diff > 6*MAD(diff) ratio over Ambient and GreenMean before artifact removal)",
-        "intermediate_signals": {
-            "ambient": "raw input ambient window",
-            "g_mean": "(g1 + g2 + g3) / 3 before preprocessing",
-        },
-    },
-    "IR_ROBUST_RANGE_RATIO": {
-        "formula": "(p95(ir_raw)-p5(ir_raw)) / |median(ir_raw)|",
-        "intermediate_signals": {"ir_raw": "preprocessed IR raw-clean signal"},
-    },
-    "GREEN_ROBUST_RANGE_RATIO": {
-        "formula": "(p95(g_mean_raw)-p5(g_mean_raw)) / |median(g_mean_raw)|",
-        "intermediate_signals": {"g_mean_raw": "(g1_raw + g2_raw + g3_raw) / 3"},
-    },
-    "AMB_ROBUST_RANGE_RATIO": {
-        "formula": "(p95(amb_raw)-p5(amb_raw)) / |median(amb_raw)|",
-        "intermediate_signals": {"amb_raw": "preprocessed ambient raw-clean signal"},
-    },
-    "IR_SEG_ACDC_CV": {
-        "formula": "std(AC/DC over three 1s IR segments) / mean(AC/DC)",
-        "intermediate_signals": {"ir_raw": "preprocessed IR raw-clean signal"},
-    },
-    "GREEN_SEG_ACDC_CV": {
-        "formula": "std(AC/DC over three 1s GreenMean segments) / mean(AC/DC)",
-        "intermediate_signals": {"g_mean_raw": "(g1_raw + g2_raw + g3_raw) / 3"},
-    },
-    "AMB_SEG_ACDC_CV": {
-        "formula": "std(AC/DC over three 1s Ambient segments) / mean(AC/DC)",
-        "intermediate_signals": {"amb_raw": "preprocessed ambient raw-clean signal"},
-    },
-    "GREEN_BAND_ENERGY_RATIO": {
-        "formula": "sum(FFT(g_mean_bp)^2 over 0.7-3Hz) / sum(FFT(g_mean_bp)^2 over 0.5-5Hz)",
-        "intermediate_signals": {"g_mean_bp": "(g1_bp + g2_bp + g3_bp) / 3"},
-    },
-    "IR_BAND_ENERGY_RATIO": {
-        "formula": "sum(FFT(ir_bp)^2 over 0.7-3Hz) / sum(FFT(ir_bp)^2 over 0.5-5Hz)",
-        "intermediate_signals": {"ir_bp": "preprocessed IR bandpass signal"},
-    },
-    "AMB_BAND_ENERGY_RATIO": {
-        "formula": "sum(FFT(amb_bp)^2 over 0.7-3Hz) / sum(FFT(amb_bp)^2 over 0.5-5Hz)",
-        "intermediate_signals": {"amb_bp": "preprocessed ambient bandpass signal"},
-    },
-}
 
 
 def _json_float_map(values, feature_names):
@@ -1248,25 +1124,6 @@ def _run(name, cmd, dry_run=False, runtime_events=None):
         return False
 
 
-def run_embedded_commercial_compare(args):
-    import s09_commercial_compare as commercial_compare
-
-    argv = [
-        "--artifact_dir", str(args.artifact_dir),
-        "--split", str(args.commercial_split),
-        "--fp_cost", str(args.commercial_fp_cost),
-        "--method", "state_machine",
-        "--window_sec", str(args.window_sec),
-        "--stride_sec", str(args.stride_sec),
-        "--skip_initial_windows", str(args.skip_initial_windows),
-        "--warmup_frames", str(args.postprocess_warmup_frames),
-        "--use_stage2_ir" if args.use_stage2_ir else "--no-use_stage2_ir",
-    ]
-    if args.keep_window_probs:
-        argv.append("--keep_window_probs")
-    commercial_compare.main(argv)
-
-
 def _parse_csv_strings(value):
     return tuple(part.strip() for part in str(value).split(",") if part.strip())
 
@@ -1366,601 +1223,81 @@ def _build_full_feature_recipe(selected_features):
     为每个入选特征构建完整的自包含计算配方。
     从 25Hz 原始窗口 → 预处理 → 中间信号 → 特征值，全链路。
     """
-    # ---- 通道提取 ----
-    CHANNEL_EXTRACT = {
+    selected_features = list(selected_features)
+    catalog_formulas = build_selected_feature_formulas(selected_features)
+
+    # Keep the established mode1/mode2 physical-channel mapping unchanged.
+    channel_extract = {
         "ir": "window[:, 0]",
         "ambient": "window[:, 1] if N_ch>1 else window[:, 0]",
         "g1": "mode==1 ? window[:,3] : mode==2 ? (window[:,6]+window[:,9]+window[:,12])/3 : window[:,2]",
         "g2": "mode==1 ? window[:,4] : mode==2 ? (window[:,7]+window[:,10]+window[:,13])/3 : window[:,2]",
         "g3": "mode==1 ? window[:,5] : mode==2 ? (window[:,8]+window[:,11]+window[:,14])/3 : window[:,2]",
     }
-    MODE_DETECT = (
-        "mode=1 if mean(var(ch3,ch4,ch5)) > var(ch0) and mean(var(ch3,ch4,ch5)) > 1e6 else mode=2"
+    mode_detect = (
+        "mode=1 if mean(var(ch3,ch4,ch5)) > var(ch0) and "
+        "mean(var(ch3,ch4,ch5)) > 1e6 else mode=2"
     )
-
-    # ---- 预处理（每通道） ----
-    PREPROCESS_STEPS = [
-        ("remove_burr",    "if |x[i]-x[i-1]|>6*MAD(diff) and |x[i]-x[i+1]|>6*MAD(diff): x[i]=(x[i-1]+x[i+1])/2"),
-        ("remove_step",    "if |x[i]-x[i-1]|>10*MAD(diff): x[i]=x[i-1]"),
-        ("medfilt",        "median_filter(x, kernel=max(3,round(0.05*fs)), odd)   // ~50ms"),
-        ("moving_avg",     "convolve(x, ones(k)/k, 'same'), k=max(2,round(0.03*fs))  // ~30ms"),
-        ("bandpass",       "butterworth_4th_order(x, lowcut=0.4Hz, highcut=6.0Hz, fs=25, zero_phase=filtfilt)"),
+    preprocess_steps = [
+        (
+            "finite_replacement",
+            "replace NaN/Inf by the finite channel median; use zero only when no finite sample exists",
+        ),
+        (
+            "isolated_spike_repair",
+            "remove_burr(x,k=6): replace a point only when both neighbour differences exceed max(6*MAD(diff(x)),1e-12)",
+        ),
+        (
+            "rolling_median_detrend",
+            "baseline=rolling_median(contact_raw, nearest odd max(3,round(0.8*fs))); pulse=contact_raw-baseline",
+        ),
+        (
+            "optional_short_smoothing",
+            "if round(0.04*fs)>=2, pulse=moving_average(pulse,round(0.04*fs)); at 25Hz this step is inactive",
+        ),
     ]
-    PREPROCESS_OUTPUT = {
-        "raw_clean": "medfilt + moving_avg 之后的信号",
-        "bp":       "bandpass(raw_clean)  ← AC 信号",
-        "dc":       "median(raw_clean)",
+    preprocess_output = {
+        "contact_raw": "finite replacement followed by isolated-spike repair; used for DC/contact features",
+        "pulse": "contact_raw minus its 0.8s rolling-median baseline, with optional 0.04s smoothing",
+        "dc": "median(contact_raw)",
     }
-
-    # ---- 复合信号 ----
-    COMPOSITE = {
-        "g_mean_raw": "(g1_raw + g2_raw + g3_raw) / 3.0",
-        "g_mean_bp":  "(g1_bp + g2_bp + g3_bp) / 3.0",
-        "g_mean_dc":  "median(g_mean_raw)",
-        "g_top2_bp":  "mean of the two green channels with highest AC RMS",
-        "g_top2_raw": "raw-clean mean of the same two green channels",
-        "acc_mag":    "sqrt(acc_x^2 + acc_y^2 + acc_z^2)",
-        "acc_mag_bp": "bandpass(acc_mag - mean(acc_mag), 0.5Hz, 5.0Hz, 4th_order, fs=25)",
-        "acc_x":      "acc[:, 0]",
-        "acc_y":      "acc[:, 1]",
-        "acc_z":      "acc[:, 2]",
+    composite = {
+        "g_mean_raw": "mean(g1_contact_raw,g2_contact_raw,g3_contact_raw)",
+        "g_mean_pulse": "mean(g1_pulse,g2_pulse,g3_pulse)",
+        "g_top2_raw": "tie-aware average of every equally maximal two-zone AC-RMS pair mean",
+        "g_top2_pulse": "tie-aware average of every equally maximal two-zone AC-RMS pair pulse mean",
+        "g_median_raw": "pointwise_median(g1_contact_raw,g2_contact_raw,g3_contact_raw)",
+        "g_median_pulse": "pointwise_median(g1_pulse,g2_pulse,g3_pulse)",
+        "green_pair_views": "the three unordered two-zone mean raw/pulse signals",
+        "ambient_residuals": "each zone pulse after guarded linear ambient projection removal",
+        "acc_magnitude": "sqrt(acc_x^2+acc_y^2+acc_z^2)",
+        "acc_motion": "acc_magnitude minus its 0.8s rolling-median baseline, then guarded clipping",
     }
-
-    # ---- 通用函数 ----
-    UTILS = {
-        "safe_div(a,b)":  "a / (b + 1e-12)",
-        "robust_mad(x)":  "median(|x - median(x)|)",
-        "robust_iqr(x)":  "percentile(x,75) - percentile(x,25)",
-        "safe_corr(x,y)": "x=x-mean(x); y=y-mean(y); sx=std(x); sy=std(y);\n"
-                          "  if sx<1e-12 or sy<1e-12: return 0.0\n"
-                          "  return mean((x/sx) * (y/sy))",
-        "smooth_envelope(x)": "convolve(|bp|, ones(w)/w, 'same'), w=max(3,round(0.25*fs)), odd",
-        "max_norm_xcorr(x,y,max_lag)": "correlate(x,y,'full'), keep lags in [-max_lag,max_lag],\n"
-                          "  normalize by (N*sx*sy+1e-12), return max(|val|)",
-        "fft_peak_features(bp,fs,fmin,fmax)": "x=bp-mean(bp); xw=x*hamming(N); nfft=next_pow2(N,max=256);\n"
-                          "  spec=|rfft(xw,nfft)|; freqs=rfftfreq(nfft,1/fs);\n"
-                          "  band=(freqs>=fmin & freqs<=fmax); peak_ratio=max(band)/median(band);\n"
-                          "  dom_freq=band_freqs[argmax(band)]; return (peak_ratio, dom_freq)",
-        "normalized_autocorr(bp)": "x=bp-mean(bp); ac=correlate(x,x,'full'); ac=ac[N-1:];\n"
-                          "  return ac/ac[0] if ac[0]>1e-12 else zeros",
-        "autocorr_peak_lag(bp,fs,bpm_min,bpm_max)": "ac=normalized_autocorr(bp);\n"
-                          "  lag_min=max(1,int(fs*60/bpm_max)); lag_max=min(len(ac)-1,int(fs*60/bpm_min));\n"
-                          "  peak=max(ac[lag_min:lag_max+1]); lag_sec=(lag_min+argmax)/fs;\n"
-                          "  return (peak, lag_sec)",
+    utils = {
+        "guarded_ratio": "finite numerator/denominator with a signal-scale denominator floor",
+        "guarded_corr": "finite correlation; return zero if either relative standard deviation is too small",
+        "robust_mad": "median(abs(x-median(x)))",
+        "fft_cache": "Hamming-window rFFT over 0.5-5Hz; a zero-energy band has dom_freq=0",
+        "frequency_validity_gate": "zone pulse RMS>max(1e-8*median(abs(zone_raw)),1e-9), dom_freq>0, spectral peak/median ratio>=3, and 40-180bpm autocorrelation peak>=0.20",
+        "top2_tie_rule": "include all pairs whose pair AC sum is within max(1e-9*best,1e-12) of the best pair",
     }
-
-    # ---- 逐特征完整配方（包含中间值展开） ----
-    # 每个特征的 value 是一个 dict: {"depends": [中间信号], "formula": "完整公式"}
-    FEATURE_FULL = {
-        # == Core stats ==
-        "IR_mean":          {"depends": ["ir_raw"], "formula": "mean(ir_raw)"},
-        "IR_std":           {"depends": ["ir_raw"], "formula": "std(ir_raw)"},
-        "IR_p95":           {"depends": ["ir_raw"], "formula": "percentile(ir_raw, 95)"},
-        "IR_diff_std":      {"depends": ["ir_raw"], "formula": "std(diff(ir_raw))"},
-        "IR_acdc":          {"depends": ["ir_bp", "ir_dc"], "formula": "safe_div(sqrt(mean(ir_bp^2)), |ir_dc|)"},
-
-        "G_mean_mean":      {"depends": ["g_mean_raw"], "formula": "mean(g_mean_raw)"},
-        "G_mean_std":       {"depends": ["g_mean_raw"], "formula": "std(g_mean_raw)"},
-        "G_mean_diff_std":  {"depends": ["g_mean_raw"], "formula": "std(diff(g_mean_raw))"},
-        "G_mean_acdc":      {"depends": ["g_mean_bp", "g_mean_dc"], "formula": "safe_div(sqrt(mean(g_mean_bp^2)), |g_mean_dc|)"},
-
-        "log_IR_Gmean_mean":{"depends": ["ir_raw", "g_mean_raw"], "formula": "mean(log|ir_raw| - log|g_mean_raw|)"},
-        "IR_over_Gmean_mean":{"depends": ["ir_raw", "g_mean_raw"], "formula": "mean(ir_raw / (g_mean_raw + 1e-12))"},
-        "IR_over_Gmean_std":{"depends": ["ir_raw", "g_mean_raw"], "formula": "std(ir_raw / (g_mean_raw + 1e-12))"},
-        "corr_IR_Gmean":    {"depends": ["ir_raw", "g_mean_raw"], "formula": "safe_corr(ir_raw, g_mean_raw)"},
-
-        "Ambient_mean":     {"depends": ["amb_raw"], "formula": "mean(amb_raw)"},
-        "Ambient_std":      {"depends": ["amb_raw"], "formula": "std(amb_raw)"},
-        "Ambient_p95":      {"depends": ["amb_raw"], "formula": "percentile(amb_raw, 95)"},
-        "corr_Ambient_IR":  {"depends": ["amb_raw", "ir_raw"], "formula": "safe_corr(amb_raw, ir_raw)"},
-        "corr_Ambient_Gmean":{"depends": ["amb_raw", "g_mean_raw"], "formula": "safe_corr(amb_raw, g_mean_raw)"},
-
-        "IR_over_Ambient_mean":{"depends": ["ir_raw", "amb_raw"], "formula": "mean(ir_raw / (amb_raw + 1e-12))"},
-        "IR_over_Ambient_std": {"depends": ["ir_raw", "amb_raw"], "formula": "std(ir_raw / (amb_raw + 1e-12))"},
-
-        # == Single-channel: GREEN ==
-        "GREEN_DC_MEDIAN":  {"depends": ["g_mean_raw"], "formula": "median(g_mean_raw)"},
-        "GREEN_DC_IQR":     {"depends": ["g_mean_raw"], "formula": "robust_iqr(g_mean_raw)"},
-        "GREEN_AC_RMS":     {"depends": ["g_mean_bp"], "formula": "sqrt(mean(g_mean_bp^2))"},
-        "GREEN_AC_MAD":     {"depends": ["g_mean_bp"], "formula": "robust_mad(g_mean_bp)"},
-        "GREEN_AC_DC_RATIO":{"depends": ["g_mean_bp", "g_mean_dc"], "formula": "safe_div(sqrt(mean(g_mean_bp^2)), |g_mean_dc|)"},
-        "GREEN_DERIV_MAD":  {"depends": ["g_mean_bp"], "formula": "robust_mad(diff(g_mean_bp))"},
-
-        # == Single-channel: IRX ==
-        "IRX_DC_MEDIAN":    {"depends": ["ir_raw"], "formula": "median(ir_raw)"},
-        "IRX_DC_IQR":       {"depends": ["ir_raw"], "formula": "robust_iqr(ir_raw)"},
-        "IRX_AC_RMS":       {"depends": ["ir_bp"], "formula": "sqrt(mean(ir_bp^2))"},
-        "IRX_AC_MAD":       {"depends": ["ir_bp"], "formula": "robust_mad(ir_bp)"},
-        "IRX_AC_DC_RATIO":  {"depends": ["ir_bp", "ir_dc"], "formula": "safe_div(sqrt(mean(ir_bp^2)), |ir_dc|)"},
-        "IRX_DERIV_MAD":    {"depends": ["ir_bp"], "formula": "robust_mad(diff(ir_bp))"},
-
-        # == Single-channel: AMBX ==
-        "AMBX_DC_MEDIAN":   {"depends": ["amb_raw"], "formula": "median(amb_raw)"},
-        "AMBX_DC_IQR":      {"depends": ["amb_raw"], "formula": "robust_iqr(amb_raw)"},
-        "AMBX_AC_RMS":      {"depends": ["amb_bp"], "formula": "sqrt(mean(amb_bp^2))"},
-        "AMBX_AC_MAD":      {"depends": ["amb_bp"], "formula": "robust_mad(amb_bp)"},
-        "AMBX_AC_DC_RATIO": {"depends": ["amb_bp", "amb_dc"], "formula": "safe_div(sqrt(mean(amb_bp^2)), |amb_dc|)"},
-        "AMBX_DERIV_MAD":   {"depends": ["amb_bp"], "formula": "robust_mad(diff(amb_bp))"},
-
-        # == FFT / Frequency ==
-        "GREEN_FFT_PEAK_MEDIAN_RATIO": {"depends": ["g_mean_bp"], "formula": "fft_peak_features(g_mean_bp, 25, 0.5, 5.0)[0]"},
-        "GREEN_DOM_FREQ":     {"depends": ["g_mean_bp"], "formula": "fft_peak_features(g_mean_bp, 25, 0.5, 5.0)[1]"},
-        "GREEN_AUTO_CORR_PEAK":{"depends": ["g_mean_bp"], "formula": "autocorr_peak_lag(g_mean_bp, 25, 40, 180)[0]"},
-        "GREEN_AUTO_CORR_LAG_SEC":{"depends": ["g_mean_bp"], "formula": "autocorr_peak_lag(g_mean_bp, 25, 40, 180)[1]"},
-
-        "IRX_FFT_PEAK_MEDIAN_RATIO": {"depends": ["ir_bp"], "formula": "fft_peak_features(ir_bp, 25, 0.5, 5.0)[0]"},
-        "IRX_DOM_FREQ":     {"depends": ["ir_bp"], "formula": "fft_peak_features(ir_bp, 25, 0.5, 5.0)[1]"},
-        "IRX_AUTO_CORR_PEAK":{"depends": ["ir_bp"], "formula": "autocorr_peak_lag(ir_bp, 25, 40, 180)[0]"},
-        "IRX_AUTO_CORR_LAG_SEC":{"depends": ["ir_bp"], "formula": "autocorr_peak_lag(ir_bp, 25, 40, 180)[1]"},
-
-        "AMBX_FFT_PEAK_MEDIAN_RATIO": {"depends": ["amb_bp"], "formula": "fft_peak_features(amb_bp, 25, 0.5, 5.0)[0]"},
-        "AMBX_DOM_FREQ":    {"depends": ["amb_bp"], "formula": "fft_peak_features(amb_bp, 25, 0.5, 5.0)[1]"},
-        "AMBX_AUTO_CORR_PEAK":{"depends": ["amb_bp"], "formula": "autocorr_peak_lag(amb_bp, 25, 40, 180)[0]"},
-        "AMBX_AUTO_CORR_LAG_SEC":{"depends": ["amb_bp"], "formula": "autocorr_peak_lag(amb_bp, 25, 40, 180)[1]"},
-
-        # == IR FFT harmonic + SNR (Tier 2, from s03 7b) ==
-        "IR_FFT_SNR":               {"depends": ["ir_bp"], "formula": "sum(FFT(ir_bp)^2 over 0.5-5Hz) / (total_power - band_power + 1e-12)"},
-        "IR_FFT_harmonic_ratio":    {"depends": ["ir_bp"], "formula": "max_power_near(2*IR_DOM_FREQ, +/-0.3Hz) / (IR_DOM_FREQ_power + 1e-12)"},
-        "IR_FFT_harmonic_present":  {"depends": ["ir_bp"], "formula": "1 if second_harmonic_power > 0.1 * fundamental_power else 0"},
-        "IR_FFT_peak_width_Hz":     {"depends": ["ir_bp"], "formula": "FFT peak width at 50% of max within 0.5-5Hz"},
-        # == AMB spectral (Tier 2, from s03 7c) ==
-        "AMB_DOM_FREQ":              {"depends": ["amb_bp"], "formula": "fft_peak_features(amb_bp, 25, 0.5, 5.0)[1]"},
-        "AMB_FFT_PEAK_MEDIAN_RATIO": {"depends": ["amb_bp"], "formula": "fft_peak_features(amb_bp, 25, 0.5, 5.0)[0]"},
-
-        "GREEN_FFT_peak_width_Hz": {"depends": ["g_mean_bp", "fft_spec", "fft_freqs"],
-                                     "formula": "spec,freqs=fft_peak_features内部结果; band=0.5-5Hz; "
-                                                "above_half=band_spec>max(band_spec)*0.5; "
-                                                "width=freqs[above_half][-1]-freqs[above_half][0]"},
-        "GREEN_FFT_SNR":    {"depends": ["g_mean_bp", "fft_spec"],
-                             "formula": "in_band=sum(band_spec^2); out_band=sum(spec^2)-in_band; "
-                                        "SNR=in_band/(out_band+1e-12)"},
-
-        # == Green spatial ==
-        "G_imbalance_mean": {"depends": ["g1_raw", "g2_raw", "g3_raw"],
-                             "formula": "g_stack=[g1_raw,g2_raw,g3_raw]; g_std=std(g_stack,axis=0); "
-                                        "g_mean=mean(g_stack,axis=0); imb=g_std/|g_mean|; "
-                                        "return mean(imb)"},
-        "G_imbalance_p90":  {"depends": ["g1_raw", "g2_raw", "g3_raw"], "formula": "percentile(imb_series, 90)"},
-        "G_imbalance_iqr":  {"depends": ["g1_raw", "g2_raw", "g3_raw"], "formula": "robust_iqr(imb_series)"},
-        "G_rangeNorm_mean": {"depends": ["g1_raw", "g2_raw", "g3_raw"],
-                             "formula": "g_range=(max(g_stack,axis=0)-min(g_stack,axis=0)) / "
-                                        "(|g1|+|g2|+|g3|+1e-12); return mean(g_range)"},
-        "G_rangeNorm_p90":  {"depends": ["g1_raw", "g2_raw", "g3_raw"], "formula": "percentile(g_range, 90)"},
-        "G_spatial_vmag_mean":{"depends": ["g1_raw", "g2_raw", "g3_raw"],
-                               "formula": "vx=g1-0.5*g2-0.5*g3; vy=sqrt(3)/2*(g2-g3); "
-                                          "vmag=|v|/(|g1|+|g2|+|g3|+1e-12); return mean(vmag)"},
-        "G_spatial_vmag_p90":{"depends": ["g1_raw", "g2_raw", "g3_raw"], "formula": "percentile(vmag, 90)"},
-        "G_spatial_vmag_iqr":{"depends": ["g1_raw", "g2_raw", "g3_raw"], "formula": "robust_iqr(vmag)"},
-        "G_spatial_vmag_std":{"depends": ["g1_raw", "g2_raw", "g3_raw"], "formula": "std(vmag)"},
-        "G_ch_dc_cv":      {"depends": ["g1_raw", "g2_raw", "g3_raw"],
-                            "formula": "dc=[median(g1),median(g2),median(g3)]; "
-                                       "return std(dc)/|mean(dc)+1e-12|"},
-        "G_ch_dc_max_min_ratio":{"depends": ["g1_raw", "g2_raw", "g3_raw"],
-                                 "formula": "dc=[median(g1),median(g2),median(g3)]; "
-                                            "return max(|dc|)/min(|dc|+1e-12)"},
-        "GCH_DC_RANGE_RATIO":  {"depends": ["g1_raw", "g2_raw", "g3_raw"],
-                                 "formula": "(max(ch_dc)-min(ch_dc))/|mean(ch_dc)| across G1/G2/G3"},
-        "GCH_AC_RANGE_RATIO":  {"depends": ["g1_bp", "g2_bp", "g3_bp"],
-                                 "formula": "(max(ch_ac)-min(ch_ac))/|mean(ch_ac)| across G1/G2/G3"},
-
-        # == Green 3ch consistency ==
-        "G_bp_corr_mean":  {"depends": ["g1_bp", "g2_bp", "g3_bp"],
-                            "formula": "c12=safe_corr(g1_bp,g2_bp); c23=safe_corr(g2_bp,g3_bp); "
-                                       "c31=safe_corr(g3_bp,g1_bp); return mean([c12,c23,c31])"},
-        "G_bp_corr_min":   {"depends": ["g1_bp", "g2_bp", "g3_bp"], "formula": "min(c12,c23,c31)"},
-        "G_bp_corr_std":   {"depends": ["g1_bp", "g2_bp", "g3_bp"], "formula": "std(c12,c23,c31)"},
-        "G_bp_lag_std":    {"depends": ["g1_bp", "g2_bp", "g3_bp"],
-                            "formula": "c12=correlate(g1-mean(g1),g2-mean(g2),'same'); "
-                                       "lag12=argmax(|c12|)-N/2; "
-                                       "c23=correlate(g2-mean(g2),g3-mean(g3),'same'); "
-                                       "lag23=argmax(|c23|)-N/2; return std([lag12,lag23])"},
-
-        # == Cross-channel ==
-        "GREEN_IR_RAW_CORR":  {"depends": ["g_mean_raw", "ir_raw"], "formula": "safe_corr(g_mean_raw, ir_raw)"},
-        "GREEN_IR_BP_CORR":   {"depends": ["g_mean_bp", "ir_bp"], "formula": "safe_corr(g_mean_bp, ir_bp)"},
-        "GREEN_IR_ENV_CORR":  {"depends": ["g_mean_bp", "ir_bp"], "formula": "safe_corr(smooth_envelope(g_mean_bp,25), smooth_envelope(ir_bp,25))"},
-        "GREEN_IR_MAX_XCORR": {"depends": ["g_mean_bp", "ir_bp"], "formula": "max_norm_xcorr(g_mean_bp, ir_bp, max_lag=int(0.3*25)=7)"},
-        "GREEN_IR_DOM_FREQ_DIFF":{"depends": ["g_mean_bp", "ir_bp"], "formula": "|GREEN_DOM_FREQ - IRX_DOM_FREQ|"},
-        "GREEN_IR_AC_RATIO":  {"depends": ["g_mean_bp", "ir_bp"], "formula": "safe_div(sqrt(mean(g_mean_bp^2)), sqrt(mean(ir_bp^2)))"},
-        "GREEN_IR_DC_RATIO":  {"depends": ["g_mean_dc", "ir_dc"], "formula": "safe_div(|g_mean_dc|, |ir_dc|)"},
-        "GREEN_IR_ACDC_RATIO_RATIO":{"depends": ["g_mean_bp", "ir_bp", "g_mean_dc", "ir_dc"],
-                                      "formula": "safe_div(GREEN_AC_DC_RATIO, IRX_AC_DC_RATIO)"},
-
-        "GREEN_AMB_BP_CORR":  {"depends": ["g_mean_bp", "amb_bp"], "formula": "safe_corr(g_mean_bp, amb_bp)"},
-        "IR_AMB_BP_CORR":     {"depends": ["ir_bp", "amb_bp"], "formula": "safe_corr(ir_bp, amb_bp)"},
-        "GREEN_AMB_ENV_CORR": {"depends": ["g_mean_bp", "amb_bp"], "formula": "safe_corr(smooth_envelope(g_mean_bp,25), smooth_envelope(amb_bp,25))"},
-        "IR_AMB_ENV_CORR":    {"depends": ["ir_bp", "amb_bp"], "formula": "safe_corr(smooth_envelope(ir_bp,25), smooth_envelope(amb_bp,25))"},
-        "GREEN_AMB_LEAK":     {"depends": ["g_mean_bp", "amb_bp"], "formula": "|GREEN_AMB_BP_CORR| * sqrt(mean(amb_bp^2)) / (sqrt(mean(g_mean_bp^2))+1e-12)"},
-        "GREEN_AMB_LEAK_STABILITY": {"depends": ["amb_raw", "g_top2_raw"], "formula": "CV over three segment ratios: AMB segment ACDC / GTOP2 segment ACDC"},
-        "GREEN_AMB_SEG_CORR_RANGE": {"depends": ["amb_raw", "g_top2_raw"], "formula": "max(segment_corr(amb_raw,g_top2_raw)) - min(segment_corr(...)) over three segments"},
-        "IR_AMB_LEAK":        {"depends": ["ir_bp", "amb_bp"], "formula": "|IR_AMB_BP_CORR| * sqrt(mean(amb_bp^2)) / (sqrt(mean(ir_bp^2))+1e-12)"},
-        "AMB_AC_TO_GREEN_AC":  {"depends": ["amb_bp", "g_mean_bp"], "formula": "safe_div(sqrt(mean(amb_bp^2)), sqrt(mean(g_mean_bp^2)))"},
-        "AMB_DC_TO_GREEN_DC":  {"depends": ["amb_raw", "g_mean_raw"], "formula": "safe_div(median(amb_raw), |median(g_mean_raw)|)"},
-
-        # == Ambient Stage1 soft features ==
-        "AMB_STAGE1_RATIO":    {"depends": ["ir_raw", "amb_raw"], "formula": "median(amb_raw) / median(ir_raw)"},
-        "AMB_STAGE1_PASS":     {"depends": ["ir_raw", "amb_raw"], "formula": "1 if ir_dc >= 100 and amb/ir < 2.0 else 0"},
-        "IR_DC_LEVEL":         {"depends": ["ir_raw"], "formula": "median(ir_raw)"},
-
-        # == Spatial coupling ==
-        "corr_Gmean_G_imbalance": {"depends": ["g_mean_raw", "g1_raw", "g2_raw", "g3_raw"],
-                                   "formula": "safe_corr(g_mean_raw, imb_series)"},
-        "corr_Gmean_vmag":       {"depends": ["g_mean_raw", "g1_raw", "g2_raw", "g3_raw"],
-                                   "formula": "safe_corr(g_mean_raw, vmag_series)"},
-        "corr_IR_G_imbalance":   {"depends": ["ir_raw", "g1_raw", "g2_raw", "g3_raw"],
-                                   "formula": "safe_corr(ir_raw, imb_series)"},
-        "corr_IR_vmag":          {"depends": ["ir_raw", "g1_raw", "g2_raw", "g3_raw"],
-                                   "formula": "safe_corr(ir_raw, vmag_series)"},
-        "corr_Ambient_vmag":     {"depends": ["amb_raw", "g1_raw", "g2_raw", "g3_raw"],
-                                   "formula": "safe_corr(amb_raw, vmag_series)"},
-
-        # == Hjorth ==
-        "GREEN_Hjorth_Activity":   {"depends": ["g_mean_bp"], "formula": "var(g_mean_bp)"},
-        "GREEN_Hjorth_Mobility":   {"depends": ["g_mean_bp"], "formula": "sqrt(var(diff(g_mean_bp))/var(g_mean_bp))"},
-        "GREEN_Hjorth_Complexity": {"depends": ["g_mean_bp"], "formula": "sqrt(var(diff2(g_mean_bp))/var(diff(g_mean_bp)))"},
-        "IRX_Hjorth_Activity":     {"depends": ["ir_bp"], "formula": "var(ir_bp)"},
-        "IRX_Hjorth_Mobility":     {"depends": ["ir_bp"], "formula": "sqrt(var(diff(ir_bp))/var(ir_bp))"},
-        "IRX_Hjorth_Complexity":   {"depends": ["ir_bp"], "formula": "sqrt(var(diff2(ir_bp))/var(diff(ir_bp)))"},
-
-        # == Entropy (GREEN only) ==
-        "GREEN_Entropy_Shannon": {"depends": ["g_mean_bp"], "formula": "hist=histogram(bp,10,density=True); -sum(hist[hist>0]*log(hist[hist>0]+1e-12))"},
-        "GREEN_Entropy_ApEn":    {"depends": ["g_mean_bp"], "formula": "ApproximateEntropy(bp,m=2,r=0.2*std(bp)): "
-                                            "patterns_i=[bp[i:i+m] for i]; D_ij=max|patterns_i-patterns_j|; "
-                                            "C_i=sum(D_ij<=r)/(N-m); phi=mean(log(C_i+eps)); "
-                                            "ApEn=phi(m)-phi(m+1)"},
-        "GREEN_Entropy_SampEn":  {"depends": ["g_mean_bp"], "formula": "SampleEntropy(bp,m=2,r=0.2*std(bp)): "
-                                            "same as ApEn but exclude self-matches (D_ii=inf); "
-                                            "B=sum(D_ij<=r); SampEn=-log(B(m+1)/B(m)+eps)"},
-
-        # == Derivative ==
-        "GREEN_Deriv_d1_mean": {"depends": ["g_mean_bp"], "formula": "mean(diff(g_mean_bp))"},
-        "GREEN_Deriv_d1_std":  {"depends": ["g_mean_bp"], "formula": "std(diff(g_mean_bp))"},
-        "GREEN_Deriv_d1_max":  {"depends": ["g_mean_bp"], "formula": "max(diff(g_mean_bp))"},
-        "GREEN_Deriv_d1_min":  {"depends": ["g_mean_bp"], "formula": "min(diff(g_mean_bp))"},
-        "GREEN_Deriv_d1_zcr":  {"depends": ["g_mean_bp"], "formula": "sum(|diff(sign(diff(bp)))|)/(2*len(diff(bp)))"},
-        "IRX_Deriv_d1_mean":   {"depends": ["ir_bp"], "formula": "mean(diff(ir_bp))"},
-        "IRX_Deriv_d1_std":    {"depends": ["ir_bp"], "formula": "std(diff(ir_bp))"},
-        "IRX_Deriv_d1_max":    {"depends": ["ir_bp"], "formula": "max(diff(ir_bp))"},
-        "IRX_Deriv_d1_min":    {"depends": ["ir_bp"], "formula": "min(diff(ir_bp))"},
-        "IRX_Deriv_d1_zcr":    {"depends": ["ir_bp"], "formula": "sum(|diff(sign(diff(bp)))|)/(2*len(diff(bp)))"},
-        "AMBX_Deriv_d1_mean": {"depends": ["amb_bp"], "formula": "mean(diff(amb_bp))"},
-        "AMBX_Deriv_d1_std":  {"depends": ["amb_bp"], "formula": "std(diff(amb_bp))"},
-        "AMBX_Deriv_d1_max":  {"depends": ["amb_bp"], "formula": "max(diff(amb_bp))"},
-        "AMBX_Deriv_d1_min":  {"depends": ["amb_bp"], "formula": "min(diff(amb_bp))"},
-        "AMBX_Deriv_d1_zcr":  {"depends": ["amb_bp"], "formula": "sum(|diff(sign(diff(bp)))|)/(2*len(diff(bp)))"},
-
-        # == Hjorth (AMBX) ==
-        "AMBX_Hjorth_Activity":   {"depends": ["amb_bp"], "formula": "var(amb_bp)"},
-        "AMBX_Hjorth_Mobility":   {"depends": ["amb_bp"], "formula": "sqrt(var(diff(amb_bp))/var(amb_bp))"},
-        "AMBX_Hjorth_Complexity": {"depends": ["amb_bp"], "formula": "sqrt(var(diff2(amb_bp))/var(diff(amb_bp)))"},
-
-        # == Entropy (AMBX) ==
-        "AMBX_Entropy_Shannon": {"depends": ["amb_bp"], "formula": "Shannon entropy on 10-bin histogram of amb_bp"},
-
-        # == Temporal (AMBX) ==
-        "AMBX_Temporal_valley_ratio": {"depends": ["amb_bp"], "formula": "len(valleys)/len(amb_bp)"},
-
-        # == Temporal ==
-        "GREEN_Temporal_slope_mean":      {"depends": ["g_mean_bp"], "formula": "linear_regression(bp~arange(N)): slope=cov(t,bp)/var(t)"},
-        "GREEN_Temporal_slope_std":       {"depends": ["g_mean_bp"], "formula": "std(residuals after detrend)"},
-        "GREEN_Temporal_peak_prominence": {"depends": ["g_mean_bp"], "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool"},
-        "GREEN_Temporal_peak_ratio":      {"depends": ["g_mean_bp"], "formula": "len(peaks)/len(bp)"},
-        "GREEN_Temporal_valley_ratio":    {"depends": ["g_mean_bp"], "formula": "len(valleys)/len(bp)"},
-        "IRX_Temporal_slope_mean":      {"depends": ["ir_bp"], "formula": "linear_regression(bp~arange(N)): slope=cov(t,bp)/var(t)"},
-        "IRX_Temporal_slope_std":       {"depends": ["ir_bp"], "formula": "std(residuals after detrend)"},
-        "IRX_Temporal_peak_prominence": {"depends": ["ir_bp"], "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool"},
-        "IRX_Temporal_peak_ratio":      {"depends": ["ir_bp"], "formula": "len(peaks)/len(bp)"},
-        "AMBX_Temporal_slope_mean":      {"depends": ["amb_bp"], "formula": "linear_regression(bp~arange(N)): slope=cov(t,bp)/var(t)"},
-        "AMBX_Temporal_slope_std":       {"depends": ["amb_bp"], "formula": "std(residuals after detrend)"},
-        "AMBX_Temporal_peak_prominence": {"depends": ["amb_bp"], "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool"},
-        "AMBX_Temporal_peak_ratio":      {"depends": ["amb_bp"], "formula": "len(peaks)/len(bp)"},
-
-        # == Waveform shape ==
-        "GREEN_bp_skewness": {"depends": ["g_mean_bp"], "formula": "mean((bp-mean(bp))^3) / std(bp)^3"},
-        "IRX_bp_skewness":   {"depends": ["ir_bp"], "formula": "mean((bp-mean(bp))^3) / std(bp)^3"},
-        "AMBX_bp_skewness":  {"depends": ["amb_bp"], "formula": "mean((bp-mean(bp))^3) / std(bp)^3"},
-        "GREEN_bp_kurtosis": {"depends": ["g_mean_bp"], "formula": "mean((bp-mean(bp))^4) / std(bp)^4"},
-        "IRX_bp_kurtosis":   {"depends": ["ir_bp"], "formula": "mean((bp-mean(bp))^4) / std(bp)^4"},
-        "AMBX_bp_kurtosis":  {"depends": ["amb_bp"], "formula": "mean((bp-mean(bp))^4) / std(bp)^4"},
-
-        # == ACC ==
-        "ACC_MAG_MEAN":     {"depends": ["acc_mag"], "formula": "mean(acc_mag)"},
-        "ACC_MAG_STD":      {"depends": ["acc_mag"], "formula": "std(acc_mag)"},
-        "ACC_MAG_MAD":      {"depends": ["acc_mag"], "formula": "robust_mad(acc_mag)"},
-        "ACC_AXIS_STD_SUM": {"depends": ["acc"], "formula": "sum(std(acc, axis=0))"},
-        "ACC_GRAVITY_DOM_RATIO":{"depends": ["acc"], "formula": "max(|mean(acc_x)|,|mean(acc_y)|,|mean(acc_z)|)/(sum|mean|+1e-8)"},
-        "ACC_BP_RMS":       {"depends": ["acc_mag_bp"], "formula": "sqrt(mean(acc_mag_bp^2))"},
-        "ACC_DIFF_MAD":     {"depends": ["acc_mag"], "formula": "robust_mad(diff(acc_mag))"},
-        "ACC_STILL_SCORE":  {"depends": ["acc_mag"], "formula": "1.0/(1.0+50.0*std(acc_mag)/(|mean(acc_mag)|+1e-6))"},
-        "ACC_MAG_P50":      {"depends": ["acc_mag"], "formula": "percentile(acc_mag, 50)"},
-        "ACC_MAG_P90":      {"depends": ["acc_mag"], "formula": "percentile(acc_mag, 90)"},
-        "ACC_GREEN_BP_CORR":{"depends": ["acc_mag_bp", "g_mean_bp"], "formula": "|safe_corr(acc_mag_bp, g_mean_bp)|"},
-        "ACC_IR_BP_CORR":   {"depends": ["acc_mag_bp", "ir_bp"], "formula": "|safe_corr(acc_mag_bp, ir_bp)|"},
-        "ACC_ENERGY_TO_GREEN_AC":{"depends": ["acc_mag", "g_mean_bp"], "formula": "safe_div(sum(acc_mag^2), sqrt(mean(g_mean_bp^2)))"},
-        "ACC_TO_GTOP2_AC_RATIO":{"depends": ["acc_mag", "g_top2_bp"], "formula": "safe_div(robust_mad(diff(acc_mag)), sqrt(mean(g_top2_bp^2)))"},
-        "ACC_STILL_X_GREEN_STABILITY":{"depends": ["acc_mag", "g_top2_raw"], "formula": "(1/(1+std(acc_mag)+mad(diff(acc_mag)))) * (1/(1+GTOP2_SEG_ACDC_CV))"},
-        "ACC_DIFF_TO_GTOP2_DIFF_RATIO":{"depends": ["acc_mag", "g_top2_raw"], "formula": "safe_div(robust_mad(diff(acc_mag)), robust_mad(diff(g_top2_raw)))"},
-        "ACC_STILL_GREEN_MISMATCH":{"depends": ["acc_mag", "g_top2_bp"], "formula": "still_score(acc_mag) * safe_div(sqrt(mean(g_top2_bp^2)), robust_mad(diff(acc_mag)))"},
-        "ACC_SAT_FRAC":      {"depends": ["acc"], "formula": "mean(|acc| >= 0.98*max(|acc|))"},
-        "ACC_CLIP_RATE":     {"depends": ["acc"], "formula": "mean(|diff(acc)| < 1e-10)"},
-
-        # == ACC per-axis (Tier 1) ==
-        "ACC_X_MEAN":       {"depends": ["acc_x"], "formula": "mean(acc_x)"},
-        "ACC_Y_MEAN":       {"depends": ["acc_y"], "formula": "mean(acc_y)"},
-        "ACC_Z_MEAN":       {"depends": ["acc_z"], "formula": "mean(acc_z)"},
-        "ACC_X_STD":        {"depends": ["acc_x"], "formula": "std(acc_x)"},
-        "ACC_Y_STD":        {"depends": ["acc_y"], "formula": "std(acc_y)"},
-        "ACC_Z_STD":        {"depends": ["acc_z"], "formula": "std(acc_z)"},
-        "ACC_X_ENERGY":     {"depends": ["acc_x"], "formula": "sum(acc_x^2)"},
-        "ACC_Y_ENERGY":     {"depends": ["acc_y"], "formula": "sum(acc_y^2)"},
-        "ACC_Z_ENERGY":     {"depends": ["acc_z"], "formula": "sum(acc_z^2)"},
-        "ACC_AXIS_MEAN_SUM":{"depends": ["acc"], "formula": "sum(|mean(acc, axis=0)|)"},
-        "ACC_MAG_ENERGY":   {"depends": ["acc_mag"], "formula": "sum(acc_mag^2)"},
-        "ACC_MAG_P2P":      {"depends": ["acc_mag"], "formula": "max(acc_mag) - min(acc_mag)"},
-
-        # == ACC orientation (Tier 2) ==
-        "ACC_TILT_ANGLE":   {"depends": ["acc"], "formula": "grav=mean(acc,axis=0); deg(acos(|grav[2]|/norm(grav)))"},
-        "ACC_DOM_AXIS":     {"depends": ["acc"], "formula": "argmax(|mean(acc,axis=0)|)"},
-        "ACC_GRAVITY_RATIO":{"depends": ["acc_mag"], "formula": "norm(mean(acc,axis=0)) / (mean(acc_mag) + 1e-8)"},
-
-        # == ACC tremor (Tier 2) ==
-        "ACC_TREMOR_PEAK_FREQ":  {"depends": ["acc_mag"], "formula": "argmax(rfft(acc_mag*hamming) over 3-12Hz)"},
-        "ACC_TREMOR_PEAK_POWER": {"depends": ["acc_mag"], "formula": "max(rfft(acc_mag*hamming)^2 over 3-12Hz)"},
-        "ACC_TREMOR_POWER_RATIO":{"depends": ["acc_mag"], "formula": "sum(rfft^2 over 3-12Hz) / sum(rfft^2)"},
-        "ACC_LOW_MOTION_RATIO":  {"depends": ["acc_mag"], "formula": "sum(rfft^2 over 0.5-3Hz) / sum(rfft^2)"},
-    }
-
-    def _single_channel_feature_info(prefix, base):
-        raw = f"{prefix.lower()}_raw"
-        bp = f"{prefix.lower()}_bp"
-        dc = f"{prefix.lower()}_dc"
-        formulas = {
-            "DC_MEDIAN": {"depends": [raw], "formula": f"median({raw})"},
-            "DC_IQR": {"depends": [raw], "formula": f"robust_iqr({raw})"},
-            "AC_RMS": {"depends": [bp], "formula": f"sqrt(mean({bp}^2))"},
-            "AC_MAD": {"depends": [bp], "formula": f"robust_mad({bp})"},
-            "AC_DC_RATIO": {"depends": [bp, dc], "formula": f"safe_div(sqrt(mean({bp}^2)), |{dc}|)"},
-            "DERIV_MAD": {"depends": [bp], "formula": f"robust_mad(diff({bp}))"},
-            "FFT_PEAK_MEDIAN_RATIO": {"depends": [bp], "formula": f"fft_peak_features({bp}, fs, 0.5, 5.0)[0]"},
-            "DOM_FREQ": {"depends": [bp], "formula": f"fft_peak_features({bp}, fs, 0.5, 5.0)[1]"},
-            "AUTO_CORR_PEAK": {"depends": [bp], "formula": f"autocorr_peak_lag({bp}, fs, 40, 180)[0]"},
-            "AUTO_CORR_LAG_SEC": {"depends": [bp], "formula": f"autocorr_peak_lag({bp}, fs, 40, 180)[1]"},
+    recipes = {}
+    for name in selected_features:
+        info = dict(catalog_formulas[name])
+        info["intermediate_signals"] = {
+            "signal_source": info["signal_source"],
+            "preprocessing": info["preprocessing"],
         }
-        return formulas.get(base)
-
-    def _consensus_feature_info(base, stat):
-        values = [f"G1_{base}", f"G2_{base}", f"G3_{base}"]
-        arr = f"[{values[0]}, {values[1]}, {values[2]}]"
-        formulas = {
-            "min": f"min({arr})",
-            "max": f"max({arr})",
-            "range": f"max({arr}) - min({arr})",
-            "cv": f"std({arr}) / (mean(abs({arr})) + 1e-12)",
-            "top2_mean": f"mean(largest_two({arr}))",
-        }
-        if stat not in formulas:
-            return None
-        return {
-            "depends": values,
-            "formula": formulas[stat],
-        }
-
-    def _infer_feature_info(name):
-        for prefix in ("G1", "G2", "G3", "GTOP2"):
-            marker = f"{prefix}_"
-            if name.startswith(marker):
-                inferred = _single_channel_feature_info(prefix, name[len(marker):])
-                if inferred is not None:
-                    return inferred
-
-        if name.startswith("G_consensus_"):
-            suffix = name[len("G_consensus_"):]
-            for stat in ("top2_mean", "range", "min", "max", "cv"):
-                stat_suffix = f"_{stat}"
-                if suffix.endswith(stat_suffix):
-                    base = suffix[:-len(stat_suffix)]
-                    return _consensus_feature_info(base, stat)
-
-        fixed = {
-            "G_TOP2_CHANNEL_COUNT": {
-                "depends": ["g1_bp", "g2_bp", "g3_bp"],
-                "formula": "count(two green channels with highest AC RMS)",
-            },
-            "G_TOP2_WORST_IDX": {
-                "depends": ["g1_bp", "g2_bp", "g3_bp"],
-                "formula": "argmin([sqrt(mean(g1_bp^2)), sqrt(mean(g2_bp^2)), sqrt(mean(g3_bp^2))])",
-            },
-            "G_DROPOUT_COUNT": {
-                "depends": ["g1_bp", "g2_bp", "g3_bp"],
-                "formula": "count(channel_ac_rms < 0.05 * max(channel_ac_rms))",
-            },
-            "G_MIN_CHANNEL_ID": {
-                "depends": ["g1_bp", "g2_bp", "g3_bp"],
-                "formula": "argmin(channel_ac_rms)",
-            },
-            "G_DROPOUT_ANGLE": {
-                "depends": ["g1_bp", "g2_bp", "g3_bp"],
-                "formula": "degrees(atan2((sqrt(3)/2)*(ac2-ac3), ac1-0.5*ac2-0.5*ac3))",
-            },
-            "G_2OF3_AC_SUPPORT": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "count(raw_centered_ac_rms >= 0.5 * max(raw_centered_ac_rms)) / 3",
-            },
-            "G_TOP2_TO_ALL_AC_RATIO": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "sum(largest_two(raw_centered_ac_rms)) / (sum(raw_centered_ac_rms) + 1e-12)",
-            },
-            "G_TOP2_CORR_MIN": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw", "g1_bp", "g2_bp", "g3_bp"],
-                "formula": "corrcoef(bandpass signals for two channels with highest raw centered AC RMS)",
-            },
-            "G_WEAK_CHANNEL_GAP": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "(mean(largest_two(raw_centered_ac_rms)) - min(raw_centered_ac_rms)) / (mean(largest_two(raw_centered_ac_rms)) + 1e-12)",
-            },
-            "G_SPATIAL_STABILITY_SCORE": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw", "g1_bp", "g2_bp", "g3_bp"],
-                "formula": "G_2OF3_AC_SUPPORT * max(0, G_TOP2_CORR_MIN) / (1 + mean(spatial_vmag))",
-            },
-            "G_TOP1_TO_TOP2_AC_RATIO": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "max(raw_centered_ac_rms) / (mean(largest_two(raw_centered_ac_rms)) + 1e-12)",
-            },
-            "G_TOP2_RANK_STABILITY": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "1 - fraction of three temporal segments whose top-2 green channels differ from global top-2",
-            },
-            "G_TOP2_SWITCH_RATE": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "fraction of three temporal segments whose top-2 green channels differ from global top-2",
-            },
-            "G_SPATIAL_VMAG_RANGE": {
-                "depends": ["g1_raw", "g2_raw", "g3_raw"],
-                "formula": "P90(spatial_vmag) - P10(spatial_vmag)",
-            },
-            "GREEN_SAT_FRAC": {
-                "depends": ["g_mean_raw"],
-                "formula": "mean(g_mean_raw >= 0.98 * max(g_mean_raw))",
-            },
-            "GREEN_CLIP_RATE": {
-                "depends": ["g_mean_raw"],
-                "formula": "mean(abs(diff(g_mean_raw)) < 1e-10)",
-            },
-            "IR_SAT_FRAC": {
-                "depends": ["ir_raw"],
-                "formula": "mean(ir_raw >= 0.98 * max(ir_raw))",
-            },
-            "IR_CLIP_RATE": {
-                "depends": ["ir_raw"],
-                "formula": "mean(abs(diff(ir_raw)) < 1e-10)",
-            },
-            "TOTAL_INVALID_COUNT": {
-                "depends": [],
-                "formula": "count(all feature values that are None/NaN/inf before s03 zero-fill)",
-            },
-            "PPG_INVALID_COUNT": {
-                "depends": [],
-                "formula": "count(PPG-related feature values that are None/NaN/inf before s03 zero-fill)",
-            },
-            "GREEN_INVALID_COUNT": {
-                "depends": [],
-                "formula": "count(green-related feature values that are None/NaN/inf before s03 zero-fill)",
-            },
-            "GTOP2_ROBUST_RANGE_RATIO": {
-                "depends": ["g_top2_raw"],
-                "formula": "(P95(g_top2_raw) - P5(g_top2_raw)) / (|median(g_top2_raw)| + 1e-8)",
-            },
-            "GTOP2_SEG_ACDC_CV": {
-                "depends": ["g_top2_raw"],
-                "formula": "CV of AC/DC ratios over three 1s segments of g_top2_raw",
-            },
-            "GTOP2_HALF_ACDC_DELTA": {
-                "depends": ["g_top2_raw"],
-                "formula": "absolute difference between first-half and second-half segment AC/DC means",
-            },
-            "GTOP2_SEG_ACDC_RANGE": {
-                "depends": ["g_top2_raw"],
-                "formula": "max(segment AC/DC) - min(segment AC/DC) over three segments",
-            },
-            "GTOP2_BAND_ENERGY_RATIO": {
-                "depends": ["g_top2_bp"],
-                "formula": "sum(FFT(g_top2_bp)^2 0.7-3Hz) / sum(FFT(g_top2_bp)^2 0.5-5Hz)",
-            },
-            "GTOP2_bp_skewness": {
-                "depends": ["g_top2_bp"],
-                "formula": "mean(zscore(g_top2_bp)^3)",
-            },
-            "GTOP2_bp_kurtosis": {
-                "depends": ["g_top2_bp"],
-                "formula": "mean(zscore(g_top2_bp)^4)",
-            },
-            "GTOP2_zero_cross_rate": {
-                "depends": ["g_top2_bp"],
-                "formula": "fraction of adjacent centered g_top2_bp samples crossing zero",
-            },
-            "GTOP2_abs_diff_ratio": {
-                "depends": ["g_top2_bp"],
-                "formula": "robust_mad(diff(g_top2_bp)) / (mean(abs(g_top2_bp)) + 1e-12)",
-            },
-            "GTOP2_Hjorth_Activity": {
-                "depends": ["g_top2_bp"],
-                "formula": "var(g_top2_bp)",
-            },
-            "GTOP2_Hjorth_Mobility": {
-                "depends": ["g_top2_bp"],
-                "formula": "sqrt(var(diff(g_top2_bp)) / var(g_top2_bp))",
-            },
-            "GTOP2_Hjorth_Complexity": {
-                "depends": ["g_top2_bp"],
-                "formula": "sqrt(var(diff2(g_top2_bp)) / var(diff(g_top2_bp)))",
-            },
-            "GTOP2_Deriv_d1_mean": {"depends": ["g_top2_bp"], "formula": "mean(diff(g_top2_bp))"},
-            "GTOP2_Deriv_d1_std": {"depends": ["g_top2_bp"], "formula": "std(diff(g_top2_bp))"},
-            "GTOP2_Deriv_d1_max": {"depends": ["g_top2_bp"], "formula": "max(diff(g_top2_bp))"},
-            "GTOP2_Deriv_d1_min": {"depends": ["g_top2_bp"], "formula": "min(diff(g_top2_bp))"},
-            "GTOP2_Deriv_d1_zcr": {
-                "depends": ["g_top2_bp"],
-                "formula": "sum(abs(diff(sign(diff(g_top2_bp))))) / (2 * len(diff(g_top2_bp)))",
-            },
-            "GTOP2_Temporal_slope_mean": {
-                "depends": ["g_top2_bp"],
-                "formula": "linear_regression(g_top2_bp ~ arange(N)): slope",
-            },
-            "GTOP2_Temporal_slope_std": {
-                "depends": ["g_top2_bp"],
-                "formula": "std(residuals after linear detrend of g_top2_bp)",
-            },
-            "GTOP2_Temporal_peak_prominence": {
-                "depends": ["g_top2_bp"],
-                "formula": "legacy research peak feature excluded from deployment-friendly Stage2 pool",
-            },
-            "GTOP2_Temporal_peak_ratio": {
-                "depends": ["g_top2_bp"],
-                "formula": "len(peaks in g_top2_bp) / len(g_top2_bp)",
-            },
-            "GTOP2_Temporal_valley_ratio": {
-                "depends": ["g_top2_bp"],
-                "formula": "len(peaks in -g_top2_bp) / len(g_top2_bp)",
-            },
-        }
-        return fixed.get(name)
-
-    # ---- 为每个入选特征组装完整配方 ----
-    recipe = {}
-    for f in selected_features:
-        info = FEATURE_FULL.get(f) or _infer_feature_info(f)
-        if info is None:
-            recipe[f] = {"formula": "[未匹配]"}
-            continue
-
-        # 展开依赖的中间信号
-        deps_expanded = {}
-        for dep in info["depends"]:
-            if dep in PREPROCESS_OUTPUT:
-                deps_expanded[dep] = f"preprocess_signal({dep.split('_')[0]}) → {PREPROCESS_OUTPUT.get(dep, dep)}"
-            elif dep in COMPOSITE:
-                deps_expanded[dep] = COMPOSITE[dep]
-            elif dep.endswith("_raw") or dep.endswith("_bp") or dep.endswith("_dc"):
-                ch = dep.replace("_raw", "").replace("_bp", "").replace("_dc", "")
-                signal_type = "raw" if "_raw" in dep else ("bp" if "_bp" in dep else "dc")
-                deps_expanded[dep] = f"preprocess_signal({ch}) → {signal_type}"
-            elif dep in CHANNEL_EXTRACT:
-                deps_expanded[dep] = CHANNEL_EXTRACT[dep]
-            elif dep in ("acc_mag", "acc_mag_bp"):
-                deps_expanded[dep] = COMPOSITE.get(dep, dep)
-            else:
-                deps_expanded[dep] = "(computed on the fly)"
-
-        recipe[f] = {
-            "formula": info["formula"],
-            "intermediate_signals": deps_expanded,
-        }
-
-    for f in selected_features:
-        if str(recipe.get(f, {}).get("formula", "")).startswith("[") and f in EXTRA_FEATURE_FORMULAS:
-            recipe[f] = EXTRA_FEATURE_FORMULAS[f]
-
-    return recipe, CHANNEL_EXTRACT, MODE_DETECT, PREPROCESS_STEPS, PREPROCESS_OUTPUT, COMPOSITE, UTILS
+        recipes[name] = info
+    return (
+        recipes,
+        channel_extract,
+        mode_detect,
+        preprocess_steps,
+        preprocess_output,
+        composite,
+        utils,
+    )
 
 
 def export_deploy_cookbook(artifact_dir):
@@ -2013,7 +1350,7 @@ def export_deploy_cookbook(artifact_dir):
             },
             "operator_notes": (
                 "Stage2 uses scalar statistics, ratio/MAD/IQR features, simple correlations, "
-                "and a fixed green-top2 FFT source for deployment-friendly implementation."
+                "and explicitly cataloged reusable FFT sources for deployment-friendly implementation."
             ),
         },
 
@@ -2024,7 +1361,7 @@ def export_deploy_cookbook(artifact_dir):
             "channels": ch_extract,
         },
         "A_preprocessing": {
-            "_note": "对 ir/ambient/g1/g2/g3 各执行以下管线，产出 *_raw_clean, *_bp, *_dc",
+            "_note": "对 ambient/g1/g2/g3 执行以下管线，产出 contact_raw、pulse 和 dc；IR 仅供 Stage1",
             "pipeline": [{"step": i+1, "name": name, "formula": formula} for i, (name, formula) in enumerate(preproc_steps)],
             "outputs": preproc_out,
         },
@@ -2041,7 +1378,7 @@ def export_deploy_cookbook(artifact_dir):
         "B_selected_features": {
             "_note": f"共 {len(selected)} 个特征，按此顺序组成 XGBoost 输入向量 feature_vec[0..{len(selected)-1}]",
             "feature_order": selected,
-            "recipes": {f: recipe.get(f, {"formula": "[未匹配]"}) for f in selected},
+            "recipes": {f: recipe[f] for f in selected},
         },
 
         # ---- Section C: XGBoost 推理 ----
@@ -2091,7 +1428,7 @@ def export_deploy_cookbook(artifact_dir):
                 "IF state==0 and count(score>T_on) >= K_on and cooldown_expired: state=1, reset counter",
                 "IF state==1 and count(score<T_off) >= K_off and cooldown_expired: state=0, reset counter",
                 "output_state[t] = stage1_gate[t] AND state[t]  // gate never pauses or resets Stage2",
-                "quality[t] from Ambient_std / G_mean_mean thresholds (from bundle)",
+                "quality[t] from the feature-specific train thresholds stored in bundle['quality_thresholds']",
             ],
             "quality_thresholds": bundle.get("quality_thresholds", {}),
         },
@@ -2142,7 +1479,7 @@ def export_deploy_cookbook(artifact_dir):
         "operator_reuse_plan": {
             "shared_preprocessing": [
                 "one preprocessing pass per raw channel",
-                "reuse g_top2_raw/g_top2_bp for green reliability, FFT, and ACC coupling features",
+                "reuse g_top2_raw/g_top2_pulse for green reliability, FFT, and ACC coupling features",
                 "reuse one FFT result per source listed in feature_cost_summary.fft_sources",
             ],
             "fft_sources": feature_cost_summary.get("fft_sources", []),
@@ -2671,14 +2008,6 @@ def main():
                    help="maximum s07 postprocess candidates to evaluate; <=0 keeps full grid")
     p.add_argument("--postprocess_warmup_frames", type=int, default=5,
                    help="s07 window-level metrics skip this many leading state-machine windows per sample")
-    p.add_argument("--commercial_compare", action=argparse.BooleanOptionalAction, default=False,
-                   help="run optional s09 commercial-vs-project comparison")
-    p.add_argument("--commercial_split", default="test", choices=["train", "valid", "test"],
-                   help="split used by s09 commercial comparison")
-    p.add_argument("--commercial_fp_cost", type=float, default=4.0,
-                   help="s09 commercial comparison FP cost")
-    p.add_argument("--keep_window_probs", action="store_true",
-                   help="keep per-window probabilities in s09 commercial comparison details")
     p.add_argument("--run_generalization_audit", action=argparse.BooleanOptionalAction, default=False,
                    help="run optional generalization audit after s06_eval")
     p.add_argument("--audit_min_support", type=int, default=10,
@@ -2782,19 +2111,18 @@ def main():
         ("s06_feat",  "导出特征提取脚本"),
         ("s06_plot",  "画错误样本图"),
         ("s06_cb",    "导出部署配方"),
-        ("s09_cmp",   "商业窗口级对比"),
     ]
 
     skip_set = {s.strip() for s in args.skip.split(",") if s.strip()}
     if "s10_audit" in skip_set:
         skip_set.add("s06_audit")
     raw_stop_after = args.stop_after
-    stop_after = "s09_cmp" if raw_stop_after == "commercial_compare" else raw_stop_after
+    stop_after = raw_stop_after
     if stop_after == "s10_audit":
         stop_after = "s06_audit"
     step_keys = [key for key, _ in all_steps]
     if stop_after not in step_keys:
-        print(f"[ERROR] unknown --stop_after={raw_stop_after!r}; choose one of: {','.join(step_keys + ['commercial_compare'])}")
+        print(f"[ERROR] unknown --stop_after={raw_stop_after!r}; choose one of: {','.join(step_keys)}")
         sys.exit(2)
 
     manual_feature_file = args.manual_feature_file or os.path.join(
@@ -2825,9 +2153,6 @@ def main():
         if "s07_post" not in skip_set and not args.optimize_postprocess:
             args.optimize_postprocess = True
             auto_enabled.append("--optimize_postprocess")
-    if stop_after == "s09_cmp" and "s09_cmp" not in skip_set and not args.commercial_compare:
-        args.commercial_compare = True
-        auto_enabled.append("--commercial_compare")
     if stop_after == "s06_audit" and "s06_audit" not in skip_set and not args.run_generalization_audit:
         args.run_generalization_audit = True
         auto_enabled.append("--run_generalization_audit")
@@ -3094,12 +2419,6 @@ def main():
     elif "s06_xpt" not in skip_set:
         print("(s06_xpt: --no-export_deploy 跳过)")
 
-    # s09_cmp
-    if "s09_cmp" not in skip_set and args.commercial_compare:
-        commands["s09_cmp"] = "__commercial_compare__"
-    elif "s09_cmp" not in skip_set:
-        print("(商业窗口级对比: --no-commercial_compare skipped; outputs window_level_compare.csv and accuracy_scope_compare.csv when enabled)")
-
     # s06_plot (纯 Python 调用，非子进程，默认自动生成)
     if "s06_plot" not in skip_set:
         commands["s06_plot"] = "__plot__"
@@ -3154,7 +2473,7 @@ def main():
             continue  # optional step not requested
 
         special_cmd = (
-            cmd in {"__plot__", "__extractor__", "__cookbook__", "__commercial_compare__",
+            cmd in {"__plot__", "__extractor__", "__cookbook__",
                     "__s05_viz__", "__s06_tree_viz__"}
             or str(cmd).startswith("__feature_embedding_report__")
             or str(cmd).startswith("__generalization_audit__")
@@ -3206,19 +2525,6 @@ def main():
                 export_stage2_feature_contracts(args.artifact_dir)
                 export_golden_vectors(args.artifact_dir)
                 validate_deploy_artifact_consistency(args.artifact_dir)
-            dt = time.time() - t0
-            _record_runtime(runtime_events, display_name, dt, dry_run=False)
-            completed_keys.add(key)
-            print(f"[OK] {display_name}  [{timedelta(seconds=int(dt))}]")
-            if key == stop_after:
-                stopped_at = key
-                print(f"\n[STOP] 已达到 --stop_after={stop_after}，停止")
-                break
-            continue
-
-        if cmd == "__commercial_compare__":
-            t0 = time.time()
-            run_embedded_commercial_compare(args)
             dt = time.time() - t0
             _record_runtime(runtime_events, display_name, dt, dry_run=False)
             completed_keys.add(key)

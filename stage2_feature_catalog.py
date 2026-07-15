@@ -6,7 +6,7 @@ from collections import OrderedDict
 from typing import Iterable, Mapping
 
 
-FEATURE_POOL_VERSION = "stage2_interpretable_v5"
+FEATURE_POOL_VERSION = "stage2_interpretable_v7"
 
 COMMERCIAL_8_FEATURE_MAPPING = OrderedDict([
     ("GREEN_CORR", "GREEN_CORR"),
@@ -319,11 +319,11 @@ for _name, _formula, _bounded in [
     ("G_bp_corr_min", "minimum pairwise green pulse correlation", [-1.0, 1.0]),
     ("G_bp_corr_std", "std(pairwise green pulse correlations)", [0.0, 1.0]),
     ("G_2OF3_AC_SUPPORT", "count(channel_ac >= 0.5*max_ac)/3", [0.0, 1.0]),
-    ("G_TOP2_TO_ALL_AC_RATIO", "sum(largest_two_ac)/guarded_sum(all_ac)", [0.0, 1.0]),
-    ("G_TOP2_CORR_MIN", "correlation between the two highest-AC green pulse channels", [-1.0, 1.0]),
-    ("G_WEAK_CHANNEL_GAP", "(mean(top2_ac)-min_ac)/guarded_mean(top2_ac)", [0.0, 1.0]),
-    ("G_TOP1_TO_TOP2_AC_RATIO", "max_ac/guarded_mean(top2_ac)", [1.0, 2.0]),
-    ("G_TOP2_RANK_STABILITY", "1-fraction(segments whose top2 set differs from global top2)", [0.0, 1.0]),
+    ("G_TOP2_TO_ALL_AC_RATIO", "max_pair_ac_sum/guarded_sum(all_ac), averaging equally optimal pair views on ties", [0.0, 1.0]),
+    ("G_TOP2_CORR_MIN", "median pair correlation over all equally maximal two-zone AC pairs", [-1.0, 1.0]),
+    ("G_WEAK_CHANNEL_GAP", "(max_pair_ac_mean-min_ac)/guarded_max_pair_ac_mean", [0.0, 1.0]),
+    ("G_TOP1_TO_TOP2_AC_RATIO", "max_ac/guarded_max_pair_ac_mean", [1.0, 2.0]),
+    ("G_TOP2_RANK_STABILITY", "1-fraction(segments whose maximal-pair set differs from the global maximal-pair set)", [0.0, 1.0]),
 ]:
     _add(
         _name,
@@ -356,6 +356,143 @@ _add(
     bounded_range=[0.0, 0.4],
     deployment_cost=1.8,
 )
+
+for _name, _group, _source, _formula, _ops_list, _unit, _bounded, _cost, _risks in [
+    (
+        "GMEDIAN_AC_DC_RATIO", "green_contact", "green_median",
+        "RMS(pointwise_median(zone_pulse))/guarded_abs(median(pointwise_median(zone_raw)))",
+        _ops("median3", "median", "sum_squares", "sqrt", "safe_ratio"),
+        "ratio", None, 1.2, (),
+    ),
+    (
+        "GMEDIAN_CORR", "pulse_shape", "green_median",
+        "corr(pointwise_median(zone_pulse), moving_average(pointwise_median(zone_pulse), 0.15s))",
+        _ops("median3", "moving_average", "correlation"),
+        "correlation", [-1.0, 1.0], 1.2, (),
+    ),
+    (
+        "GMEDIAN_AUTO_CORR_PEAK", "frequency", "green_median",
+        "maximum normalized autocorrelation of pointwise median pulse over 40-180 bpm lags",
+        _ops("median3", "autocorrelation", "argmax"),
+        "correlation", [-1.0, 1.0], 1.5, (),
+    ),
+    (
+        "GMEDIAN_FFT_PEAK_MEDIAN_RATIO", "frequency", "green_median",
+        "max(in-band median-pulse spectrum)/median(in-band median-pulse spectrum)",
+        _ops("median3", "hamming", "rfft", "median", "safe_ratio"),
+        "ratio", None, 2.8, (),
+    ),
+    (
+        "GTOP2_CORR", "pulse_shape", "green_top2",
+        "corr(tie-aware maximal-pair composite pulse, moving_average(composite, 0.15s))",
+        _ops("moving_average", "correlation"),
+        "correlation", [-1.0, 1.0], 1.0, (),
+    ),
+    (
+        "G_TOP2_ALL_CORR", "green_spatial", "green_3zone",
+        "corr(tie-aware maximal-pair composite pulse, mean(zone_pulse))",
+        _ops("sort3", "mean", "correlation"),
+        "correlation", [-1.0, 1.0], 1.2, (),
+    ),
+    (
+        "G_WEAK_TO_TOP2_CORR", "green_spatial", "green_3zone",
+        "median corr(lowest-AC tied zones, tie-aware maximal-pair composite pulse)",
+        _ops("sort3", "correlation"),
+        "correlation", [-1.0, 1.0], 1.2, (),
+    ),
+    (
+        "G_ZONE_DOM_FREQ_MAD_HZ", "green_spatial", "green_3zone",
+        "mean absolute deviation of valid periodic zone dominant frequencies from their median over 0.5-5Hz",
+        _ops("three_channel_loop", "hamming", "rfft", "argmax", "median", "absolute", "mean"),
+        "Hz", [0.0, 4.5], 2.9, ("short_window_frequency", "frequency_validity_gate"),
+    ),
+    (
+        "G_ZONE_HR_SUPPORT_RATIO", "green_spatial", "green_3zone",
+        "fraction of all three zones with valid periodic evidence and dominant frequency within 0.20Hz of the valid-zone median",
+        _ops("three_channel_loop", "hamming", "rfft", "argmax", "median", "absolute", "count"),
+        "ratio", [0.0, 1.0], 2.9, ("short_window_frequency", "frequency_validity_gate"),
+    ),
+    (
+        "G_PAIR_PERIODICITY_MAX", "green_spatial", "green_3zone_pairs",
+        "maximum autocorrelation peak across all three pair-mean pulses",
+        _ops("three_pair_loop", "autocorrelation", "argmax", "max"),
+        "correlation", [-1.0, 1.0], 2.0, (),
+    ),
+    (
+        "G_PAIR_PERIODICITY_MEDIAN", "green_spatial", "green_3zone_pairs",
+        "median autocorrelation peak across all three pair-mean pulses",
+        _ops("three_pair_loop", "autocorrelation", "argmax", "median"),
+        "correlation", [-1.0, 1.0], 2.0, (),
+    ),
+    (
+        "G_PAIR_FREQ_GAP_MIN_HZ", "green_spatial", "green_3zone_pairs",
+        "minimum absolute dominant-frequency gap across pairs whose two zones both pass the periodic-evidence gate; zero if no valid pair",
+        _ops("three_channel_loop", "hamming", "rfft", "argmax", "three_pair_loop", "difference", "absolute", "min"),
+        "Hz", [0.0, 4.5], 2.9, ("short_window_frequency", "frequency_validity_gate"),
+    ),
+    (
+        "G_PAIR_FREQ_GAP_MEDIAN_HZ", "green_spatial", "green_3zone_pairs",
+        "median absolute dominant-frequency gap across pairs whose two zones both pass the periodic-evidence gate; zero if no valid pair",
+        _ops("three_channel_loop", "hamming", "rfft", "argmax", "three_pair_loop", "difference", "absolute", "median"),
+        "Hz", [0.0, 4.5], 2.9, ("short_window_frequency", "frequency_validity_gate"),
+    ),
+    (
+        "G_PAIR_ACDC_MEDIAN", "green_spatial", "green_3zone_pairs",
+        "median AC/DC across all three pair-mean signals",
+        _ops("three_pair_loop", "median", "sum_squares", "sqrt", "safe_ratio"),
+        "ratio", None, 1.4, (),
+    ),
+    (
+        "G_PAIR_AMB_ABS_CORR_MIN", "ambient_cross", "green_3zone_pairs+ambient",
+        "minimum abs corr(pair-mean pulse, ambient pulse) across all three pairs",
+        _ops("three_pair_loop", "correlation", "absolute", "min"),
+        "correlation", [0.0, 1.0], 1.4, (),
+    ),
+    (
+        "G_PAIR_AMB_ABS_CORR_MEDIAN", "ambient_cross", "green_3zone_pairs+ambient",
+        "median abs corr(pair-mean pulse, ambient pulse) across all three pairs",
+        _ops("three_pair_loop", "correlation", "absolute", "median"),
+        "correlation", [0.0, 1.0], 1.4, (),
+    ),
+    (
+        "G_AMB_RESIDUAL_2OF3_PERIODICITY", "ambient_cross", "green_3zone+ambient",
+        "median zone autocorrelation peak after guarded ambient linear projection removal",
+        _ops("three_channel_loop", "covariance", "variance", "safe_ratio", "autocorrelation", "median"),
+        "correlation", [-1.0, 1.0], 2.0, (),
+    ),
+    (
+        "G_AMB_RESIDUAL_PAIR_CORR_MAX", "ambient_cross", "green_3zone+ambient",
+        "maximum pairwise zone correlation after guarded ambient linear projection removal",
+        _ops("three_pair_loop", "covariance", "variance", "safe_ratio", "correlation", "max"),
+        "correlation", [-1.0, 1.0], 1.8, (),
+    ),
+    (
+        "G_ZONE_PHASE_CONCENTRATION", "frequency", "green_3zone",
+        "magnitude of mean unit phasor across valid periodic zones at their median dominant frequency; requires at least two valid zones",
+        _ops("three_channel_loop", "hamming", "rfft", "complex_phase", "mean", "absolute"),
+        "concentration", [0.0, 1.0], 3.2, ("experimental_high_cost", "short_window_phase", "frequency_validity_gate"),
+    ),
+    (
+        "G_PAIR_SPECTRAL_CONSENSUS", "frequency", "green_3zone_pairs",
+        "median pairwise cosine similarity of zone power spectra over 0.5-5Hz for pairs whose two zones pass the periodic-evidence gate; zero if no valid pair",
+        _ops("three_pair_loop", "hamming", "rfft", "sum_squares", "cosine_similarity", "median"),
+        "similarity", [0.0, 1.0], 3.2, ("experimental_high_cost", "short_window_spectrum", "frequency_validity_gate"),
+    ),
+]:
+    _add(
+        _name,
+        group=_group,
+        preprocessing="cross_signal" if "AMB" in _name else "pulse_detrended",
+        formula=_formula,
+        c_operators=_ops_list,
+        unit=_unit,
+        signal_source=_source,
+        fft="rfft" in _ops_list,
+        bounded_range=_bounded,
+        accumulator="float64",
+        deployment_cost=_cost,
+        risk_flags=_risks,
+    )
 
 for _name, _formula, _preprocessing in [
     ("corr_Ambient_Gmean", "corr(ambient_raw, green_raw)", "contact_raw"),

@@ -5,10 +5,12 @@ from pathlib import Path
 
 import joblib
 import numpy as np
+import pytest
 
 import s03_extract_feature_pool as s03
 import s04_feature_selection as s04
 import s08_run_pipeline as s08
+import stage2_feature_catalog as catalog
 
 
 ROOT = Path(__file__).resolve().parent
@@ -42,15 +44,53 @@ def test_deployment_feature_filter_removes_complex_operators():
     assert "ACC_PPG_coherence_mean" not in filtered
 
 
-def test_deployment_feature_cost_summary_counts_green_top2_fft_only():
+def test_deployment_feature_cost_summary_counts_reused_fft_sources():
     summary = s04.summarize_deployment_feature_costs(
-        ["GREEN_AC_RMS", "GTOP2_BAND_ENERGY_RATIO", "AMB_BAND_ENERGY_RATIO"]
+        [
+            "GREEN_AC_RMS",
+            "GTOP2_BAND_ENERGY_RATIO",
+            "AMB_BAND_ENERGY_RATIO",
+            "GMEDIAN_FFT_PEAK_MEDIAN_RATIO",
+            "G_ZONE_PHASE_CONCENTRATION",
+        ]
     )
 
     assert summary["feature_set"] == "deployment_friendly"
-    assert summary["fft_source_count"] == 2
-    assert summary["fft_sources"] == ["green_top2", "ambient"]
+    assert summary["fft_source_count"] == 4
+    assert summary["fft_sources"] == [
+        "green_top2", "ambient", "green_median", "green_zones"
+    ]
     assert summary["forbidden_selected"] == []  # AMB_BAND_ENERGY_RATIO now allowed
+
+
+def test_subset_evaluation_uses_each_feature_catalog_cost(monkeypatch):
+    class FakeClassifier:
+        def fit(self, _x, _y, verbose=False):
+            return self
+
+        def predict_proba(self, x):
+            probability = np.linspace(0.2, 0.8, len(x))
+            return np.column_stack([1.0 - probability, probability])
+
+    monkeypatch.setattr(s04.xgb, "XGBClassifier", lambda **_kwargs: FakeClassifier())
+    features = ["G_TOP2_CORR_MIN", "G_ZONE_HR_SUPPORT_RATIO"]
+    train = __import__("pandas").DataFrame({
+        "target": [0, 1, 0, 1],
+        features[0]: [0.1, 0.9, 0.2, 0.8],
+        features[1]: [0.0, 1.0, 0.2, 0.8],
+    })
+    valid = train.copy()
+
+    result = s04.evaluate_feature_subsets(
+        train,
+        valid,
+        {"cost_contract": {"features": features, "description": "test"}},
+    )
+
+    expected = np.mean([
+        catalog.feature_record(name)["deployment_cost"] for name in features
+    ])
+    assert result.iloc[0]["deployment_cost_mean"] == pytest.approx(expected)
 
 
 def test_s03_and_s04_deployment_fft_allow_lists_match():
@@ -94,8 +134,8 @@ def test_s04_deployment_policy_delegates_to_s03_source_of_truth():
     for name in features:
         assert s04.is_deployment_allowed_feature(name) == s03.is_deployment_friendly_stage2_feature(name)
 
-    # The commercial eight-feature baseline remains isolated in s09 and is not
-    # silently aliased into the governed Stage2 model surface.
+    # The retained commercial feature-name mapping is not silently aliased into
+    # the governed Stage2 deployment surface.
     assert s04.filter_features_for_deployment(s03.COMMERCIAL_8_FEATURE_NAMES) == [
         "GREEN_CORR"
     ]

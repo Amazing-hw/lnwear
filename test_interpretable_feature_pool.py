@@ -35,7 +35,7 @@ def test_catalog_exactly_matches_generated_window_candidates():
     expected = catalog.model_candidate_names()
 
     assert s03.STAGE2_FEATURE_POOL_VERSION == catalog.FEATURE_POOL_VERSION
-    assert len(expected) == 91
+    assert len(expected) == 111
     assert "mode" in expected
     assert list(features) == expected
     assert all(np.isfinite(value) for value in features.values())
@@ -55,7 +55,7 @@ def test_three_zone_expansion_is_governed_and_complete():
         "G_ZONE_LAG_RMS_SEC",
     }
 
-    assert len(catalog.model_candidate_names()) == 91
+    assert len(catalog.model_candidate_names()) == 111
     assert expected_new <= set(catalog.model_candidate_names())
     for name in expected_new:
         record = catalog.feature_record(name)
@@ -65,6 +65,224 @@ def test_three_zone_expansion_is_governed_and_complete():
     assert "partial_sort" in catalog.feature_record("ACC_JERK_TAIL_MEAN_REL")["c_operators"]
     assert "bounded_lag_loop" in catalog.feature_record("ACC_GREEN_MAX_LAG_CORR")["c_operators"]
     assert "cosine_similarity" in catalog.feature_record("ACC_GREEN_PSD_SIMILARITY")["c_operators"]
+
+
+def test_three_zone_robust_expansion_is_governed():
+    import stage2_feature_catalog as catalog
+
+    expected = {
+        "GMEDIAN_AC_DC_RATIO",
+        "GMEDIAN_CORR",
+        "GMEDIAN_AUTO_CORR_PEAK",
+        "GMEDIAN_FFT_PEAK_MEDIAN_RATIO",
+        "GTOP2_CORR",
+        "G_TOP2_ALL_CORR",
+        "G_WEAK_TO_TOP2_CORR",
+        "G_ZONE_DOM_FREQ_MAD_HZ",
+        "G_ZONE_HR_SUPPORT_RATIO",
+        "G_PAIR_PERIODICITY_MAX",
+        "G_PAIR_PERIODICITY_MEDIAN",
+        "G_PAIR_FREQ_GAP_MIN_HZ",
+        "G_PAIR_FREQ_GAP_MEDIAN_HZ",
+        "G_PAIR_ACDC_MEDIAN",
+        "G_PAIR_AMB_ABS_CORR_MIN",
+        "G_PAIR_AMB_ABS_CORR_MEDIAN",
+        "G_AMB_RESIDUAL_2OF3_PERIODICITY",
+        "G_AMB_RESIDUAL_PAIR_CORR_MAX",
+        "G_ZONE_PHASE_CONCENTRATION",
+        "G_PAIR_SPECTRAL_CONSENSUS",
+    }
+
+    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v7"
+    assert len(catalog.model_candidate_names()) == 111
+    assert expected <= set(catalog.model_candidate_names())
+    for name in expected:
+        record = catalog.feature_record(name)
+        assert record["formula"]
+        assert record["c_operators"]
+        assert record["deployment_cost"] > 0.0
+    for name in {"G_ZONE_PHASE_CONCENTRATION", "G_PAIR_SPECTRAL_CONSENSUS"}:
+        assert "experimental_high_cost" in catalog.feature_record(name)["risk_flags"]
+
+
+def test_three_zone_guarded_helpers_remove_ambient_and_reuse_fft_phase():
+    fs = 25.0
+    t = np.arange(125, dtype=float) / fs
+    pulse = np.sin(2.0 * np.pi * 1.2 * t)
+    ambient = 0.8 * np.sin(2.0 * np.pi * 0.35 * t + 0.2)
+    contaminated = pulse + 2.5 * ambient
+
+    residual = s03._ambient_projection_residual(contaminated, ambient)
+    assert np.isfinite(residual).all()
+    assert abs(s03.guarded_corr(residual, ambient)) < abs(
+        s03.guarded_corr(contaminated, ambient)
+    )
+    assert s03.guarded_corr(residual, pulse) > 0.95
+
+    caches = [
+        s03.compute_fft_cache(np.sin(2.0 * np.pi * 1.2 * t + phase), fs)
+        for phase in (0.0, 0.04, -0.03)
+    ]
+    assert s03._phase_concentration(caches, 1.2) > 0.99
+    assert s03._spectral_power_cosine_from_cache(caches[0], caches[1]) > 0.99
+
+    flat_cache = s03.compute_fft_cache(np.zeros_like(t), fs)
+    assert s03._phase_concentration([flat_cache] * 3, 1.2) == 0.0
+    assert s03._spectral_power_cosine_from_cache(flat_cache, flat_cache) == 0.0
+
+
+def test_three_zone_robust_features_are_finite_and_permutation_invariant():
+    import stage2_feature_catalog as catalog
+
+    ir, ambient, g1, g2, g3, _, _ = _signals()
+    names = [
+        name for name in catalog.model_candidate_names()
+        if name.startswith("GMEDIAN_")
+        or name == "GTOP2_CORR"
+        or name.startswith("G_TOP2_ALL")
+        or name.startswith("G_WEAK_TO_TOP2")
+        or name.startswith("G_ZONE_DOM_FREQ")
+        or name.startswith("G_ZONE_HR_SUPPORT")
+        or name.startswith("G_PAIR_")
+        or name.startswith("G_AMB_RESIDUAL_")
+        or name == "G_ZONE_PHASE_CONCENTRATION"
+    ]
+    baseline = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3)
+
+    assert len(names) == 20
+    assert all(np.isfinite(baseline[name]) for name in names)
+    for permuted in permutations([g1, g2, g3]):
+        actual = s03.extract_feature_pool_from_window(ir, ambient, *permuted)
+        for name in names:
+            assert actual[name] == pytest.approx(baseline[name], abs=1e-12)
+
+
+def test_three_zone_robust_features_handle_one_bad_zone_and_frequency_disagreement():
+    n = 125
+    fs = 25.0
+    t = np.arange(n, dtype=float) / fs
+    rng = np.random.default_rng(71)
+    pulse = np.sin(2.0 * np.pi * 1.2 * t)
+    other_frequency = np.sin(2.0 * np.pi * 2.0 * t)
+    ambient_wave = np.sin(2.0 * np.pi * 0.35 * t + 0.3)
+    dc = 2.0e6
+    ir = np.zeros(n)
+    ambient = 1.0e5 + 6000.0 * ambient_wave
+    clean_zones = [dc + 8000.0 * pulse, dc + 7600.0 * pulse, dc + 8400.0 * pulse]
+
+    clean = s03.extract_feature_pool_from_window(ir, ambient, *clean_zones, fs=fs)
+    bad_zone = dc + 26000.0 * rng.normal(size=n) + 18000.0 * ambient_wave
+    unilateral = s03.extract_feature_pool_from_window(
+        ir, ambient, clean_zones[0], clean_zones[1], bad_zone, fs=fs
+    )
+    disagreement = s03.extract_feature_pool_from_window(
+        ir, ambient, clean_zones[0], clean_zones[1], dc + 8000.0 * other_frequency, fs=fs
+    )
+
+    assert unilateral["GMEDIAN_AUTO_CORR_PEAK"] > unilateral["GREEN_AUTO_CORR_PEAK"]
+    assert unilateral["G_PAIR_PERIODICITY_MAX"] > 0.5
+    assert unilateral["G_AMB_RESIDUAL_2OF3_PERIODICITY"] > 0.5
+    assert disagreement["G_ZONE_DOM_FREQ_MAD_HZ"] > clean["G_ZONE_DOM_FREQ_MAD_HZ"]
+    assert disagreement["G_ZONE_HR_SUPPORT_RATIO"] < clean["G_ZONE_HR_SUPPORT_RATIO"]
+
+
+def test_three_zone_phase_concentration_detects_asynchronous_zones():
+    n = 125
+    fs = 25.0
+    t = np.arange(n, dtype=float) / fs
+    dc = 2.0e6
+    ir = np.zeros(n)
+    ambient = np.zeros(n)
+    aligned = [dc + 8000.0 * np.sin(2.0 * np.pi * 1.2 * t + phase)
+               for phase in (0.0, 0.03, -0.02)]
+    spread = [dc + 8000.0 * np.sin(2.0 * np.pi * 1.2 * t + phase)
+              for phase in (0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0)]
+
+    aligned_features = s03.extract_feature_pool_from_window(ir, ambient, *aligned, fs=fs)
+    spread_features = s03.extract_feature_pool_from_window(ir, ambient, *spread, fs=fs)
+
+    assert aligned_features["G_ZONE_PHASE_CONCENTRATION"] > 0.95
+    assert spread_features["G_ZONE_PHASE_CONCENTRATION"] < 0.2
+
+
+def test_exact_rms_ties_do_not_make_top2_features_depend_on_zone_order():
+    n = 124
+    pulse_a = np.tile([1.0, -1.0], n // 2)
+    pulse_b = pulse_a.copy()
+    pulse_c = np.tile([1.0, 1.0, -1.0, -1.0], n // 4)
+    pulses = [pulse_a, pulse_b, pulse_c]
+    raw = [2.0e6 + pulse for pulse in pulses]
+
+    values = []
+    for order in permutations(range(3)):
+        spatial, _, _ = s03._green_spatial_candidates(
+            [raw[index] for index in order],
+            [pulses[index] for index in order],
+            fs=25.0,
+        )
+        values.append(spatial["G_TOP2_CORR_MIN"])
+
+    assert max(values) - min(values) < 1e-12
+
+
+def test_invalid_zone_frequency_is_excluded_but_two_zone_consensus_survives():
+    fs = 25.0
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    pulse = np.sin(2.0 * np.pi * 1.2 * t)
+    dc = 2.0e6
+    flat = np.full(n, dc)
+    features = s03.extract_feature_pool_from_window(
+        np.zeros(n),
+        np.zeros(n),
+        dc + 8000.0 * pulse,
+        dc + 7600.0 * pulse,
+        flat,
+        fs=fs,
+    )
+
+    assert s03.compute_fft_cache(np.zeros(n), fs)["dom_freq"] == 0.0
+    assert features["G_ZONE_HR_SUPPORT_RATIO"] == pytest.approx(2.0 / 3.0)
+    assert features["G_PAIR_FREQ_GAP_MIN_HZ"] == pytest.approx(0.0)
+    assert features["G_PAIR_FREQ_GAP_MEDIAN_HZ"] == pytest.approx(0.0)
+    assert features["G_ZONE_PHASE_CONCENTRATION"] > 0.95
+    assert features["G_PAIR_SPECTRAL_CONSENSUS"] > 0.95
+
+
+def test_tiny_aperiodic_noise_has_no_valid_zone_frequency_support():
+    fs = 25.0
+    n = 125
+    rng = np.random.default_rng(197)
+    dc = 2.0e6
+    noise = 1.0e-6 * rng.normal(size=n)
+    features = s03.extract_feature_pool_from_window(
+        np.zeros(n), np.zeros(n), dc + noise, dc + noise, dc + noise, fs=fs
+    )
+
+    assert features["G_ZONE_HR_SUPPORT_RATIO"] == 0.0
+    assert features["G_ZONE_DOM_FREQ_MAD_HZ"] == 0.0
+    assert features["G_ZONE_PHASE_CONCENTRATION"] == 0.0
+    assert features["G_PAIR_SPECTRAL_CONSENSUS"] == 0.0
+
+
+def test_tiny_periodic_zone_is_excluded_from_frequency_consensus():
+    fs = 25.0
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    dc = 2.0e6
+    clean_1 = dc + 8000.0 * np.sin(2.0 * np.pi * 1.2 * t)
+    clean_2 = dc + 7600.0 * np.sin(2.0 * np.pi * 1.2 * t + 0.02)
+    tiny_opposite = dc + 1.0e-6 * np.sin(2.0 * np.pi * 1.2 * t + np.pi)
+
+    features = s03.extract_feature_pool_from_window(
+        np.zeros(n), np.zeros(n), clean_1, clean_2, tiny_opposite, fs=fs
+    )
+
+    assert features["G_ZONE_HR_SUPPORT_RATIO"] == pytest.approx(2.0 / 3.0)
+    assert features["G_PAIR_FREQ_GAP_MIN_HZ"] == pytest.approx(0.0)
+    assert features["G_PAIR_FREQ_GAP_MEDIAN_HZ"] == pytest.approx(0.0)
+    assert features["G_ZONE_PHASE_CONCENTRATION"] > 0.95
+    assert features["G_PAIR_SPECTRAL_CONSENSUS"] > 0.95
 
 
 def test_raw_green_layouts_normalize_to_same_three_symmetric_zones():
@@ -574,7 +792,7 @@ def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
     )
     outputs = s04.export_full_feature_ranking(tmp_path, ranking)
 
-    assert len(ranking) == 91
+    assert len(ranking) == 111
     for item in ranking:
         record = catalog.feature_record(item["feature"])
         assert item["commercial_8_member"] == record["commercial_8_member"]
@@ -585,9 +803,9 @@ def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
 
     completeness = json.loads(outputs["completeness"].read_text(encoding="utf-8"))
     assert completeness["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
-    assert completeness["catalog_count"] == 91
-    assert completeness["ranked_count"] == 91
-    assert completeness["unique_ranked_count"] == 91
+    assert completeness["catalog_count"] == 111
+    assert completeness["ranked_count"] == 111
+    assert completeness["unique_ranked_count"] == 111
     assert completeness["missing_from_ranking"] == []
     assert completeness["extra_in_ranking"] == []
     assert completeness["commercial_8_mapping"] == dict(catalog.COMMERCIAL_8_FEATURE_MAPPING)

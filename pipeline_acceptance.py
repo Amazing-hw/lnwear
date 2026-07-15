@@ -25,13 +25,6 @@ MANDATORY_FIGURES = [
     Path("postprocess_opt/postprocess_search_summary.png"),
     Path("report_plots/pipeline_scientific_overview.png"),
 ]
-COMMERCIAL_FIGURES = [
-    Path("commercial_compare/commercial_compare_summary.png"),
-    Path("commercial_compare/commercial_compare_probabilities.png"),
-    Path("commercial_compare/commercial_compare_disagreements.png"),
-]
-
-
 def _read_json(path: Path):
     if not path.is_file():
         return None
@@ -181,14 +174,12 @@ def build_pipeline_acceptance_report(artifact_dir):
         )
     )
     mandatory_figures = list(MANDATORY_FIGURES)
-    if (artifact_dir / "commercial_compare" / "commercial_compare.json").is_file():
-        mandatory_figures.extend(COMMERCIAL_FIGURES)
     figure_results = [_figure_quartet(artifact_dir / relative) for relative in mandatory_figures]
     figure_paths = [path for _passed, paths in figure_results for path in paths]
     figures_pass = bool(figure_results and all(passed for passed, _paths in figure_results))
 
     sections = {
-        "Feature pool": _section(feature_pass, "83 governed candidates are uniquely and completely ranked." if feature_pass else "Feature-pool completeness failed.", [completeness_path]),
+        "Feature pool": _section(feature_pass, f"{expected_feature_count} governed candidates are uniquely and completely ranked." if feature_pass else "Feature-pool completeness failed.", [completeness_path]),
         "Selection": _section(selection_pass, f"{len(selected_features)} manually selected features and source hashes are frozen." if selection_pass else "Manual selection is missing, stale, or lacks source hashes.", [selection_path]),
         "Model": _section(model_pass, f"Selected model: {model.get('selected_candidate', 'unavailable')}" if model_pass else "Selected model or hard-negative decision is missing, inconsistent, or violates finite-prediction, FPR, or node constraints.", [model_path, hard_negative_path]),
         "Postprocess": _section(post_pass, "Causal postprocessing meets FPR and added-latency targets." if post_pass else "Postprocessing is missing or does not meet FPR/latency targets.", [post_path]),

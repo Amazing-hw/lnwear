@@ -85,7 +85,12 @@ def test_csv_selection_import_preserves_catalog_order(tmp_path):
     ranking_path = tmp_path / "feature_ranking_full.json"
     _write_ranking(ranking_path)
     selection_path = export_manual_selection_csv(ranking_path, tmp_path)
-    selected = {"COMM_GREEN_AC", "ACC_MAG_MEAN", "GREEN_FFT_PEAK_MEDIAN_RATIO"}
+    selected = {
+        "COMM_GREEN_AC",
+        "ACC_MAG_MEAN",
+        "GREEN_FFT_PEAK_MEDIAN_RATIO",
+        "G_PAIR_PERIODICITY_MEDIAN",
+    }
     _select(selection_path, selected)
 
     actual, provenance = load_manual_selection_csv(

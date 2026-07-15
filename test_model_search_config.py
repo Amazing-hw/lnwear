@@ -10,7 +10,6 @@ import pytest
 
 import s05_train_final_model as s05
 import s08_run_pipeline as s08
-import s09_commercial_compare as s09
 from stage2_feature_catalog import FEATURE_POOL_VERSION
 
 
@@ -1408,9 +1407,6 @@ def test_s08_default_includes_model_search_but_skips_npz_and_postprocess_search(
     assert " --optimize " not in output
     assert "s07_postprocess_optimize.py" not in output
     assert "--export_window_cache" not in output
-    assert "s09_commercial_compare.py" not in output
-    assert "商业窗口级对比" in output
-    assert "window_level_compare.csv" in output
 
 
 def test_s08_model_search_can_explicitly_run_npz_and_postprocess_search():
@@ -1437,167 +1433,6 @@ def test_s08_model_search_can_explicitly_run_npz_and_postprocess_search():
     assert output.count("--export_window_cache") == 2
     assert "s07_postprocess_optimize.py" in output
     assert "--replay_split test" in output
-    assert "s09_commercial_compare.py" not in output
-
-
-def test_s08_commercial_compare_is_embedded_not_s09_subprocess():
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(ROOT / "s08_run_pipeline.py"),
-            "--dry_run",
-            "--feature_selection_mode",
-            "auto",
-            "--commercial_compare",
-            "--stop_after",
-            "commercial_compare",
-        ],
-        cwd=str(ROOT),
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-
-    output = result.stdout + result.stderr
-    assert "商业窗口级对比" in output
-    assert "__commercial_compare__" in output
-    assert "s09_commercial_compare.py" not in output
-    assert "--export_window_cache" not in output
-    assert "s07_postprocess_optimize.py" not in output
-
-
-def test_s09_builds_window_metric_comparison_rows():
-    report = {
-        "commercial": {
-            "window_metrics": {
-                "accuracy": 0.90,
-                "precision": 0.80,
-                "recall": 0.70,
-                "f1": 0.75,
-                "total_windows": 100,
-            }
-        },
-        "project": {
-            "window_metrics": {
-                "accuracy": 0.95,
-                "precision": 0.85,
-                "recall": 0.80,
-                "f1": 0.825,
-                "total_windows": 100,
-            }
-        },
-        "metric_deltas_project_minus_commercial": {
-            "window_metrics": {
-                "accuracy": 0.05,
-                "precision": 0.05,
-                "recall": 0.10,
-                "f1": 0.075,
-            }
-        },
-    }
-
-    rows = s09.build_window_metric_comparison_rows(report)
-
-    assert rows[0]["metric"] == "accuracy"
-    assert rows[0]["commercial"] == pytest.approx(0.90)
-    assert rows[0]["project"] == pytest.approx(0.95)
-    assert rows[0]["delta_project_minus_commercial"] == pytest.approx(0.05)
-    assert rows[-1]["metric"] == "total_windows"
-
-
-def test_s09_builds_accuracy_scope_rows():
-    report = {
-        "commercial": {
-            "summary": {"accuracy": 0.91},
-            "window_model_summary": {"accuracy": 0.84},
-            "window_stream_summary": {"accuracy": 0.79},
-        },
-        "project": {
-            "summary": {"accuracy": 0.95},
-            "window_model_summary": {"accuracy": 0.89},
-            "window_stream_summary": {"accuracy": 0.86},
-        },
-        "metric_deltas_project_minus_commercial": {
-            "summary": {"accuracy": 0.04},
-            "window_model_summary": {"accuracy": 0.05},
-            "window_stream_summary": {"accuracy": 0.07},
-        },
-    }
-
-    rows = s09.build_accuracy_scope_rows(report)
-
-    assert [row["scope"] for row in rows] == [
-        "summary",
-        "window_model_summary",
-        "window_stream_summary",
-    ]
-    assert rows[0]["commercial_accuracy"] == pytest.approx(0.91)
-    assert rows[1]["project_accuracy"] == pytest.approx(0.89)
-    assert rows[2]["delta_project_minus_commercial"] == pytest.approx(0.07)
-
-
-def test_s09_commercial_summary_keeps_majority_vote_when_stream_metrics_added():
-    details = s09._finalize_commercial_results(
-        [
-            {
-                "sample_name": "positive_recovery",
-                "target": 1,
-                "window_probs": [0.9, 0.9, 0.9, 0.1, 0.1, 0.1],
-                "stage2_enabled_flags": [1, 1, 1, 1, 1, 1],
-                "fallback": False,
-            }
-        ],
-        threshold=0.5,
-    )
-    assert details[0]["pred"] == 1
-
-    s09._apply_state_machine_to_details(
-        details,
-        threshold=0.5,
-        postprocess_cfg={"sample_pred_warmup_frames": 5, "sample_pred_strategy": "final_state"},
-    )
-
-    payload = s09._build_eval_payload(
-        details,
-        {},
-        model_threshold=0.5,
-        warmup_frames=0,
-    )
-
-    assert details[0]["pred"] == 1
-    assert payload["summary"]["recall"] == pytest.approx(1.0)
-    assert payload["window_stream_summary"]["recall"] < payload["summary"]["recall"]
-
-
-def test_s09_print_accuracy_scope_comparison_prints_three_scopes(capsys):
-    report = {
-        "commercial": {
-            "summary": {"accuracy": 0.91},
-            "window_model_summary": {"accuracy": 0.84},
-            "window_stream_summary": {"accuracy": 0.79},
-        },
-        "project": {
-            "summary": {"accuracy": 0.95},
-            "window_model_summary": {"accuracy": 0.89},
-            "window_stream_summary": {"accuracy": 0.86},
-        },
-        "metric_deltas_project_minus_commercial": {
-            "summary": {"accuracy": 0.04},
-            "window_model_summary": {"accuracy": 0.05},
-            "window_stream_summary": {"accuracy": 0.07},
-        },
-    }
-
-    s09.print_accuracy_scope_comparison(report)
-    out = capsys.readouterr().out
-
-    assert "[Accuracy compare]" in out
-    assert "sample" in out
-    assert "window_model" in out
-    assert "window_stream" in out
-    assert "commercial=0.9100" in out
-    assert "project=0.9500" in out
-    assert "delta=0.0400" in out
 
 
 def test_s08_full_optimize_enables_cache_and_postprocess_search():
@@ -1622,7 +1457,6 @@ def test_s08_full_optimize_enables_cache_and_postprocess_search():
     assert '--model_search_feature_counts "30"' not in output
     assert "--export_window_cache" in output
     assert "s07_postprocess_optimize.py" in output
-    assert "s09_commercial_compare.py" not in output
 
 
 def test_s08_hard_negative_optimize_no_longer_enables_full_fp_sensitive_loop():

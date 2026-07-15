@@ -7,6 +7,7 @@ from pathlib import Path
 import h5py
 import joblib
 import numpy as np
+import stage2_feature_catalog as catalog
 
 
 ROOT = Path(__file__).resolve().parent
@@ -69,6 +70,22 @@ def test_readme_does_not_document_empty_model_search_feature_counts():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert '--model_search_feature_counts ""' not in readme
+
+
+def test_commercial_comparison_runtime_is_removed_but_feature_mapping_remains():
+    pipeline_source = (ROOT / "s08_run_pipeline.py").read_text(encoding="utf-8")
+    acceptance_source = (ROOT / "pipeline_acceptance.py").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert not (ROOT / "s09_commercial_compare.py").exists()
+    for token in ("s09_cmp", "commercial_compare", "s09_commercial_compare"):
+        assert token not in pipeline_source
+        assert token not in acceptance_source
+        assert token not in readme
+    assert len(catalog.COMMERCIAL_8_FEATURE_MAPPING) == 8
+    assert set(catalog.COMMERCIAL_8_FEATURE_MAPPING.values()) <= set(
+        catalog.model_candidate_names()
+    )
 
 
 def test_s08_rejects_test_split_for_postprocess_parameter_selection(tmp_path):
