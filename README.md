@@ -113,6 +113,8 @@ artifacts/manual_feature_selection.csv
 
 该文件由 `s04` 根据同目录下的 `feature_ranking_full.json` 自动生成，包含完整特征池及其排序、稳定性、漂移、误报风险和部署成本信息。人工选择时只允许修改 `selected` 列：
 
+逐项理解特征时请配合阅读 [全特征生理意义与可解释性人工筛选指南](FEATURE_INTERPRETABILITY_GUIDE.md)。该指南严格覆盖当前 `stage2_interpretable_v8` 的 126 项候选，说明每项的定义、生理/物理含义、预期方向、鲁棒性、泛化风险和工程取舍；它用于解释统计证据，不把单个特征视为单一生理因果，也不替代独立验证。
+
 ```text
 selected = 1    选中该特征
 selected = 0    不选该特征
