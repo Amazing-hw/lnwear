@@ -10,7 +10,8 @@
     python s08_run_pipeline.py --artifact_dir artifacts --skip s01,s02,s03,s04
 
 恢复流程严格使用 CSV 中的特征名称、顺序和数量，执行 XGBoost 搜参、
-train OOF hard-negative 候选、评估和部署导出；不搜索特征数量。
+train OOF hard-negative 候选、评估和部署导出；不搜索特征数量。模型搜参的
+树数候选统一硬限制为不超过 50。
 
 显式无人值守流程（含 XGBoost 搜参与部署导出）使用：
     python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --feature_selection_mode auto
@@ -96,6 +97,11 @@ import sys
 import time
 import joblib
 
+from model_search_limits import (
+    MAX_MODEL_SEARCH_N_ESTIMATORS,
+    default_model_search_n_estimators_csv,
+    parse_model_search_n_estimators,
+)
 from s03_extract_feature_pool import is_stage2_ir_feature
 from s04_feature_selection import (
     is_deployment_allowed_feature,
@@ -2031,8 +2037,14 @@ def main():
                    help="s05 model-search sampling/CV seed")
     p.add_argument("--model_search_n_workers", type=int, default=None,
                    help="parallel s05 model candidates; defaults to --n_workers")
-    p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60",
-                   help="comma-separated s05 n_estimators candidates")
+    p.add_argument(
+        "--model_search_n_estimators",
+        default=default_model_search_n_estimators_csv(),
+        help=(
+            "comma-separated s05 n_estimators candidates; "
+            f"hard maximum is {MAX_MODEL_SEARCH_N_ESTIMATORS}"
+        ),
+    )
     p.add_argument("--model_search_max_depth", default="2,3,4,5",
                    help="comma-separated s05 max_depth candidates")
     p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10,0.15,0.20",
@@ -2105,6 +2117,10 @@ def main():
 
     _raw_argv = sys.argv[1:]
     args = p.parse_args()
+    try:
+        parse_model_search_n_estimators(args.model_search_n_estimators)
+    except ValueError as exc:
+        p.error(str(exc))
     if args.model_search_n_workers is None:
         args.model_search_n_workers = args.n_workers
 

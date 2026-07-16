@@ -42,6 +42,25 @@ CACHE_CONTRACT_FIELDS = (
 )
 
 
+def _env_flag(name):
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_n_workers(n_workers=None, n_items=None, cap=4):
+    """Resolve bounded postprocess-search workers with a serial escape hatch."""
+    if _env_flag("WL_FORCE_SERIAL"):
+        return 1
+    if n_workers is None:
+        n_workers = max(1, min(cap, (os.cpu_count() or cap) // 2))
+    try:
+        resolved = max(1, int(n_workers))
+    except (TypeError, ValueError):
+        resolved = 1
+    if n_items is not None:
+        resolved = min(resolved, max(1, int(n_items)))
+    return resolved
+
+
 def _scalar(value):
     arr = np.asarray(value)
     if arr.shape == ():
@@ -848,7 +867,7 @@ def main():
         f"(full_grid={len(full_grid)}, search_budget={args.search_budget}, "
         f"model_threshold={model_threshold:.4f})..."
     )
-    n_workers = max(1, int(args.n_workers))
+    n_workers = resolve_n_workers(args.n_workers, n_items=len(grid))
     t0 = time.time()
 
     _init_worker_caches(caches, args.warmup_frames)

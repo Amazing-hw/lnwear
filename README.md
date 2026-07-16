@@ -231,6 +231,7 @@ feature_selection_mode:        manual
 model_search:                  true
 model_search_feature_counts:   8,10,12,15,18（仅 auto；manual 忽略）
 model_search_strategy:         staged_group_cv
+model_search_n_estimators:     20,25,30,35,40,45,50（硬上限 50）
 model_search_max_depth:        2,3,4,5
 model_search_n_workers:        默认跟随全局 n_workers（当前上限 4）
 max_model_nodes:               500
@@ -275,12 +276,15 @@ python s08_run_pipeline.py \
 并行安全约束：
 
 - worker 数会自动限制到实际任务数，空闲任务不会额外创建线程。
-- `WL_FORCE_SERIAL=1` 会强制所有支持该开关的阶段回退到单 worker，便于排查环境问题。
+- `WL_FORCE_SERIAL=1` 会强制 s01–s07 的数据、特征、模型候选、评估和后处理搜索回退到单 worker，便于排查环境问题。
 - 主流程默认设置 `OMP_NUM_THREADS=1`、`MKL_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1`、`NUMEXPR_NUM_THREADS=1` 和 `VECLIB_MAXIMUM_THREADS=1`；如果调用者已经显式设置，则保留调用者的值。
 - `WL_INNER_N_JOBS` 默认未设置，此时单个 XGBoost 候选使用 1 个内部线程；如果显式提高该值，应相应降低 `--model_search_n_workers`，避免两层并行相乘。
 - s03 并行 worker 可以乱序完成，但主进程会按原始样本索引重组后再写 CSV，保证相同输入和配置下行顺序确定。
 - s05 候选可以乱序完成，但记录按候选输入索引重组；候选异常会终止搜索，不会静默删除失败候选后继续选择模型。
+- s07 worker 数会限制到实际后处理候选数，避免搜索预算很小时创建空闲进程。
 - 小任务自动串行：s01 只有一个 H5、s02/s03/s06 不超过两个样本或 s04 不超过四个 fold 任务时，跳过进程池开销。
+
+模型搜参中的 `n_estimators` 使用统一配置源，默认候选为 `20,25,30,35,40,45,50`。无论从 `s08` 还是直接从 `s05` 进入，显式传入大于 50 的候选都会直接报错，不会静默裁剪。
 
 manual 模式下，CSV 冻结的特征名称和数量不会改变；并行只作用于这组固定特征上的模型参数候选，不会重新搜索特征数或执行 local-swap。
 

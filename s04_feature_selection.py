@@ -83,6 +83,8 @@ def resolve_n_workers(n_workers=None, n_items=None, cap=4):
         resolved = 1
     if n_items is not None and int(n_items) <= 4:
         return 1
+    if n_items is not None:
+        resolved = min(resolved, max(1, int(n_items)))
     return resolved
 
 

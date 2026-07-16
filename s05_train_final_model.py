@@ -43,6 +43,11 @@ from stage2_feature_catalog import (
     FEATURE_POOL_VERSION,
 )
 from manual_feature_selection import load_manual_selection_csv
+from model_search_limits import (
+    DEFAULT_MODEL_SEARCH_N_ESTIMATORS,
+    MAX_MODEL_SEARCH_N_ESTIMATORS,
+    parse_model_search_n_estimators,
+)
 from scientific_figures import save_scientific_figure
 
 # 配置日志
@@ -255,7 +260,7 @@ MODEL_SEARCH_PARAM_KEYS = [
 ]
 
 DEFAULT_MODEL_SEARCH_SPACE = {
-    "n_estimators": [20, 25, 30, 35, 40, 45, 50, 55, 60],
+    "n_estimators": list(DEFAULT_MODEL_SEARCH_N_ESTIMATORS),
     "max_depth": [2, 3, 4, 5],
     "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.20],
     "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
@@ -814,8 +819,8 @@ def build_default_xgb_params(scale_pos_weight=1.0):
 
 def build_model_search_axes(args):
     return {
-        "n_estimators": parse_model_search_values(
-            args.model_search_n_estimators, int, "model_search_n_estimators"),
+        "n_estimators": parse_model_search_n_estimators(
+            args.model_search_n_estimators),
         "max_depth": parse_model_search_values(
             args.model_search_max_depth, int, "model_search_max_depth"),
         "learning_rate": parse_model_search_values(
@@ -2687,7 +2692,10 @@ def main(args=None):
                         help="parallel outer model candidates; each XGBoost fit defaults to WL_INNER_N_JOBS=1")
     parser.add_argument("--model_search_n_estimators", type=str,
                         default=_model_search_default_csv("n_estimators"),
-                        help="comma-separated n_estimators candidates for --model_search")
+                        help=(
+                            "comma-separated n_estimators candidates for --model_search; "
+                            f"hard maximum is {MAX_MODEL_SEARCH_N_ESTIMATORS}"
+                        ))
     parser.add_argument("--model_search_max_depth", type=str,
                         default=_model_search_default_csv("max_depth"),
                         help="comma-separated max_depth candidates for --model_search")

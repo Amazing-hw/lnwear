@@ -166,7 +166,7 @@ def test_s08_manual_resume_passes_frozen_feature_contract(tmp_path):
 
 def _model_search_args(**overrides):
     values = {
-        "model_search_n_estimators": "20,25,30,35,40,45,50,55,60,70,80",
+        "model_search_n_estimators": "20,25,30,35,40,45,50",
         "model_search_max_depth": "2,3,4",
         "model_search_learning_rate": "0.025,0.03,0.04,0.05,0.06,0.08,0.10",
         "model_search_min_child_weight": "10,15,20,25,30,40,50",
@@ -987,9 +987,50 @@ def test_default_model_search_axes_have_fine_n_estimators():
     args = _model_search_args()
 
     axes = s05.build_model_search_axes(args)
-    n_estimators = set(axes["n_estimators"])
+    n_estimators = axes["n_estimators"]
 
-    assert {25, 35, 45, 55}.issubset(n_estimators)
+    assert n_estimators == [20, 25, 30, 35, 40, 45, 50]
+    assert max(n_estimators) == 50
+
+
+def test_s05_rejects_model_search_tree_count_above_50():
+    args = _model_search_args(model_search_n_estimators="20,51")
+
+    with pytest.raises(ValueError, match="maximum is 50"):
+        s05.build_model_search_axes(args)
+
+
+def test_s08_rejects_model_search_tree_count_above_50():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "s08_run_pipeline.py"),
+            "--dry_run",
+            "--feature_selection_mode",
+            "auto",
+            "--model_search_n_estimators",
+            "20,51",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "maximum is 50" in output
+
+
+def test_s08_default_model_search_tree_grid_stops_at_50():
+    result = _run_s08_dry_run(
+        "--feature_selection_mode", "auto",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert '--model_search_n_estimators "20,25,30,35,40,45,50"' in output
+    assert '--model_search_n_estimators "20,25,30,35,40,45,50,55,60"' not in output
 
 
 def test_default_pipeline_search_budget_stays_deployable_and_runtime_bounded():
