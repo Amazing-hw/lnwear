@@ -18,7 +18,7 @@ def _signals(n=125, fs=25.0):
     g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
     g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
     g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
     acc = np.column_stack([
         0.02 * np.sin(2 * np.pi * 0.8 * t),
         0.01 * np.cos(2 * np.pi * 0.5 * t),
@@ -31,7 +31,9 @@ def test_catalog_exactly_matches_generated_window_candidates():
     import stage2_feature_catalog as catalog
 
     *_, ppg, acc = _signals()
-    features = s03.extract_window_features(ppg, fs=25.0, acc_window=acc)
+    features = s03.extract_window_features(
+        ppg, fs=25.0, acc_window=acc, ppg_config=0
+    )
     expected = catalog.model_candidate_names()
 
     assert s03.STAGE2_FEATURE_POOL_VERSION == catalog.FEATURE_POOL_VERSION
@@ -425,8 +427,8 @@ def test_raw_green_layouts_normalize_to_same_three_symmetric_zones():
     for column in (8, 11, 14):
         layout_grouped[:, column] = g3
 
-    zones_3 = s03.get_channels_from_window(layout_3, mode=1)[2:]
-    zones_grouped = s03.get_channels_from_window(layout_grouped, mode=2)[2:]
+    zones_3 = s03.get_channels_from_window(layout_3, ppg_config=0)[2:]
+    zones_grouped = s03.get_channels_from_window(layout_grouped, ppg_config=2)[2:]
 
     for actual, expected in zip(zones_grouped, zones_3):
         assert np.allclose(actual, expected)
@@ -668,7 +670,9 @@ def test_candidate_features_are_finite_on_degenerate_inputs():
     acc = np.zeros((n, 3), dtype=float)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        features = s03.extract_window_features(ppg, fs=25.0, acc_window=acc)
+        features = s03.extract_window_features(
+            ppg, fs=25.0, acc_window=acc, ppg_config=0
+        )
 
     assert list(features) == catalog.model_candidate_names()
     assert all(np.isfinite(value) for value in features.values())
@@ -782,14 +786,13 @@ def test_mode_zero_preserves_explicit_three_green_channel_layout():
 def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
     import stage2_feature_catalog as catalog
 
-    *_, ppg, acc = _signals(n=300, fs=100.0)
+    # Seven candidate windows become one retained center window after [3:-3].
+    *_, ppg, acc = _signals(n=900, fs=100.0)
     calls = []
 
     monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
     monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
     monkeypatch.setattr(s03, "stage1_sample_pass", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(s03, "_is_25hz_sample", lambda _sample: False)
-    monkeypatch.setattr(s03, "detect_green_mode", lambda _ppg: 0)
 
     def fake_shared(window, mode, fs, acc_window, use_stage2_ir):
         calls.append((window.shape, mode, fs, acc_window is not None, use_stage2_ir))
@@ -808,7 +811,10 @@ def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
 
     monkeypatch.setattr(s03, "extract_stage2_window", fake_shared)
     rows = s03._extract_rows_for_sample(
-        {"sample_name": "sample", "h5_file": "x.h5", "target": 1},
+        {
+            "sample_name": "sample", "h5_file": "x.h5", "target": 1,
+            "frequency": 100, "ppg_config": 0,
+        },
         dc_threshold=1.0,
         ac_dc_threshold=1.0,
         window_len=300,

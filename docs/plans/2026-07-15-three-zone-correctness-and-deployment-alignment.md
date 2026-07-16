@@ -1,5 +1,8 @@
 # Three-Zone Correctness and Deployment Alignment Implementation Plan
 
+> Historical completed plan for the v7/111 stage. The active implementation is
+> v8/126; use README and the 2026-07-16 fixed-position/deployment designs.
+
 > **Execution:** Use TDD in the current dirty workspace; do not commit or push.
 
 **Goal:** Make three-zone features strictly permutation-invariant and frequency-valid, align every deployment recipe with the governed extractor, and remove commercial comparison functionality while retaining commercial features.

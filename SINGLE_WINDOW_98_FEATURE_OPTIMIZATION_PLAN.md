@@ -1,333 +1,111 @@
-# Stage2 单窗 98% 特征筛选优化计划
+# Stage2 单窗准确率优化方案（现行）
 
-## Summary
+更新时间：2026-07-16
+适用版本：`stage2_interpretable_v8`，126 项受治理候选
 
-目标是在不增加模型复杂度的前提下，将 **Stage2 raw window accuracy** 提升到 98% 以上。主指标只统计真正进入 XGBoost 的 Stage2 raw 窗口，不把 Stage1 关闭窗口计入模型能力评估；后处理 `s07` 继续独立评估，不参与单窗 98% 判定。
+## 目标与约束
 
-核心约束：
+目标是在不依赖后处理掩盖单窗错误的前提下，提高 Stage2 单窗 accuracy、precision、recall、
+F1 和跨场景稳定性。不得用 test split 反复选择特征、阈值或模型参数。
 
-- 不通过加树、加深度来提升准确率。
-- XGBoost 复杂度不高于当前配置，必要时还要尝试缩小模型。
-- 默认特征预算为 12-15 个。
-- Stage2 窗口配置保持 `3s / 1s / skip_initial_windows=3`。
+现行约束：
 
-## Success Criteria
+- 默认窗口为 5 秒，步长为 1 秒；3 秒窗只作为显式独立实验。
+- 每条数据读取并完成窗口排序后直接使用 `[3:-3]`，删除前三包与后三包。
+- Stage2 始终使用全量合法窗口，与 Stage1 阈值流并行；Stage1 不过滤 Stage2 数据集。
+- Stage2 不使用 IR 派生特征；IR 仅用于 Stage1 DC/ACDC 快速门控。
+- 特征池为 v8/126，包含 `mode`、商用八特征映射、三固定位置绿光区及鲁棒空间候选。
+- 最终特征名称、顺序和数量由 `manual_feature_selection.csv` 的人工选择决定。
+- 人工模式只搜索固定特征集合上的模型参数，不搜索特征数量或执行 local-swap。
+- XGBoost `max_depth` 搜索范围为 2、3、4、5，最终模型仍受节点预算约束。
+- 商用八特征保留为候选特征，不存在独立商业模型对比流水线。
+- 所有绘图只输出 600 DPI PNG，不使用浏览器或 HTML。
 
-主验收目标：
+## 推荐流程
 
-- test split 的 Stage2 raw window accuracy >= 98.0%。
-- 同时报告 precision、recall、F1、AUC 和 confusion matrix，避免 accuracy 被类别不平衡掩盖。
-- valid/test 不允许数据泄漏；所有阈值、特征选择、填充值、校准只由 train/valid 决定。
+### 1. 生成完整特征排序
 
-候选模型优先级：
-
-1. Stage2 raw window accuracy 达标。
-2. FP 更低。
-3. 特征数量更少。
-4. 部署成本更低。
-5. train/valid 稳定性更好。
-
-## Current Baseline To Freeze
-
-先固定当前默认流水线作为 baseline：
-
-```bash
+```powershell
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
-记录以下指标：
-
-- `window_model_summary.accuracy`
-- `window_model_summary.precision`
-- `window_model_summary.recall`
-- `window_model_summary.f1`
-- `window_model_summary.confusion_matrix`
-- `window_model_summary.stage1_pass_samples`
-
-同时保留当前默认配置：
+默认人工模式运行到 s04，生成：
 
 ```text
-window_sec = 3
-stride_sec = 1
-skip_initial_windows = 3
-max_features = 15
+artifacts/feature_ranking_full.csv
+artifacts/feature_ranking_full.json
+artifacts/manual_feature_selection.csv
 ```
 
-## Feature Diagnostics
+完整排序覆盖全部具备训练资格的候选。缺失率、低方差、高相关、VIF、漂移、FP proxy、
+部署成本和风险标记用于人工判断，不会擅自替换人工选择。
 
-优化重点不是增加模型容量，而是把特征筛选做成可解释、可复现、可闭环的过程。
+### 2. 人工选择特征
 
-需要对所有候选特征生成诊断表：
+只修改 `manual_feature_selection.csv` 的 `selected` 列：`1` 表示入选，`0` 表示不入选。
+不能修改特征名、排序、公式、版本、风险字段或 ranking SHA。保存后重新运行同一命令，s05
+会冻结人工选择的名称、顺序、数量和文件哈希。
 
-- 缺失率。
-- 方差和低方差过滤结果。
-- train/valid 分布漂移。
-- 单特征 AUC。
-- 单特征 FP proxy。
-- 所属 feature group。
-- deployment cost。
-- SHAP train/valid 一致性。
-- 是否 scale-dependent。
+人工筛选时优先检查：
 
-重点标记三类风险特征：
+- train repeated group-CV 与 valid 单窗指标是否一致；
+- FP/FN 是否集中在特定 mode、设备、H5、时间位置或三光区失衡场景；
+- 固定位置候选是否真正补充空间信息，而不是重复整体均值；
+- FFT、熵和复杂相关特征的增益是否覆盖端侧成本；
+- 商用八特征是否仍提供稳定基线信息，但不单独训练商业对比模型。
 
-- train 排名高但 valid 排名低的疑似过拟合特征。
-- FP proxy 高、容易造成非佩戴误触的特征。
-- 部署成本高但贡献低的复杂特征，例如部分 FFT、Entropy、复杂 waveform 特征。
+### 3. 固定特征集合搜索模型参数
 
-## Feature Subset Search
+模型搜索使用 staged group-CV，并行评估候选但限制每个 XGBoost 模型内部线程，避免嵌套
+并行过载。搜索包含：树数、深度 2-5、学习率、子采样、列采样、正则化、最小叶节点权重、
+概率校准和 valid 阈值。
 
-默认特征预算为 12-15 个。不要只输出一个 `selected_features.json`，而是生成多套候选组合并统一评估。
+模型选择优先级：
 
-候选组合建议：
+1. valid 单窗 accuracy；
+2. precision 与 FP；
+3. recall 与 FN；
+4. group-CV 稳定性；
+5. 节点数、特征成本和跨 mode 鲁棒性。
 
-| 组合 | 目标 |
-|---|---|
-| `accuracy_first` | 优先 raw window accuracy |
-| `fp_safe` | 优先低 FP proxy |
-| `deployment_light` | 优先低部署成本 |
-| `balanced` | accuracy、FP proxy、部署成本加权 |
-| `commercial_8_baseline` | 商业 8 特征 baseline，用作参照 |
+### 4. 错误样本和 hard-negative 分析
 
-每组候选组合必须使用相同模型复杂度评估，不允许通过模型容量变化解释结果差异。
+使用 s05/s06 导出的窗口错误明细，按 sample、H5、mode、时间位置、质量、OOD、三光区支持度
+和环境光分层。Hard negative 只从 train 发现和回灌；valid 用于模型/阈值选择，test 只做最终
+独立验收。
 
-建议输出：
+优先处理：
+
+- 非佩戴但周期性或绿光相关性较高的 FP；
+- 单边翘起、一个光区受外光影响但仍佩戴的 FN；
+- 三光区只有一处强信号的伪佩戴；
+- 强运动、桌面遮挡、弱绿光和强环境光；
+- 特定 mode、设备或采集批次集中错误。
+
+### 5. 后处理独立优化
+
+在单窗模型固化后再评估 EMA、中值/投票、迟滞阈值、K-on/K-off、冷却时间和状态机。
+后处理只使用 valid 选参，再在 test replay；必须同时报告独立 Stage2、Stage1 和最终融合指标。
+
+## 部署产物
+
+Python 最小部署文件：
 
 ```text
-artifacts/feature_subset_search/
-  subset_candidates.csv
-  subset_eval_valid.csv
-  subset_eval_summary.json
-  best_subset_features.json
+artifacts/deploy_feature_extractor.py
+artifacts/final_model.json
 ```
 
-每条候选记录至少包含：
+特征脚本自包含人工选择后的顺序、fill/clip、阈值和特征引擎，不依赖项目源码。NumPy、SciPy
+和 XGBoost 属于 Python 运行环境依赖。其他 catalog、cookbook 和 golden-vector 文件用于审计、
+固件移植及数值对齐，不是 Python 单窗推理的必需项目文件。
 
-```text
-subset_name
-feature_names
-n_features
-group_count
-deployment_cost_mean
-scale_dependent_count
-valid_raw_window_accuracy
-valid_precision
-valid_recall
-valid_f1
-valid_auc
-valid_fp
-valid_fn
-score
+## 验证命令
+
+```powershell
+python -m py_compile s03_extract_feature_pool.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py
+python -m pytest test_deploy_feature_extractor.py test_prewindowed_h5.py test_end_to_end_pipeline_guard.py -q
+python -m pytest -q
 ```
 
-## Feature Group Strategy
-
-保留当前 `s04_feature_selection.py` 的分组体系，但需要把“为什么入选/为什么淘汰”输出清楚。
-
-优先方向：
-
-- IR、Green、Ambient 的低成本统计和 ratio 类特征优先。
-- Green spatial 与 IR-Green cross 特征需要通过 valid 证明增益。
-- ACC 特征至少进入候选池，但是否入选最终 12-15 个特征由组合评估决定。
-- FFT、Entropy、复杂 waveform 特征设置更高进入门槛，除非 valid/test raw window 指标证明它们有稳定增益。
-- 商业 8 特征必须作为 baseline 组合单独评估，判断当前新增特征是否真的有效。
-
-不推荐方向：
-
-- 不用 test split 参与筛选。
-- 不靠提高 `n_estimators` 或 `max_depth` 达标。
-- 不因为单个特征 train importance 高就直接入选。
-- 不把后处理端到端效果反向混入单窗模型目标。
-
-## Raw Window Error Analysis
-
-需要导出 Stage2 raw window 级错误明细，用于反推特征问题。
-
-建议输出：
-
-```text
-artifacts/window_error_analysis/
-  raw_window_errors_valid.csv
-  raw_window_errors_test.csv
-  raw_window_error_summary.json
-```
-
-明细字段：
-
-```text
-sample_name
-h5_file
-target
-pred
-prob
-window_start_sec
-window_end_sec
-stage1_enabled
-mode
-quality
-ood_rate
-is_fp
-is_fn
-selected_features_version
-```
-
-分层统计：
-
-- 按 label 分层。
-- 按 sample 分层，找高错误率样本。
-- 按 H5 文件分层，找数据源偏差。
-- 按 `mode` 分层，判断硬件通道模式是否影响特征。
-- 按窗口起点分层，确认跳过前三窗后是否仍有早期窗口异常。
-- 按 OOD/quality 分层，判断错误是否来自低质量窗口。
-
-## Implementation Steps
-
-### Step 1: 固化 baseline 指标
-
-- 运行当前默认流水线。
-- 保存 `end_to_end_eval_*`、`selected_features.json`、`model_bundle.pkl`。
-- 从 `s06` 结果中提取 Stage2 raw window 指标作为 baseline。
-
-### Step 2: 增加 raw window 错误明细导出
-
-建议改动 `s06_deploy_eval.py`：
-
-- 保留 `window_model_summary` 作为主指标。
-- 增加 raw window 级 CSV 导出。
-- CSV 只统计 XGBoost 实际推理窗口，不统计 Stage1 disabled 窗口。
-
-验收：
-
-- CSV 中 FP/FN 数量能和 `window_model_summary.confusion_matrix` 对齐。
-- `stage1_enabled=0` 的窗口不进入主指标。
-
-### Step 3: 增强 s04 特征诊断输出
-
-建议改动 `s04_feature_selection.py`：
-
-- 输出所有候选特征的诊断表。
-- 增加 train/valid drift 指标。
-- 将 FP proxy、deployment profile、SHAP consistency 汇总到一个 CSV。
-
-验收：
-
-- 每个候选特征都有 group、missing、variance、AUC、FP proxy、deployment cost。
-- 被移除的特征能说明原因。
-
-### Step 4: 增加候选特征子集搜索
-
-建议在 `s04_feature_selection.py` 中新增候选组合生成与评估逻辑：
-
-- 输入为清洗后的 train/valid 特征。
-- 输出 12-15 个特征的多个候选组合。
-- 每组候选使用固定 XGBoost 配置训练和 valid 评估。
-
-固定模型复杂度：
-
-```text
-n_estimators <= current
-max_depth <= current
-learning_rate = current
-min_child_weight = current or higher
-reg_lambda = current or higher
-```
-
-验收：
-
-- 每组组合都有 valid raw window 指标。
-- 结果按 score 排序。
-- 最优组合写入 `best_subset_features.json`。
-
-### Step 5: 用最佳候选重训最终模型
-
-- 将最佳 12-15 特征写入 `selected_features.json`。
-- 运行 `s05_train_final_model.py`。
-- 运行 `s06_deploy_eval.py`，评估 valid/test raw window 指标。
-
-验收：
-
-- valid raw window accuracy 达到或接近 98% 后，才看 test。
-- test raw window accuracy >= 98.0% 才标记为达标候选。
-
-### Step 6: 达标后冻结 Stage2，再搜后处理
-
-当 Stage2 raw window 指标达标后：
-
-```bash
-python s06_deploy_eval.py \
-  --artifact_dir artifacts \
-  --split valid \
-  --window_sec 3 \
-  --stride_sec 1 \
-  --skip_initial_windows 3 \
-  --window_output_root window_outputs \
-  --export_window_cache
-
-python s07_postprocess_optimize.py \
-  --artifact_dir artifacts \
-  --split valid \
-  --cache_root window_outputs \
-  --max_sample_fp_rate 0.02 \
-  --max_false_worn_event_rate 0.02 \
-  --max_first_worn_output_p95_sec 6.0 \
-  --fp_cost 4.0
-```
-
-后处理优化只读 `window_outputs`，不再影响 Stage2 特征筛选目标。
-
-## Experiment Matrix
-
-第一轮只改特征筛选，不改模型复杂度：
-
-| 实验 | max_features | 策略 |
-|---|---:|---|
-| baseline | 15 | 当前 s04 默认策略 |
-| commercial_8 | 8 | 商业 baseline 特征 |
-| accuracy_first_15 | 15 | raw window accuracy 优先 |
-| fp_safe_15 | 15 | FP proxy 优先 |
-| deployment_light_15 | 15 | 低部署成本优先 |
-| balanced_15 | 15 | accuracy + FP + cost 平衡 |
-| balanced_12 | 12 | 压缩特征版本 |
-
-第二轮根据第一轮结果细化：
-
-- 若 FP 高：提高 FP proxy 权重。
-- 若 FN 高：检查正样本召回低的特征组，优先增强 IR/Green/ACC 互补特征。
-- 若 train 高 valid 低：降低 SHAP train-only 特征权重，提高 train/valid consistency 权重。
-- 若某个 mode 集中出错：增加 mode 分层评估，考虑 mode-aware 特征或剔除 mode 不稳定特征。
-
-## Test Plan
-
-文档与命令检查：
-
-```bash
-python -m pytest D:\wearing_liveness\new\tests
-```
-
-建议新增测试：
-
-- `s06` raw window 错误明细不统计 Stage1 disabled 窗口。
-- raw window 错误明细 FP/FN 数量与 summary confusion matrix 一致。
-- `s04` 候选组合搜索不读取 test split。
-- `s04` 候选组合输出的特征数在 12-15 范围内。
-- `s04` 输出每个候选特征的 group、FP proxy、deployment cost。
-
-## Failure Handling
-
-如果 12-15 个特征无法达到 98%：
-
-1. 不立即增加模型复杂度。
-2. 先查看错误分层报告，确认主要错误来源。
-3. 尝试 15 个特征的不同组合策略。
-4. 若仍无法达标，输出“当前特征预算下不可达”的证据：
-   - 最优 valid/test 指标。
-   - 主要 FP/FN 来源。
-   - 是否集中于特定样本、H5、mode 或低质量窗口。
-5. 再由人工决定是否放宽特征预算或重新设计特征。
-
-## Assumptions
-
-- 单窗 98% 主目标指 Stage2 raw window accuracy。
-- 特征数量目标为 12-15 个。
-- 不增加模型复杂度，必要时可进一步缩小模型。
-- 当前无法直接查看真实 H5 数据，因此所有判断必须通过可复现实验、错误明细和分层报告完成。
+真实数据验收必须额外运行完整训练、valid 模型选择、test 独立评估和两文件隔离部署推理。

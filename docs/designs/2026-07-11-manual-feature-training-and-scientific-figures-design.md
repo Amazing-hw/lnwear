@@ -2,7 +2,7 @@
 
 > Superseded for feature count and manual-selection format by
 > `2026-07-13-mode-feature-and-csv-selection-design.md`. This document retains
-> the historical rationale; the active workflow has 111 candidates, uses a
+> the historical rationale; the active v8 workflow has 126 candidates, uses a
 > CSV-only selection contract, and normalizes green layouts to three symmetric zones.
 
 Date: 2026-07-11

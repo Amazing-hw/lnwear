@@ -1,8 +1,8 @@
 # Manual Feature Training and Scientific Figures Implementation Plan
 
 > Historical plan. The active CSV-only contract is defined in
-> `2026-07-13-mode-feature-and-csv-selection.md`, and the current 111-feature
-> three-zone pool in `2026-07-13-three-zone-feature-expansion.md`;
+> `2026-07-13-mode-feature-and-csv-selection.md`; the active pool is now v8 with
+> 126 governed candidates and fixed-position three-zone features;
 > Excel/OpenPyXL steps below are no longer operational requirements.
 
 > Implementation checklist for the wearing-liveness pipeline. Steps use checkbox (`- [ ]`) syntax for tracking.

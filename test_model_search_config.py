@@ -38,6 +38,8 @@ def test_s08_default_manual_mode_stops_after_feature_ranking():
     assert "[STOP]" in output and "s04" in output
     assert "s05_train_final_model.py" not in output
     assert "候选特征子集搜索" not in output
+    assert "s07_postprocess_optimize.py" not in output
+    assert "--export_window_cache" not in output
 
 
 def test_s08_explicit_auto_mode_runs_unattended_selection_and_training():
@@ -70,6 +72,32 @@ def test_s08_manual_resume_defaults_to_csv_selection_file(tmp_path):
     assert f'--manual_feature_file "{selection_csv}"' in output
     assert "s05_train_final_model.py" in output
     assert "--mine_hard_negatives" in output
+
+
+def test_s08_manual_resume_runs_full_training_and_deploy_without_postprocess_search(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    selection_csv = artifact_dir / "manual_feature_selection.csv"
+    selection_csv.write_text("placeholder for dry-run existence check", encoding="utf-8")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--skip", "s01,s02,s03,s04",
+    )
+    output = result.stdout + result.stderr
+
+    assert "[manual] exact CSV feature names/order/count are frozen" in output
+    assert "s05_train_final_model.py" in output
+    assert "--model_search_strategy staged_group_cv" in output
+    assert '--model_search_max_depth "2,3,4,5"' in output
+    assert "--mine_hard_negatives" in output
+    assert "--model_search_feature_counts" not in output
+    assert "s06_deploy_eval.py" in output
+    assert "__extractor__" in output
+    assert "__cookbook__" in output
+    assert "s07_postprocess_optimize.py" not in output
+    assert "--export_window_cache" not in output
+    assert " --optimize " not in output
 
 
 def test_s08_manual_resume_does_not_cap_user_feature_count(tmp_path):

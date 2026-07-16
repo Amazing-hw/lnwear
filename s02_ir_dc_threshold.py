@@ -19,7 +19,11 @@ import numpy as np
 import pandas as pd
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from scipy.signal import resample_poly
-from s03_extract_feature_pool import load_ppg as load_h5_ppg, flatten_prewindowed_signal
+from s03_extract_feature_pool import (
+    load_ppg as load_h5_ppg,
+    flatten_prewindowed_signal,
+    get_sample_frequency,
+)
 
 STAGE1_PRIMITIVE_SEC = 1.0
 STAGE1_DECISION_SEC = 3.0
@@ -67,11 +71,6 @@ def load_ppg(sample):
     return ppg
 
 
-def _is_25hz_sample(sample):
-    name = sample.get("sample_name", "") if isinstance(sample, dict) else str(sample)
-    return "sleep_25hz" in name.lower()
-
-
 def downsample_to_5hz(signal, fs_original=100, fs_target=5):
     if fs_original == fs_target:
         return signal
@@ -102,11 +101,11 @@ def _extract_windows_from_sample(sample, min_duration_sec):
     stride = win
     try:
         ppg = load_ppg(sample)
+        ppg_fs = get_sample_frequency(sample)
     except Exception as e:
         print(f"读取失败 {sample.get('sample_name')}: {e}")
         return []
 
-    ppg_fs = 25 if _is_25hz_sample(sample) else 100
     min_duration = int(min_duration_sec * ppg_fs)
     if len(ppg) < min_duration:
         return []

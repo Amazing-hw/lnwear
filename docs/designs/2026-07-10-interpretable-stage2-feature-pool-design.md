@@ -1,8 +1,8 @@
 # Interpretable Stage2 Feature Pool Design
 
-> Historical design record. The active implementation is v7: `mode` was later
-> admitted as a governed candidate, and the independent commercial-comparison
-> runtime was removed. The commercial eight-feature mapping remains in the catalog.
+> Historical design record. The active implementation is v8 with 126 governed
+> candidates, CSV-only manual selection and fixed-position three-zone features.
+> The commercial comparison runtime was removed; its eight-feature mapping remains.
 
 Date: 2026-07-10
 Status: Approved for implementation

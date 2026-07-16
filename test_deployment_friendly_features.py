@@ -169,7 +169,7 @@ def test_s08_dry_run_does_not_expose_feature_pool_switches():
     assert "representative model search" in output
 
 
-def test_deploy_extractor_has_no_complex_library_dependency_without_profile_meta(tmp_path):
+def test_deploy_extractor_is_self_contained_without_profile_meta(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
     selected = ["GREEN_AC_RMS", "G_TOP2_CORR_MIN", "GTOP2_BAND_ENERGY_RATIO"]
@@ -198,11 +198,10 @@ def test_deploy_extractor_has_no_complex_library_dependency_without_profile_meta
     s08.export_feature_extractor_script(str(artifact_dir))
     text = (artifact_dir / "deploy_feature_extractor.py").read_text(encoding="utf-8")
 
-    assert "scipy" not in text
-    assert "coherence" not in text
-    assert "find_peaks" not in text
-    assert "Entropy" not in text
-    assert "SampEn" not in text
+    assert "from s03_extract_feature_pool" not in text
+    assert "S03_SOURCE_DIR" not in text
+    assert "sys.path.insert" not in text
+    assert "from scipy.signal import resample_poly" in text
     assert "FEATURE_ORDER" in text
 
 

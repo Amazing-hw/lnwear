@@ -150,7 +150,7 @@ _add(
     "mode",
     group="acquisition_context",
     preprocessing="acquisition_context",
-    formula="integer acquisition mode selected by detect_green_mode (0, 1, or 2)",
+    formula="integer H5 ppg_config metadata value (0, 1, or 2)",
     c_operators=_ops("identity", "integer_compare"),
     unit="category_code",
     signal_source="acquisition_mode",

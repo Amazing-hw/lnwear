@@ -1,8 +1,10 @@
 from pathlib import Path
 import importlib.util
 import json
+import os
 import py_compile
 import re
+import shutil
 import subprocess
 import sys
 
@@ -165,10 +167,10 @@ def test_accuracy_friendly_lightweight_features_are_source_and_deploy_ready():
         0.02 * np.cos(2 * np.pi * 0.5 * t),
         1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
     ])
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
 
     pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
-    with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
+    with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc, ppg_config=0)
     expected_ppg = [
         "GTOP2_zero_cross_rate",
         "GTOP2_abs_diff_ratio",
@@ -209,10 +211,10 @@ def test_object_worn_friendly_feature_pool_expansion_is_deployable():
         0.001 * np.cos(2 * np.pi * 0.3 * t),
         1.0 + 0.001 * np.sin(2 * np.pi * 0.4 * t),
     ])
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
 
     pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
-    with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
+    with_acc = s03.extract_window_features(ppg, fs=fs, acc_window=acc, ppg_config=0)
     expected_ppg = [
         "G_TOP1_TO_TOP2_AC_RATIO",
         "G_TOP2_RANK_STABILITY",
@@ -242,14 +244,16 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
     g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
     g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
     g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
     acc = np.column_stack([
         0.01 * np.sin(2 * np.pi * 1.0 * t),
         0.02 * np.cos(2 * np.pi * 0.5 * t),
         1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
     ])
     selected = s04.filter_features_for_deployment(
-        list(s03.extract_window_features(ppg, fs=fs, acc_window=acc).keys())
+        list(s03.extract_window_features(
+            ppg, fs=fs, acc_window=acc, ppg_config=0
+        ).keys())
     )
 
     joblib.dump(
@@ -280,6 +284,52 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
     assert list(module.FEATURE_ORDER) == selected
     assert "GTOP2_BAND_ENERGY_RATIO" in module.FEATURE_ORDER
     assert len(vector) == len(selected)
+
+
+def test_standalone_deploy_engine_matches_all_governed_candidates(tmp_path):
+    fs = 25.0
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.17 * t)
+    ambient = 1.0e5 + 600.0 * np.sin(2 * np.pi * 0.37 * t)
+    g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.17 * t + 0.01)
+    g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.17 * t + 0.03)
+    g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.17 * t - 0.02)
+    acc = np.column_stack([
+        0.01 * np.sin(2 * np.pi * 0.8 * t),
+        0.02 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.01 * np.sin(2 * np.pi * 0.6 * t),
+    ])
+    selected = catalog.model_candidate_names()
+    formulas = {name: {"formula": name, "intermediate_signals": {}} for name in selected}
+    script = s08._render_selected_feature_extractor(
+        selected,
+        {name: 0.0 for name in selected},
+        {},
+        formulas,
+    )
+    script_path = tmp_path / "deploy_feature_extractor.py"
+    script_path.write_text(script, encoding="utf-8")
+
+    spec = importlib.util.spec_from_file_location("isolated_deploy_feature_extractor", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    actual = module.extract_raw_feature_dict(
+        ir, ambient, g1, g2, g3, acc=acc, fs=fs, ppg_config=0
+    )
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
+    expected = s03.extract_window_features(
+        ppg, fs=fs, acc_window=acc, use_stage2_ir=False, ppg_config=0
+    )
+
+    assert list(actual) == selected
+    for name in selected:
+        record = catalog.feature_record(name)
+        assert actual[name] == pytest.approx(
+            expected[name],
+            abs=float(record["c_abs_tolerance"]),
+            rel=float(record["c_rel_tolerance"]),
+        ), name
 
 
 def test_export_feature_contract_files_and_golden_raw_values(tmp_path):
@@ -349,7 +399,7 @@ def test_export_feature_contract_files_and_golden_raw_values(tmp_path):
         }
 
 
-def test_rendered_deploy_feature_extractor_is_s03_source_backed():
+def test_rendered_deploy_feature_extractor_is_self_contained():
     selected = [
         "GREEN_CORR",
         "GREEN_AC_RMS",
@@ -368,14 +418,14 @@ def test_rendered_deploy_feature_extractor_is_s03_source_backed():
         {name: 0.0 for name in selected},
         {},  # clip_bounds (empty for this test)
         formulas,
-        scripts_dir=Path(__file__).resolve().parent,
     )
 
-    assert "from s03_extract_feature_pool import extract_window_features" in script
-    assert "S03_SOURCE_DIR" in script
-    assert "sys.path.insert" in script
-    assert "def _preprocess(" not in script
-    assert "def _fft_metrics(" not in script
+    assert "from s03_extract_feature_pool" not in script
+    assert "S03_SOURCE_DIR" not in script
+    assert "sys.path.insert" not in script
+    assert "def preprocess_signal(" in script
+    assert "def _fft_shape_features(" in script
+    assert "def extract_window_features(" in script
     assert "FEATURE_ORDER" in script
     assert "CLIP_BOUNDS" in script
     assert "WINDOW_MODEL_THRESHOLD" in script
@@ -401,7 +451,6 @@ def test_rendered_deploy_feature_extractor_compiles_and_runs_standalone(tmp_path
         {name: 0.0 for name in selected},
         {},  # clip_bounds (empty for this test)
         formulas,
-        scripts_dir=Path(__file__).resolve().parent,
         window_model_threshold=0.42,
     )
     script_path = tmp_path / "deploy_feature_extractor.py"
@@ -425,6 +474,110 @@ def test_rendered_deploy_feature_extractor_compiles_and_runs_standalone(tmp_path
     assert module.WINDOW_MODEL_THRESHOLD == 0.42
     assert module.classify_probability(0.41) == 0
     assert module.classify_probability(0.42) == 1
+
+
+def test_standalone_extractor_accepts_raw_ppg_frequency_and_config(tmp_path):
+    selected = ["GREEN_DC_MEDIAN", "mode"]
+    formulas = {name: {"formula": name, "intermediate_signals": {}} for name in selected}
+    script = s08._render_selected_feature_extractor(
+        selected,
+        {name: 0.0 for name in selected},
+        {},
+        formulas,
+    )
+    script_path = tmp_path / "deploy_feature_extractor.py"
+    script_path.write_text(script, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("raw_ppg_deploy_extractor", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    raw = np.tile(np.arange(40, dtype=float), (500, 1))
+    from_raw = module.extract_features_from_ppg(
+        raw, frequency=100, ppg_config=1
+    )
+    direct = module.extract_features(
+        np.zeros(125), np.ones(125),
+        np.full(125, 6.0), np.full(125, 7.0), np.full(125, 8.0),
+        fs=25, ppg_config=1,
+    )
+
+    assert from_raw == pytest.approx(direct)
+    assert from_raw[1] == 1.0
+
+
+def test_feature_script_and_model_json_are_sufficient_for_python_inference(tmp_path):
+    selected = ["GREEN_CORR", "GREEN_AC_RMS", "mode"]
+    model = XGBClassifier(
+        n_estimators=2,
+        max_depth=1,
+        learning_rate=0.1,
+        eval_metric="logloss",
+        random_state=0,
+    )
+    model.fit(
+        np.asarray([[0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.2, 0.1, 0.0], [0.8, 0.9, 0.0]]),
+        np.asarray([0, 1, 0, 1]),
+    )
+    artifact_dir = tmp_path / "training_artifacts"
+    artifact_dir.mkdir()
+    model.save_model(artifact_dir / "final_model.json")
+    joblib.dump(
+        {
+            "feature_names": selected,
+            "fill_values": {name: 0.0 for name in selected},
+            "clip_bounds": {},
+            "threshold": 0.5,
+            "meta": {"fs_ppg": 25.0, "win_sec": 5.0, "use_stage2_ir": False},
+        },
+        artifact_dir / "model_bundle.pkl",
+    )
+    script_path = Path(s08.export_feature_extractor_script(str(artifact_dir)))
+
+    deploy_dir = tmp_path / "isolated_deploy"
+    deploy_dir.mkdir()
+    shutil.copy2(script_path, deploy_dir / "deploy_feature_extractor.py")
+    shutil.copy2(artifact_dir / "final_model.json", deploy_dir / "final_model.json")
+    code = """
+import importlib.util
+from pathlib import Path
+import numpy as np
+from xgboost import XGBClassifier
+
+root = Path.cwd()
+spec = importlib.util.spec_from_file_location("deploy_features", root / "deploy_feature_extractor.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+fs = 25.0
+t = np.arange(125, dtype=float) / fs
+ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.2 * t)
+ambient = 1.0e5 + 500.0 * np.sin(2 * np.pi * 0.4 * t)
+g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t)
+g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
+g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
+vector = module.extract_features(ir, ambient, g1, g2, g3, fs=fs, ppg_config=0)
+model = XGBClassifier()
+model.load_model(root / "final_model.json")
+probability = float(model.predict_proba(np.asarray([vector], dtype=float))[0, 1])
+print(f"features={len(vector)} probability={probability:.8f}")
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = ""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=deploy_dir,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+
+    assert result.stdout.startswith("features=3 probability=")
+    assert sorted(path.name for path in deploy_dir.iterdir()) == [
+        "__pycache__",
+        "deploy_feature_extractor.py",
+        "final_model.json",
+    ]
 
 
 def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
@@ -451,8 +604,9 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     script = Path(out_path).read_text(encoding="utf-8")
 
     assert "WINDOW_MODEL_THRESHOLD = 0.37" in script
-    assert "s03_extract_feature_pool" in script
-    assert "sys.path.insert" in script
+    assert "from s03_extract_feature_pool" not in script
+    assert "S03_SOURCE_DIR" not in script
+    assert "sys.path.insert" not in script
 
 
 def test_s03_stage2_ir_disabled_omits_ir_features_before_selection():
@@ -464,18 +618,21 @@ def test_s03_stage2_ir_disabled_omits_ir_features_before_selection():
     g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
     g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
     g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
     acc = np.column_stack([
         0.01 * np.sin(2 * np.pi * 1.0 * t),
         0.02 * np.cos(2 * np.pi * 0.5 * t),
         1.0 + 0.01 * np.sin(2 * np.pi * 0.8 * t),
     ])
 
-    features = s03.extract_window_features(ppg, fs=fs, acc_window=acc, use_stage2_ir=False)
+    features = s03.extract_window_features(
+        ppg, fs=fs, acc_window=acc, use_stage2_ir=False, ppg_config=0
+    )
     ppg_with_different_ir = ppg.copy()
     ppg_with_different_ir[:, 0] = 1.0e6 + 5.0e5 * np.sin(2 * np.pi * 0.7 * t)
     features_with_different_ir = s03.extract_window_features(
-        ppg_with_different_ir, fs=fs, acc_window=acc, use_stage2_ir=False
+        ppg_with_different_ir, fs=fs, acc_window=acc,
+        use_stage2_ir=False, ppg_config=0
     )
 
     forbidden = [
@@ -505,7 +662,7 @@ def test_s03_feature_pool_source_keys_are_stage2_ir_free_even_with_acc():
     g1 = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + 0.01)
     g2 = 2.1e6 + 7.5e3 * np.sin(2 * np.pi * 1.2 * t + 0.03)
     g3 = 1.9e6 + 8.5e3 * np.sin(2 * np.pi * 1.2 * t - 0.02)
-    ppg = np.column_stack([ir, ambient, g1, g2, g3, np.zeros(n)])
+    ppg = np.column_stack([ir, ambient, np.zeros(n), g1, g2, g3])
     acc = np.column_stack([
         0.01 * np.sin(2 * np.pi * 1.0 * t),
         0.02 * np.cos(2 * np.pi * 0.5 * t),
@@ -513,7 +670,9 @@ def test_s03_feature_pool_source_keys_are_stage2_ir_free_even_with_acc():
     ])
 
     pool = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
-    window_features = s03.extract_window_features(ppg, fs=fs, acc_window=acc)
+    window_features = s03.extract_window_features(
+        ppg, fs=fs, acc_window=acc, ppg_config=0
+    )
 
     assert not [name for name in pool if s03.is_stage2_ir_feature(name)]
     assert not [name for name in window_features if s03.is_stage2_ir_feature(name)]

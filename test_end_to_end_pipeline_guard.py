@@ -28,7 +28,8 @@ def _write_synthetic_grouped_h5(dataset_dir):
         for rec in range(40):
             label = 1 if rec % 2 == 0 else 0
             grp = f.create_group(f"record_{rec:02d}_{label}")
-            grp.create_dataset("ppg_config", data=np.array(65, dtype=np.int32))
+            grp.create_dataset("frequency", data=np.array(100, dtype=np.int32))
+            grp.create_dataset("ppg_config", data=np.array(2, dtype=np.int32))
             for w in window_order:
                 child = grp.create_group(f"rec{rec:02d}_w{w}_{label}")
                 ppg = np.zeros((n_channels, n_time), dtype=np.float32)
@@ -180,10 +181,11 @@ def test_s08_synthetic_grouped_h5_smoke_exports_consistent_deploy_artifacts(tmp_
 
     script_path = artifact_dir / "deploy_feature_extractor.py"
     script = script_path.read_text(encoding="utf-8")
-    assert "from s03_extract_feature_pool import extract_window_features" in script
-    assert "S03_SOURCE_DIR" in script
-    assert "def _preprocess(" not in script
-    assert "def _fft_metrics(" not in script
+    assert "from s03_extract_feature_pool" not in script
+    assert "S03_SOURCE_DIR" not in script
+    assert "sys.path.insert" not in script
+    assert "def preprocess_signal(" in script
+    assert "def _fft_shape_features(" in script
 
     spec = importlib.util.spec_from_file_location("deploy_feature_extractor_smoke", script_path)
     module = importlib.util.module_from_spec(spec)

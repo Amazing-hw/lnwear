@@ -57,7 +57,10 @@ def test_s02_default_min_duration_matches_3s_decision_window(monkeypatch):
     monkeypatch.setattr(s02, "load_ppg", lambda _sample: ppg)
 
     df = s02.extract_stage1_windows(
-        [{"sample_name": "three_second_sample", "h5_file": "x.h5", "target": 1}],
+        [{
+            "sample_name": "three_second_sample", "h5_file": "x.h5",
+            "target": 1, "frequency": 100,
+        }],
         n_workers=1,
     )
 
@@ -78,7 +81,10 @@ def test_stage2_training_extraction_uses_all_windows_independent_of_stage1(monke
     ppg = np.zeros((3, 300, 6), dtype=float)
     ppg[:, :, 0] = 2.0e6
     ppg[:, :, 1] = 1.9e6
-    sample = {"sample_name": "ambient_near_ir", "h5_file": "synthetic.h5", "target": 1}
+    sample = {
+        "sample_name": "ambient_near_ir", "h5_file": "synthetic.h5",
+        "target": 1, "frequency": 25, "ppg_config": 0,
+    }
 
     monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
     monkeypatch.setattr(s03, "load_acc", lambda _sample: None)
@@ -91,8 +97,6 @@ def test_stage2_training_extraction_uses_all_windows_independent_of_stage1(monke
             {},
         ),
     )
-    monkeypatch.setattr(s03, "detect_green_mode", lambda _ppg: 1)
-
     rows = s03._extract_rows_for_sample(
         sample,
         dc_threshold=1.0e12,

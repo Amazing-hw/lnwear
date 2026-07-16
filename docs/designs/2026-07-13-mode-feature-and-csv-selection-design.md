@@ -1,13 +1,15 @@
 # Mode Feature and CSV Manual Selection Design
 
+> Historical note: `mode` now equals explicit H5 `ppg_config`; signal-based mode detection has been removed.
+
 ## Goal
 
-Allow the detected acquisition `mode` to participate in the governed Stage2 feature ranking and final manual selection, and replace the XLSX manual-selection workflow with a CSV-only workflow.
+Allow the acquisition-configuration feature `mode` to participate in the governed Stage2 feature ranking and final manual selection, and replace the XLSX manual-selection workflow with a CSV-only workflow.
 
 ## Feature contract
 
 - Add integer `mode` (0/1/2) to the governed feature catalog as an acquisition-context feature.
-- Keep the existing value produced by `detect_green_mode`; do not one-hot encode it.
+- Source the scalar value directly from H5 `ppg_config`; do not one-hot encode it.
 - Include it in ranking, selection, training, model fingerprints, deployment order, and C parity whenever selected.
 - Mark it as scale-independent, non-FFT, constant-time, and expose an explicit shortcut/generalization risk flag in its catalog metadata and documentation.
 - Continue reporting `mode` as row metadata where useful; being metadata no longer excludes it from the model candidate surface.

@@ -6,7 +6,8 @@
 
 输入支持两种形态：
 - 3D 预切窗 PPG：直接逐个使用 H5 中已有窗口，不再二次滑窗。
-- 连续时序 PPG：独立降采样到 25Hz，再按 5s/1s 滑窗（可显式切到 3s）。
+- 连续时序 PPG：按 H5 `frequency` 判断；100Hz 降到 25Hz，25Hz 直接使用，
+  再按 5s/1s 滑窗（可显式切到 3s）。
 - grouped-window H5：一个 record 下多个窗口 group，窗口名末尾为 *_w20_1；
   读取时按 w 后数字排序，label 来自最后一段。
 
@@ -14,10 +15,9 @@
 1. 读取 artifacts/splits.json
 2. 读取 artifacts/stage1_threshold.json
 3. 对全部合法样本/窗口提取 5s/25Hz Stage2 特征；Stage1 仅独立统计，不过滤 Stage2
+   读入并排序后固定删除每条数据的前三个和后三个窗口。
 4. 复用原始 H5 读取方式
-5. 复用原始绿光通道构建方式：
-   - mode=1: ch3/ch4/ch5 已表示三个中心对称光区
-   - mode=2: 原始分组通道先按光区平均，再归一化为三个中心对称光区
+5. 只按 H5 `ppg_config` 构建三个固定物理光区，不做信号方差判断。
 6. 模型候选使用与部署一致的短窗预处理：有限值替换、孤立毛刺修复、
    0.8s 滚动中位数去趋势；仅当 round(0.04*fs)>=2 时做短窗均值平滑。
    文件内保留的旧研究辅助函数不属于当前 126 项受治理候选的提取链路。
@@ -61,7 +61,8 @@ STAGE1_PRIMITIVE_SEC = 1.0
 STAGE1_DECISION_SEC = 3.0
 STAGE1_FS = 5
 STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
-DEFAULT_SKIP_INITIAL_WINDOWS = 3
+DEFAULT_SKIP_INITIAL_WINDOWS = 0
+EDGE_WINDOW_TRIM = 3
 DEFAULT_USE_STAGE2_IR = False
 COMMERCIAL_8_FEATURE_NAMES = [
     "GREEN_CORR",
@@ -75,6 +76,14 @@ COMMERCIAL_8_FEATURE_NAMES = [
 ]
 
 WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
+
+
+def trim_ordered_windows(items):
+    """Drop the first and last three ordered windows immediately after loading."""
+    if len(items) <= 2 * EDGE_WINDOW_TRIM:
+        return items[0:0] if isinstance(items, np.ndarray) else []
+    trimmed = items[EDGE_WINDOW_TRIM:-EDGE_WINDOW_TRIM]
+    return trimmed if isinstance(items, np.ndarray) else list(trimmed)
 
 
 def apply_stage2_ir_policy(ir, use_stage2_ir=DEFAULT_USE_STAGE2_IR):
@@ -314,7 +323,7 @@ def _sorted_grouped_window_items(group):
             continue
         window_index, label = parsed
         items.append((window_index, label, child_name, child))
-    return sorted(items, key=lambda item: item[0])
+    return trim_ordered_windows(sorted(items, key=lambda item: item[0]))
 
 
 def load_grouped_window_metadata(sample):
@@ -324,10 +333,11 @@ def load_grouped_window_metadata(sample):
     labels = sample.get("window_labels")
     names = sample.get("window_names")
     if indices is not None and labels is not None:
+        positions = trim_ordered_windows(list(range(len(indices))))
         return {
-            "window_indices": [int(x) for x in indices],
-            "window_labels": [int(x) for x in labels],
-            "window_names": [str(x) for x in names] if names is not None else None,
+            "window_indices": [int(indices[i]) for i in positions],
+            "window_labels": [int(labels[i]) for i in positions],
+            "window_names": [str(names[i]) for i in positions] if names is not None else None,
         }
     with h5py.File(sample["h5_file"], "r") as f:
         items = _sorted_grouped_window_items(f[sample["sample_name"]])
@@ -354,6 +364,8 @@ def load_ppg(sample):
             ppg = np.stack(windows, axis=0)
         else:
             ppg = normalize_ppg_array(grp["ppg"][:])
+            if is_prewindowed_signal(ppg):
+                ppg = trim_ordered_windows(ppg)
     return ppg
 
 
@@ -378,12 +390,35 @@ def load_acc(sample):
         if "acc" not in grp:
             return None
         acc = normalize_acc_array(grp["acc"][:])
+        if is_prewindowed_signal(acc):
+            acc = trim_ordered_windows(acc)
     return acc
 
+def get_sample_frequency(sample):
+    """Return the validated H5 sampling frequency recorded by s01."""
+    try:
+        frequency = int(sample["frequency"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("sample frequency metadata is missing or invalid") from exc
+    if frequency not in {25, 100}:
+        raise ValueError(f"sample frequency must be 25 or 100, got {frequency}")
+    return frequency
+
+
+def get_sample_ppg_config(sample):
+    """Return the validated H5 green-channel configuration recorded by s01."""
+    try:
+        ppg_config = int(sample["ppg_config"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("sample ppg_config metadata is missing or invalid") from exc
+    if ppg_config not in {0, 1, 2}:
+        raise ValueError(f"sample ppg_config must be 0, 1, or 2, got {ppg_config}")
+    return ppg_config
+
+
 def _is_25hz_sample(sample):
-    """检测样本是否已经是 25Hz 原生数据（名称含 sleep_25hz）。"""
-    name = sample.get("sample_name", "") if isinstance(sample, dict) else str(sample)
-    return "sleep_25hz" in name.lower()
+    """Compatibility helper backed only by explicit H5 frequency metadata."""
+    return get_sample_frequency(sample) == 25
 def stage1_ambient_check(ppg, ambient_ratio_threshold=0.8):
     """Stage1 环境光检查: median(ambient) / median(ir) < threshold。
 
@@ -496,51 +531,15 @@ def stage1_sample_pass(ppg, dc_threshold, ac_dc_threshold, ppg_fs=100):
 # 绿光通道构建逻辑
 # =========================================================
 
-def detect_green_mode(ppg):
+def get_channels_from_window(window, ppg_config):
     """
-    直接复用你原来的模式识别逻辑。
+    根据 H5 ppg_config 统一输出三个固定物理光区：
+    - 0: g1=ch3, g2=ch4, g3=ch5
+    - 1: g1=(ch3+ch9)/2, g2=(ch4+ch10)/2, g3=(ch5+ch11)/2
+    - 2: g1=(ch6+ch9+ch12)/3, g2=(ch7+ch10+ch13)/3,
+         g3=(ch8+ch11+ch14)/3
 
-    if mode1_var > mode2_var and mode1_var > 1e6:
-        mode = 1
-    else:
-        mode = 2
-    """
-    if is_prewindowed_signal(ppg):
-        ppg = flatten_prewindowed_signal(ppg)
-    ppg = np.asarray(ppg, dtype=np.float64)
-    if ppg.shape[1] >= 6:
-        var_ch0 = np.var(finite_signal(ppg[:, 0]))
-        var_ch3 = np.var(finite_signal(ppg[:, 3]))
-        var_ch4 = np.var(finite_signal(ppg[:, 4]))
-        var_ch5 = np.var(finite_signal(ppg[:, 5]))
-
-        mode1_var = (var_ch3 + var_ch4 + var_ch5) / 3.0
-        mode2_var = var_ch0
-
-        if mode1_var > mode2_var and mode1_var > 1e6:
-            return 1
-        else:
-            return 2
-
-    return 2
-
-def get_channels_from_window(window, mode):
-    """
-    通道选择逻辑：
-    
-    IR: ch0
-    
-    Ambient: ch1（如果没有则退化为ch0）
-    
-    绿光（统一输出三个固定物理光区；g1/g2/g3 顺序跨配置保持稳定）：
-        mode=1 且通道数>=6:
-            g1=ch3, g2=ch4, g3=ch5（三个光区已直接给出）
-        mode=2 且通道数>=16:
-            g1=(ch6+ch9+ch12)/3
-            g2=(ch7+ch10+ch13)/3
-            g3=(ch8+ch11+ch14)/3
-        否则:
-            ch2作为绿光，退化为g1=g2=g3
+    IR 固定为 ch0，Ambient 固定为 ch1。通道编号为零基索引。
     """
     ir = window[:, 0]
 
@@ -549,27 +548,31 @@ def get_channels_from_window(window, mode):
     else:
         ambient = window[:, 0]
 
-    if mode == 0 and window.shape[1] >= 5:
-        g1 = window[:, 2]
-        g2 = window[:, 3]
-        g3 = window[:, 4]
-    elif mode == 1 and window.shape[1] >= 6:
+    try:
+        ppg_config = int(ppg_config)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("ppg_config must be 0, 1, or 2") from exc
+
+    if ppg_config == 0 and window.shape[1] >= 6:
         g1 = window[:, 3]
         g2 = window[:, 4]
         g3 = window[:, 5]
-    elif mode == 2 and window.shape[1] >= 16:
+    elif ppg_config == 1 and window.shape[1] >= 12:
+        g1 = (window[:, 3] + window[:, 9]) / 2.0
+        g2 = (window[:, 4] + window[:, 10]) / 2.0
+        g3 = (window[:, 5] + window[:, 11]) / 2.0
+    elif ppg_config == 2 and window.shape[1] >= 15:
         g1 = (window[:, 6] + window[:, 9] + window[:, 12]) / 3.0
         g2 = (window[:, 7] + window[:, 10] + window[:, 13]) / 3.0
         g3 = (window[:, 8] + window[:, 11] + window[:, 14]) / 3.0
     else:
-        if window.shape[1] >= 3:
-            g = window[:, 2]
-        else:
-            g = window[:, 0]
-
-        g1 = g
-        g2 = g
-        g3 = g
+        required = {0: 6, 1: 12, 2: 15}.get(ppg_config)
+        if required is None:
+            raise ValueError(f"ppg_config must be 0, 1, or 2, got {ppg_config}")
+        raise ValueError(
+            f"ppg_config={ppg_config} requires at least {required} PPG channels, "
+            f"got {window.shape[1]}"
+        )
 
     return ir, ambient, g1, g2, g3
 
@@ -3349,8 +3352,15 @@ def extract_stage2_window(
 
 
 def extract_window_features(ppg_window, fs=25.0, acc_window=None,
-                            use_stage2_ir=DEFAULT_USE_STAGE2_IR, mode=None):
-    resolved_mode = detect_green_mode(ppg_window) if mode is None else int(mode)
+                            use_stage2_ir=DEFAULT_USE_STAGE2_IR, mode=None,
+                            ppg_config=None):
+    if ppg_config is None:
+        ppg_config = mode
+    elif mode is not None and int(mode) != int(ppg_config):
+        raise ValueError("mode and ppg_config disagree")
+    if ppg_config is None:
+        raise ValueError("ppg_config is required; automatic mode detection is disabled")
+    resolved_mode = int(ppg_config)
     features, _, _ = extract_stage2_window(
         ppg_window,
         mode=resolved_mode,
@@ -3400,6 +3410,8 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
     try:
         ppg = load_ppg(sample)
         acc = load_acc(sample)
+        sample_frequency = get_sample_frequency(sample)
+        mode = get_sample_ppg_config(sample)
     except Exception as e:
         print(f"读取失败 {sample.get('sample_name')}: {e}")
         return []
@@ -3408,9 +3420,8 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
         window_meta = load_grouped_window_metadata(sample)
         window_indices = list(window_meta.get("window_indices") or []) if window_meta else []
         window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
-        native_25hz = _is_25hz_sample(sample) or int(ppg.shape[1]) == int(round((window_len / max(fs, 1)) * FEATURE_FS))
+        native_25hz = sample_frequency == FEATURE_FS
         ppg_src_fs = 25 if native_25hz else 100
-        mode = detect_green_mode(ppg)
         rows = []
         first_idx = max(0, int(skip_initial_windows))
         for win_idx in range(first_idx, ppg.shape[0]):
@@ -3462,14 +3473,14 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
                 continue
         return rows
 
-    if len(ppg) < window_len:
+    source_window_len = int(round((window_len / max(fs, 1)) * sample_frequency))
+    if len(ppg) < source_window_len:
         return []
 
     # 检测是否 25Hz 原生数据
-    native_25hz = _is_25hz_sample(sample)
+    native_25hz = sample_frequency == FEATURE_FS
     ppg_src_fs = 25 if native_25hz else 100
 
-    mode = detect_green_mode(ppg)
     sample_target = int(sample.get("target", 0))
 
     # 降采样至 25Hz（原生 25Hz 直接使用）
@@ -3502,8 +3513,12 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
         return []
 
     rows = []
-    first_start = max(0, int(skip_initial_windows)) * stride_25
-    for start in range(first_start, len(ppg_25) - win_25 + 1, stride_25):
+    starts = trim_ordered_windows(
+        list(range(0, len(ppg_25) - win_25 + 1, stride_25))
+    )
+    if skip_initial_windows:
+        starts = starts[max(0, int(skip_initial_windows)):]
+    for start in starts:
         window = ppg_25[start:start + win_25, :]
         try:
             acc_seg = None
@@ -3665,7 +3680,7 @@ def main(args=None):
                         help="Stage2 窗口秒数：3s (75点@25Hz) 或 5s (125点@25Hz)")
     parser.add_argument("--stride_sec", type=int, default=1)
     parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,
-                        help="drop this many leading Stage2 windows per sample")
+                        help="optional extra leading-window skip after automatic [3:-3] trimming")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction,
                         default=DEFAULT_USE_STAGE2_IR,
                         help="legacy compatibility flag; Stage2 model features are always ambient/green/ACC only")

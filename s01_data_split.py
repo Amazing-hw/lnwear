@@ -7,7 +7,7 @@
 主要改进：
 1. H5 扫描按文件并行（IO bound）
 2. 删除 line 99 的不可达死代码
-3. 不再依赖 ppg_config；只按 PPG 结构和窗口命名判断可用样本。
+3. 严格读取 frequency 与 ppg_config；缺失、非法或分组内不一致时跳过并统计原因。
 4. 支持 grouped-window H5：一个 record 下多个 *_w20_1 窗口 group，
    按 w 编号排序并保留窗口 label 序列。
 5. 切分逻辑、输出 schema 向后兼容
@@ -28,6 +28,16 @@ from sklearn.model_selection import train_test_split
 
 
 WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
+VALID_FREQUENCIES = {25, 100}
+VALID_PPG_CONFIGS = {0, 1, 2}
+FILTER_REASON_KEYS = (
+    "missing_frequency",
+    "invalid_frequency",
+    "missing_ppg_config",
+    "invalid_ppg_config",
+    "inconsistent_metadata",
+    "channel_count",
+)
 
 
 def _env_flag(name):
@@ -71,13 +81,67 @@ def parse_window_name(name):
     return int(match.group("index")), int(match.group("label"))
 
 
-def _read_ppg_config(group, fallback=None):
-    if "ppg_config" not in group:
-        return fallback
+def _empty_filter_counts():
+    return {key: 0 for key in FILTER_REASON_KEYS}
+
+
+def _read_scalar_int(group, field):
+    if field not in group:
+        return None
     try:
-        return int(group["ppg_config"][()])
-    except (TypeError, ValueError):
-        return fallback
+        return int(group[field][()])
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _record_filtered(filtered, h5_file, sample_name, reason, detail=""):
+    filtered[reason] += 1
+    suffix = f": {detail}" if detail else ""
+    print(f"[SKIP] h5={h5_file}, sample={sample_name}, reason={reason}{suffix}")
+
+
+def _validate_standard_metadata(group):
+    frequency = _read_scalar_int(group, "frequency")
+    ppg_config = _read_scalar_int(group, "ppg_config")
+    if "frequency" not in group:
+        return None, None, "missing_frequency"
+    if frequency not in VALID_FREQUENCIES:
+        return None, None, "invalid_frequency"
+    if "ppg_config" not in group:
+        return None, None, "missing_ppg_config"
+    if ppg_config not in VALID_PPG_CONFIGS:
+        return None, None, "invalid_ppg_config"
+    return int(frequency), int(ppg_config), None
+
+
+def _resolve_grouped_field(parent, children, field, valid_values):
+    missing_reason = f"missing_{field}"
+    invalid_reason = f"invalid_{field}"
+    parent_has_value = field in parent
+    parent_value = _read_scalar_int(parent, field) if parent_has_value else None
+    if parent_has_value and parent_value not in valid_values:
+        return None, invalid_reason
+
+    child_values = []
+    for child in children:
+        if field not in child:
+            if not parent_has_value:
+                return None, missing_reason
+            continue
+        value = _read_scalar_int(child, field)
+        if value not in valid_values:
+            return None, invalid_reason
+        child_values.append(int(value))
+
+    if parent_has_value:
+        if any(value != parent_value for value in child_values):
+            return None, "inconsistent_metadata"
+        return int(parent_value), None
+    if not child_values:
+        return None, missing_reason
+    if len(set(child_values)) != 1:
+        return None, "inconsistent_metadata"
+    return int(child_values[0]), None
 
 
 def _sample_target_from_window_labels(labels):
@@ -89,7 +153,6 @@ def _sample_target_from_window_labels(labels):
 
 
 def _scan_grouped_window_sample(h5_file, sample_name, grp, filtered):
-    parent_cfg = _read_ppg_config(grp)
     windows = []
     for child_name in grp.keys():
         parsed = parse_window_name(child_name)
@@ -98,18 +161,30 @@ def _scan_grouped_window_sample(h5_file, sample_name, grp, filtered):
         child = grp[child_name]
         if not isinstance(child, h5py.Group) or "ppg" not in child:
             continue
-        ppg_cfg = _read_ppg_config(child, fallback=parent_cfg)
         shape = child["ppg"].shape
         if not is_supported_ppg_shape(shape):
             filtered["channel_count"] += 1
             continue
         window_index, label = parsed
-        windows.append((window_index, label, child_name, shape, ppg_cfg))
+        windows.append((window_index, label, child_name, shape, child))
 
     if not windows:
         return None
 
     windows.sort(key=lambda item: item[0])
+    children = [item[4] for item in windows]
+    frequency, reason = _resolve_grouped_field(
+        grp, children, "frequency", VALID_FREQUENCIES
+    )
+    if reason is not None:
+        _record_filtered(filtered, h5_file, sample_name, reason)
+        return None
+    ppg_config, reason = _resolve_grouped_field(
+        grp, children, "ppg_config", VALID_PPG_CONFIGS
+    )
+    if reason is not None:
+        _record_filtered(filtered, h5_file, sample_name, reason)
+        return None
     labels = [int(item[1]) for item in windows]
     shapes = [list(item[3]) for item in windows]
     return {
@@ -117,7 +192,8 @@ def _scan_grouped_window_sample(h5_file, sample_name, grp, filtered):
         "h5_file": h5_file,
         "target": _sample_target_from_window_labels(labels),
         "ppg_shape": [len(windows)] + shapes[0],
-        "ppg_cfg": None if windows[0][4] is None else int(windows[0][4]),
+        "frequency": int(frequency),
+        "ppg_config": int(ppg_config),
         "window_layout": "grouped_windows",
         "window_names": [str(item[2]) for item in windows],
         "window_indices": [int(item[0]) for item in windows],
@@ -132,7 +208,7 @@ def _scan_grouped_window_sample(h5_file, sample_name, grp, filtered):
 def _scan_one_h5(h5_file):
     """单文件扫描。返回 (samples_list, filtered_counts_dict)。"""
     samples = []
-    filtered = {"ppg_cfg": 0, "channel_count": 0}
+    filtered = _empty_filter_counts()
     try:
         with h5py.File(h5_file, "r") as f:
             for sample_name in f.keys():
@@ -151,14 +227,12 @@ def _scan_one_h5(h5_file):
 
                 shape = grp["ppg"].shape
 
-                ppg_cfg = None
-                if "ppg_config" in grp:
-                    try:
-                        ppg_cfg = int(grp["ppg_config"][()])
-                    except (TypeError, ValueError):
-                        pass
                 if not is_supported_ppg_shape(shape):
                     filtered["channel_count"] += 1
+                    continue
+                frequency, ppg_config, reason = _validate_standard_metadata(grp)
+                if reason is not None:
+                    _record_filtered(filtered, h5_file, sample_name, reason)
                     continue
 
                 samples.append({
@@ -166,7 +240,8 @@ def _scan_one_h5(h5_file):
                     "h5_file": h5_file,
                     "target": int(label),
                     "ppg_shape": list(shape),
-                    "ppg_cfg": ppg_cfg,
+                    "frequency": int(frequency),
+                    "ppg_config": int(ppg_config),
                 })
     except OSError as e:
         print(f"读取 {h5_file} 失败: {e}")
@@ -194,14 +269,14 @@ def scan_h5_samples(dataset_dir, n_workers=None):
     n_workers = resolve_n_workers(n_workers, n_items=len(h5_files))
 
     samples = []
-    filtered_count = {"ppg_cfg": 0, "channel_count": 0}
+    filtered_count = _empty_filter_counts()
 
     if n_workers == 1 or len(h5_files) <= 1:
         for h5_file in h5_files:
             s, fc = _scan_one_h5(h5_file)
             samples.extend(s)
-            filtered_count["ppg_cfg"] += fc["ppg_cfg"]
-            filtered_count["channel_count"] += fc["channel_count"]
+            for key in FILTER_REASON_KEYS:
+                filtered_count[key] += fc[key]
     else:
         pool_kwargs = {"max_workers": n_workers}
         mp_ctx = multiprocessing_context_from_env()
@@ -214,10 +289,10 @@ def scan_h5_samples(dataset_dir, n_workers=None):
                     s, fc = fut.result()
                 except Exception as e:
                     print(f"扫描 {futures[fut]} 异常: {e}")
-                    s, fc = [], {"ppg_cfg": 0, "channel_count": 0}
+                    s, fc = [], _empty_filter_counts()
                 samples.extend(s)
-                filtered_count["ppg_cfg"] += fc["ppg_cfg"]
-                filtered_count["channel_count"] += fc["channel_count"]
+                for key in FILTER_REASON_KEYS:
+                    filtered_count[key] += fc[key]
                 if len(futures) >= 10 and (done_count % max(1, len(futures) // 10) == 0 or done_count == len(futures)):
                     print(f"  s01 progress: {done_count}/{len(futures)} files", flush=True)
 
@@ -225,6 +300,10 @@ def scan_h5_samples(dataset_dir, n_workers=None):
         print(f"过滤样本: channel!=40: {filtered_count['channel_count']}")
 
     # 保证并行下样本顺序的确定性（按 h5_file + sample_name 排序）
+    for reason in FILTER_REASON_KEYS[:-1]:
+        if filtered_count[reason] > 0:
+            print(f"filtered samples: {reason}={filtered_count[reason]}")
+
     samples.sort(key=lambda s: (s["h5_file"], s["sample_name"]))
     return samples
 

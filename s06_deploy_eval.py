@@ -46,10 +46,10 @@ from s03_extract_feature_pool import (
     load_ppg,
     load_acc,
     stage1_sample_pass,
-    _is_25hz_sample,
+    get_sample_frequency,
+    get_sample_ppg_config,
     is_prewindowed_signal,
     stage1_ambient_check,
-    detect_green_mode,
     get_channels_from_window,
     is_stage2_ir_feature,
     extract_feature_pool_from_window,
@@ -59,6 +59,7 @@ from s03_extract_feature_pool import (
     extract_acc_green_coupling_features,
     validate_h5_file,
     load_grouped_window_metadata,
+    trim_ordered_windows,
 )
 from stage2_feature_catalog import (
     FEATURE_CATALOG,
@@ -88,7 +89,7 @@ STAGE1_PRIMITIVE_SEC = 1.0
 STAGE1_DECISION_SEC = 3.0
 STAGE1_FS = 5
 STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
-DEFAULT_SKIP_INITIAL_WINDOWS = 3
+DEFAULT_SKIP_INITIAL_WINDOWS = 0
 DEFAULT_USE_STAGE2_IR = False
 
 
@@ -588,9 +589,9 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
     window_meta = load_grouped_window_metadata(base)
     window_indices = list(window_meta.get("window_indices") or []) if window_meta else []
     window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
-    native_25hz = _is_25hz_sample(base) or int(ppg.shape[1]) == int(round(float(window_sec) * FEATURE_FS))
+    native_25hz = get_sample_frequency(base) == FEATURE_FS
     ppg_src_fs = 25 if native_25hz else 100
-    mode = detect_green_mode(ppg)
+    mode = get_sample_ppg_config(base)
     base["mode"] = int(mode)
 
     feats_list = []
@@ -705,7 +706,9 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
     base = {
         "sample_name": sample_name, "target": target,
         "stage1_pass": True,  # streaming mode: always "passed" in the old sense
-        "mode": 0,
+        "frequency": sample.get("frequency"),
+        "ppg_config": sample.get("ppg_config"),
+        "mode": sample.get("ppg_config"),
         "window_probs": [], "window_preds": [], "quality_metas": [],
         "window_ood_scores": [], "stage1_gate_flags": [], "stage2_enabled_flags": [],
         "window_start_sec": [], "window_end_sec": [],
@@ -721,6 +724,11 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
         h5_file = sample.get("h5_file")
         if h5_file is None or sample_name is None:
             base["fallback"] = True; base["fallback_reason"] = "incomplete"; return base
+        frequency = get_sample_frequency(sample)
+        ppg_config = get_sample_ppg_config(sample)
+        base["frequency"] = int(frequency)
+        base["ppg_config"] = int(ppg_config)
+        base["mode"] = int(ppg_config)
         ok, err = validate_h5_file(h5_file, sample_name)
         if not ok:
             base["fallback"] = True; base["fallback_reason"] = f"h5: {err}"; return base
@@ -738,10 +746,10 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
 
     # 3. 信号降采样 (25Hz 原生数据跳过)
     try:
-        mode = detect_green_mode(ppg)
+        mode = get_sample_ppg_config(sample)
         base["mode"] = int(mode)
 
-        native_25hz = _is_25hz_sample(sample)
+        native_25hz = get_sample_frequency(sample) == FEATURE_FS
         ppg_src_fs = 25 if native_25hz else 100
 
         if native_25hz:
@@ -778,8 +786,10 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
         window_end_sec = []
         last_s1_step = -1
 
-        first_step = max(0, int(skip_initial_windows))
-        for step in range(first_step, max(0, n_steps_s2)):
+        window_steps = trim_ordered_windows(list(range(max(0, n_steps_s2))))
+        if skip_initial_windows:
+            window_steps = window_steps[max(0, int(skip_initial_windows)):]
+        for step in window_steps:
             # Stage1: IR @5Hz, 3s窗, 1s stride
             s2_start = step * stride_25
             target_s1_step = int(np.floor(s2_start / FEATURE_FS + 1e-9))
@@ -2145,7 +2155,10 @@ def predict_sample(sample, model, scaler, selected_features,
         fill_values = {}
     ppg = load_ppg(sample)
 
-    if not stage1_sample_pass(ppg, dc_threshold, ac_dc_threshold):
+    ppg_frequency = get_sample_frequency(sample)
+    if not stage1_sample_pass(
+        ppg, dc_threshold, ac_dc_threshold, ppg_fs=ppg_frequency
+    ):
         return {
             "sample_name": sample["sample_name"],
             "target": int(sample["target"]),
@@ -2155,7 +2168,7 @@ def predict_sample(sample, model, scaler, selected_features,
             "window_preds": [],
         }
 
-    mode = detect_green_mode(ppg)
+    mode = get_sample_ppg_config(sample)
     win = window_sec * fs
     stride = stride_sec * fs
 
@@ -2949,7 +2962,7 @@ def main(args=None):
     parser.add_argument("--window_sec", type=int, default=5)
     parser.add_argument("--stride_sec", type=int, default=1)
     parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,
-                        help="drop this many leading Stage2 windows per sample")
+                        help="optional extra leading-window skip after automatic [3:-3] trimming")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction,
                         default=None,
                         help="whether Stage2 feature extraction uses IR channel values; defaults to model bundle metadata")
