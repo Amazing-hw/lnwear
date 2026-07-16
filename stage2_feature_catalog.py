@@ -6,7 +6,7 @@ from collections import OrderedDict
 from typing import Iterable, Mapping
 
 
-FEATURE_POOL_VERSION = "stage2_interpretable_v7"
+FEATURE_POOL_VERSION = "stage2_interpretable_v8"
 
 COMMERCIAL_8_FEATURE_MAPPING = OrderedDict([
     ("GREEN_CORR", "GREEN_CORR"),
@@ -494,6 +494,70 @@ for _name, _group, _source, _formula, _ops_list, _unit, _bounded, _cost, _risks 
         risk_flags=_risks,
     )
 
+
+_POSITION_RISK_FLAGS = (
+    "fixed_position",
+    "device_shortcut",
+    "cross_mode_generalization",
+)
+
+for _suffix, _formula_template, _unit, _bounded, _operators, _preprocessing in [
+    (
+        "DC_CONTRAST",
+        "(zone{zone}_dc-median(zone_dc))/guarded_sum_abs(zone{zone}_dc,median(zone_dc))",
+        "contrast",
+        [-1.0, 1.0],
+        _ops("median", "absolute", "safe_ratio"),
+        "contact_raw",
+    ),
+    (
+        "AC_CONTRAST",
+        "(zone{zone}_ac-median(zone_ac))/guarded_sum(zone{zone}_ac,median(zone_ac))",
+        "contrast",
+        [-1.0, 1.0],
+        _ops("sum_squares", "sqrt", "median", "safe_ratio"),
+        "pulse_detrended",
+    ),
+    (
+        "AC_DC_RATIO",
+        "RMS(zone{zone}_pulse)/guarded_abs(median(zone{zone}_raw))",
+        "ratio",
+        None,
+        _ops("sum_squares", "sqrt", "median", "absolute", "safe_ratio"),
+        "pulse_detrended",
+    ),
+    (
+        "PERIODICITY",
+        "maximum normalized autocorrelation of zone{zone}_pulse over 40-180 bpm lags",
+        "correlation",
+        [-1.0, 1.0],
+        _ops("autocorrelation", "argmax"),
+        "pulse_detrended",
+    ),
+    (
+        "AMB_ABS_CORR",
+        "abs(corr(zone{zone}_pulse,ambient_pulse))",
+        "correlation",
+        [0.0, 1.0],
+        _ops("correlation", "absolute"),
+        "cross_signal",
+    ),
+]:
+    for _zone in (1, 2, 3):
+        _add(
+            f"GZONE{_zone}_{_suffix}",
+            group="green_position",
+            preprocessing=_preprocessing,
+            formula=_formula_template.format(zone=_zone),
+            c_operators=_operators,
+            unit=_unit,
+            signal_source=f"green_zone{_zone}",
+            bounded_range=_bounded,
+            scale_dependent=False,
+            deployment_cost=1.5 if _suffix == "PERIODICITY" else 1.0,
+            risk_flags=_POSITION_RISK_FLAGS,
+        )
+
 for _name, _formula, _preprocessing in [
     ("corr_Ambient_Gmean", "corr(ambient_raw, green_raw)", "contact_raw"),
     ("GREEN_AMB_BP_CORR", "corr(green_pulse, ambient_pulse)", "cross_signal"),
@@ -668,7 +732,7 @@ def validate_candidate_names(names: Iterable[str]) -> None:
         )
 
 
-if not 80 <= len(FEATURE_CATALOG) <= 120:
+if not 80 <= len(FEATURE_CATALOG) <= 140:
     raise RuntimeError(f"interpretable Stage2 catalog size out of contract: {len(FEATURE_CATALOG)}")
 
 for _commercial_name, _candidate_name in COMMERCIAL_8_FEATURE_MAPPING.items():

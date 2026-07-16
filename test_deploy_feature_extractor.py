@@ -290,6 +290,8 @@ def test_export_feature_contract_files_and_golden_raw_values(tmp_path):
         "G_PAIR_PERIODICITY_MEDIAN",
         "G_AMB_RESIDUAL_PAIR_CORR_MAX",
         "G_ZONE_PHASE_CONCENTRATION",
+        "GZONE1_DC_CONTRAST",
+        "GZONE3_AMB_ABS_CORR",
         "ACC_REL_MOTION",
     ]
     model = XGBClassifier(

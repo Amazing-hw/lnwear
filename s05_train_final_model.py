@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import logging
 import joblib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
 from pathlib import Path
 
@@ -275,6 +276,40 @@ def get_inner_n_jobs(default=1):
         return max(1, int(os.environ.get("WL_INNER_N_JOBS", default)))
     except (TypeError, ValueError):
         return max(1, int(default))
+
+
+def _env_flag(name):
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def resolve_model_search_workers(n_workers=None, n_items=None, cap=4):
+    """Resolve bounded outer-search concurrency while preserving a serial escape hatch."""
+    if _env_flag("WL_FORCE_SERIAL"):
+        return 1
+    if n_workers is None:
+        n_workers = 1
+    try:
+        resolved = max(1, min(int(n_workers), int(cap)))
+    except (TypeError, ValueError):
+        resolved = 1
+    if n_items is not None:
+        resolved = min(resolved, max(1, int(n_items)))
+    return resolved
+
+
+def ordered_thread_map(fn, items, n_workers=1):
+    """Evaluate independent jobs concurrently and return results in input order."""
+    items = list(items)
+    workers = resolve_model_search_workers(n_workers, n_items=len(items))
+    if workers == 1 or len(items) <= 1:
+        return [fn(item) for item in items]
+
+    results = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(fn, item): index for index, item in enumerate(items)}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return results
 
 
 def group_split_arrays(group_df):
@@ -1559,10 +1594,15 @@ def score_fixed_params_with_train_cv(args, X_train, y_train, groups, params,
 def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y_select,
                                              scale_pos_weight=1.0, sample_weight=None):
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
-    records = []
-    models = []
-    logger.info("model_search enabled: evaluating %d XGBoost candidates", len(grid))
-    for idx, params in enumerate(grid, 1):
+    n_workers = resolve_model_search_workers(
+        getattr(args, "model_search_n_workers", 1), n_items=len(grid))
+    logger.info(
+        "model_search enabled: evaluating %d XGBoost candidates with %d outer workers",
+        len(grid), n_workers,
+    )
+
+    def evaluate_candidate(item):
+        idx, params = item
         candidate = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
         metrics = eval_model(candidate, X_select, y_select, threshold=0.5)
         selection_metrics = evaluate_accuracy_first_threshold(candidate, X_select, y_select)
@@ -1574,7 +1614,7 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
             fp_cost=args.model_search_fp_cost,
             size_cost=args.model_search_size_cost,
         )
-        record = {
+        return {
             "rank_input_order": int(idx),
             "eligible": bool(score["eligible"]),
             "score": float(score["score"]),
@@ -1591,8 +1631,12 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
             "metrics": metrics,
             "params": params,
         }
-        records.append(record)
-        models.append(candidate)
+
+    records = ordered_thread_map(
+        evaluate_candidate,
+        list(enumerate(grid, 1)),
+        n_workers=n_workers,
+    )
 
     best = choose_accuracy_first_model_search_record(
         records,
@@ -1603,8 +1647,8 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
             f"model_search found no candidate under max_model_nodes={args.max_model_nodes}. "
             "Relax --max_model_nodes or shrink the search grid."
         )
-    best_index = int(best["rank_input_order"]) - 1
-    best_model = models[best_index]
+    best_model = train_xgb_with_params(
+        best["params"], X_train, y_train, sample_weight=sample_weight)
 
     records.sort(key=lambda r: (
         not r["eligible"],
@@ -1622,6 +1666,7 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
         "accuracy_tolerance": float(args.model_search_accuracy_tolerance),
         "selection_policy": "accuracy_first_size_second",
         "grid_size": int(len(grid)),
+        "outer_workers": int(n_workers),
         "best": _json_safe_model_search_record(best),
         "top_candidates": [_json_safe_model_search_record(r) for r in records[:20]],
     }, records
@@ -1645,14 +1690,18 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         cv_meta = {"fallback": True, "reason": "empty_cv_splits", "n_splits": 1, "n_repeats": 1}
 
     stage_train_idx, stage_valid_idx = cv_splits[0]
-    stage_records = []
+    n_workers = resolve_model_search_workers(
+        getattr(args, "model_search_n_workers", 1), n_items=len(grid))
     logger.info(
         "model_search staged_group_cv: stage A evaluating %d sampled candidates "
-        "(total_combinations=%d)",
+        "(total_combinations=%d, outer_workers=%d)",
         len(grid),
         total_combinations,
+        n_workers,
     )
-    for idx, params in enumerate(grid, 1):
+
+    def evaluate_stage_a_candidate(item):
+        idx, params = item
         sw_stage = sample_weight[stage_train_idx] if sample_weight is not None else None
         candidate = train_xgb_with_params(
             params, X_train[stage_train_idx], y_train[stage_train_idx], sample_weight=sw_stage)
@@ -1669,7 +1718,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
             fp_cost=args.model_search_fp_cost,
             size_cost=args.model_search_size_cost,
         )
-        stage_records.append({
+        return {
             "rank_input_order": int(idx),
             "eligible": bool(score["eligible"]),
             "score": float(score["score"]),
@@ -1685,7 +1734,13 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
             "chosen_reason": "",
             "metrics": selection_metrics,
             "params": params,
-        })
+        }
+
+    stage_records = ordered_thread_map(
+        evaluate_stage_a_candidate,
+        list(enumerate(grid, 1)),
+        n_workers=n_workers,
+    )
 
     stage_records.sort(key=lambda r: (
         not r["eligible"],
@@ -1706,10 +1761,10 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         len(cv_splits),
     )
 
-    cv_records = []
-    final_models = []
     fold_count = len(cv_splits)
-    for idx, params in enumerate(stage2_params, 1):
+
+    def evaluate_stage_b_candidate(item):
+        idx, params = item
         fold_metrics = []
         for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits, 1):
             sw_fold = sample_weight[train_idx] if sample_weight is not None else None
@@ -1723,7 +1778,6 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         cv_summary = summarize_cv_metrics(fold_metrics)
         final_model = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
         final_total_nodes = count_xgb_nodes(final_model)
-        final_models.append(final_model)
         mean_accuracy = float(cv_summary.get("mean_cv_accuracy") or 0.0)
         mean_fp_rate = float(cv_summary.get("mean_cv_fp_rate") or 0.0)
         size_ratio = (
@@ -1769,7 +1823,14 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         }
         record.update(cv_summary)
         record["cv_folds_completed"] = int(min(record["cv_folds_completed"], fold_count))
-        cv_records.append(record)
+        return record
+
+    cv_records = ordered_thread_map(
+        evaluate_stage_b_candidate,
+        list(enumerate(stage2_params, 1)),
+        n_workers=resolve_model_search_workers(
+            getattr(args, "model_search_n_workers", 1), n_items=len(stage2_params)),
+    )
 
     best = choose_cv_model_search_record(
         cv_records,
@@ -1780,7 +1841,8 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
             f"model_search found no candidate under max_model_nodes={args.max_model_nodes}. "
             "Relax --max_model_nodes or shrink the search grid."
         )
-    best_model = final_models[int(best["rank_input_order"]) - 1]
+    best_model = train_xgb_with_params(
+        best["params"], X_train, y_train, sample_weight=sample_weight)
 
     cv_records.sort(key=lambda r: (
         not r["eligible"],
@@ -1807,6 +1869,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         "cv_folds_completed": int(fold_count),
         "random_state": int(args.model_search_random_state),
         "max_candidates": int(args.model_search_max_candidates),
+        "outer_workers": int(n_workers),
         "parameter_space": {
             "total_combinations": int(total_combinations),
             "sampled_grid_size": int(len(grid)),
@@ -2620,6 +2683,8 @@ def main(args=None):
                         help="group-CV repeats for staged_group_cv")
     parser.add_argument("--model_search_random_state", type=int, default=42,
                         help="random seed for deterministic candidate sampling and CV splits")
+    parser.add_argument("--model_search_n_workers", type=int, default=1,
+                        help="parallel outer model candidates; each XGBoost fit defaults to WL_INNER_N_JOBS=1")
     parser.add_argument("--model_search_n_estimators", type=str,
                         default=_model_search_default_csv("n_estimators"),
                         help="comma-separated n_estimators candidates for --model_search")

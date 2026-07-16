@@ -20,7 +20,7 @@
    - mode=2: 原始分组通道先按光区平均，再归一化为三个中心对称光区
 6. 模型候选使用与部署一致的短窗预处理：有限值替换、孤立毛刺修复、
    0.8s 滚动中位数去趋势；仅当 round(0.04*fs)>=2 时做短窗均值平滑。
-   文件内保留的旧研究辅助函数不属于当前 111 项受治理候选的提取链路。
+   文件内保留的旧研究辅助函数不属于当前 126 项受治理候选的提取链路。
 7. 输出特征池 CSV：
    - feature_pool_train.csv
    - feature_pool_valid.csv
@@ -532,7 +532,7 @@ def get_channels_from_window(window, mode):
     
     Ambient: ch1（如果没有则退化为ch0）
     
-    绿光（统一输出三个中心对称光区；g1/g2/g3 不表示绝对方向）：
+    绿光（统一输出三个固定物理光区；g1/g2/g3 顺序跨配置保持稳定）：
         mode=1 且通道数>=6:
             g1=ch3, g2=ch4, g3=ch5（三个光区已直接给出）
         mode=2 且通道数>=16:
@@ -2718,6 +2718,53 @@ def _channel_candidate_features(raw, pulse, prefix, fs, fft_cache):
     ])
 
 
+def _fixed_position_zone_candidates(raw_zones, pulse_zones, ambient_pulse, fs):
+    """Return normalized candidates for the three stable physical green zones."""
+    if len(raw_zones) != 3 or len(pulse_zones) != 3:
+        raise ValueError("fixed-position extraction requires exactly three green zones")
+
+    raw_zones = [finite_signal(zone) for zone in raw_zones]
+    pulse_zones = [finite_signal(zone) for zone in pulse_zones]
+    ambient_pulse = finite_signal(ambient_pulse)
+    zone_dc = np.asarray(
+        [float(np.median(zone)) if len(zone) else 0.0 for zone in raw_zones],
+        dtype=np.float64,
+    )
+    zone_ac = np.asarray(
+        [float(np.sqrt(np.mean(zone ** 2))) if len(zone) else 0.0 for zone in pulse_zones],
+        dtype=np.float64,
+    )
+    median_dc = float(np.median(zone_dc))
+    median_ac = float(np.median(zone_ac))
+
+    features = OrderedDict()
+    for index in range(3):
+        features[f"GZONE{index + 1}_DC_CONTRAST"] = guarded_ratio(
+            zone_dc[index] - median_dc,
+            abs(zone_dc[index]) + abs(median_dc),
+            scale=zone_dc,
+        )
+    for index in range(3):
+        features[f"GZONE{index + 1}_AC_CONTRAST"] = guarded_ratio(
+            zone_ac[index] - median_ac,
+            zone_ac[index] + median_ac,
+            scale=zone_ac,
+        )
+    for index in range(3):
+        features[f"GZONE{index + 1}_AC_DC_RATIO"] = guarded_ratio(
+            zone_ac[index], abs(zone_dc[index]), scale=raw_zones[index]
+        )
+    for index in range(3):
+        features[f"GZONE{index + 1}_PERIODICITY"] = autocorr_periodicity_features(
+            pulse_zones[index], fs
+        )[0]
+    for index in range(3):
+        features[f"GZONE{index + 1}_AMB_ABS_CORR"] = abs(
+            guarded_corr(pulse_zones[index], ambient_pulse)
+        )
+    return features
+
+
 def normalized_spectral_entropy(fft_cache):
     """Normalized entropy of in-band spectral power, finite and bounded [0, 1]."""
     band_spec = fft_cache.get("band_spec")
@@ -3178,6 +3225,12 @@ def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_prep
         float(np.median(pair_spectral_consensus))
         if pair_spectral_consensus else 0.0
     )
+    features.update(_fixed_position_zone_candidates(
+        [g1_raw, g2_raw, g3_raw],
+        [g1_pulse, g2_pulse, g3_pulse],
+        ambient_pulse,
+        fs,
+    ))
 
     ordered_names = [
         name for name in stage2_model_candidate_names()
@@ -3541,6 +3594,7 @@ def extract_features_for_split(samples,
         mp_ctx = multiprocessing_context_from_env()
         if mp_ctx is not None:
             pool_kwargs["mp_context"] = mp_ctx
+        rows_by_sample = [[] for _ in args_list]
         with ProcessPoolExecutor(**pool_kwargs) as ex:
             futures = {ex.submit(_worker_extract, a): i for i, a in enumerate(args_list)}
             total = len(futures)
@@ -3553,9 +3607,11 @@ def extract_features_for_split(samples,
                     sample_name = samples[sample_idx].get("sample_name", f"idx={sample_idx}")
                     print(f"  [WARN] s03 worker failed sample={sample_name}: {e}", flush=True)
                     rows = []
-                all_rows.extend(rows)
+                rows_by_sample[sample_idx] = rows
                 if done_count % max(1, total // 10) == 0 or done_count == total:
                     print(f"  s03 progress: {done_count}/{total} samples", flush=True)
+        for rows in rows_by_sample:
+            all_rows.extend(rows)
 
     return pd.DataFrame(all_rows)
 

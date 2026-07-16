@@ -35,11 +35,138 @@ def test_catalog_exactly_matches_generated_window_candidates():
     expected = catalog.model_candidate_names()
 
     assert s03.STAGE2_FEATURE_POOL_VERSION == catalog.FEATURE_POOL_VERSION
-    assert len(expected) == 111
+    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v8"
+    assert len(expected) == 126
     assert "mode" in expected
     assert list(features) == expected
     assert all(np.isfinite(value) for value in features.values())
     assert not [name for name in expected if s04.feature_to_group(name) == "other"]
+
+
+def test_fixed_position_zone_feature_catalog_contract():
+    import stage2_feature_catalog as catalog
+
+    expected = [
+        f"GZONE{zone}_{suffix}"
+        for suffix in (
+            "DC_CONTRAST",
+            "AC_CONTRAST",
+            "AC_DC_RATIO",
+            "PERIODICITY",
+            "AMB_ABS_CORR",
+        )
+        for zone in (1, 2, 3)
+    ]
+
+    assert [name for name in catalog.model_candidate_names() if name.startswith("GZONE")] == expected
+    for name in expected:
+        record = catalog.feature_record(name)
+        assert record["group"] == "green_position"
+        assert record["signal_source"] in {"green_zone1", "green_zone2", "green_zone3"}
+        assert record["formula"]
+        assert record["unit"]
+        assert record["c_operators"]
+        assert record["deployment_cost"] > 0.0
+        assert {
+            "fixed_position",
+            "device_shortcut",
+            "cross_mode_generalization",
+        } <= set(record["risk_flags"])
+        if name.endswith(("DC_CONTRAST", "AC_CONTRAST", "PERIODICITY", "AMB_ABS_CORR")):
+            assert record["bounded_range"] is not None
+
+
+def _fixed_position_feature_names():
+    return [
+        f"GZONE{zone}_{suffix}"
+        for suffix in (
+            "DC_CONTRAST",
+            "AC_CONTRAST",
+            "AC_DC_RATIO",
+            "PERIODICITY",
+            "AMB_ABS_CORR",
+        )
+        for zone in (1, 2, 3)
+    ]
+
+
+def test_fixed_position_zone_features_match_governed_formulas():
+    ir, ambient, g1, g2, g3, _, _ = _signals()
+    features = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25.0)
+
+    raw_zones = [s03._contact_raw_signal(zone) for zone in (g1, g2, g3)]
+    pulse_zones = [s03._pulse_signal(zone, 25.0) for zone in raw_zones]
+    ambient_pulse = s03._pulse_signal(s03._contact_raw_signal(ambient), 25.0)
+    zone_dc = np.asarray([float(np.median(zone)) for zone in raw_zones])
+    zone_ac = np.asarray([float(np.sqrt(np.mean(zone ** 2))) for zone in pulse_zones])
+    median_dc = float(np.median(zone_dc))
+    median_ac = float(np.median(zone_ac))
+
+    for index, zone in enumerate((1, 2, 3)):
+        expected_dc_contrast = s03.guarded_ratio(
+            zone_dc[index] - median_dc,
+            abs(zone_dc[index]) + abs(median_dc),
+            scale=zone_dc,
+        )
+        expected_ac_contrast = s03.guarded_ratio(
+            zone_ac[index] - median_ac,
+            zone_ac[index] + median_ac,
+            scale=zone_ac,
+        )
+        expected_ac_dc = s03.guarded_ratio(
+            zone_ac[index], abs(zone_dc[index]), scale=raw_zones[index]
+        )
+        expected_periodicity = s03.autocorr_periodicity_features(
+            pulse_zones[index], 25.0
+        )[0]
+        expected_ambient_corr = abs(s03.guarded_corr(pulse_zones[index], ambient_pulse))
+
+        assert features[f"GZONE{zone}_DC_CONTRAST"] == pytest.approx(expected_dc_contrast)
+        assert features[f"GZONE{zone}_AC_CONTRAST"] == pytest.approx(expected_ac_contrast)
+        assert features[f"GZONE{zone}_AC_DC_RATIO"] == pytest.approx(expected_ac_dc)
+        assert features[f"GZONE{zone}_PERIODICITY"] == pytest.approx(expected_periodicity)
+        assert features[f"GZONE{zone}_AMB_ABS_CORR"] == pytest.approx(expected_ambient_corr)
+
+
+def test_fixed_position_zone_features_follow_stable_zone_order():
+    ir, ambient, g1, g2, g3, _, _ = _signals()
+    baseline = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3)
+    swapped = s03.extract_feature_pool_from_window(ir, ambient, g2, g1, g3)
+
+    for suffix in (
+        "DC_CONTRAST",
+        "AC_CONTRAST",
+        "AC_DC_RATIO",
+        "PERIODICITY",
+        "AMB_ABS_CORR",
+    ):
+        assert swapped[f"GZONE1_{suffix}"] == pytest.approx(baseline[f"GZONE2_{suffix}"])
+        assert swapped[f"GZONE2_{suffix}"] == pytest.approx(baseline[f"GZONE1_{suffix}"])
+        assert swapped[f"GZONE3_{suffix}"] == pytest.approx(baseline[f"GZONE3_{suffix}"])
+
+    for invariant_name in ("GREEN_AC_DC_RATIO", "GMEDIAN_AC_DC_RATIO", "G_2OF3_PERIODICITY"):
+        assert swapped[invariant_name] == pytest.approx(baseline[invariant_name])
+
+
+@pytest.mark.parametrize("case", ["zero", "constant", "tiny", "one_bad_zone"])
+def test_fixed_position_zone_features_are_finite_for_edge_cases(case):
+    n = 125
+    t = np.arange(n, dtype=float) / 25.0
+    ambient = np.zeros(n, dtype=float)
+    if case == "zero":
+        zones = [np.zeros(n, dtype=float) for _ in range(3)]
+    elif case == "constant":
+        zones = [np.full(n, value, dtype=float) for value in (1.0e6, 2.0e6, 3.0e6)]
+    elif case == "tiny":
+        zones = [1.0e-12 * np.sin(2.0 * np.pi * frequency * t) for frequency in (1.0, 1.2, 1.4)]
+    else:
+        pulse = np.sin(2.0 * np.pi * 1.2 * t)
+        zones = [2.0e6 + 8.0e3 * pulse, 2.0e6 + 7.0e3 * pulse, np.full(n, np.nan)]
+
+    features = s03.extract_feature_pool_from_window(
+        np.zeros(n), ambient, zones[0], zones[1], zones[2], fs=25.0
+    )
+    assert all(np.isfinite(features[name]) for name in _fixed_position_feature_names())
 
 
 def test_three_zone_expansion_is_governed_and_complete():
@@ -55,7 +182,7 @@ def test_three_zone_expansion_is_governed_and_complete():
         "G_ZONE_LAG_RMS_SEC",
     }
 
-    assert len(catalog.model_candidate_names()) == 111
+    assert len(catalog.model_candidate_names()) == 126
     assert expected_new <= set(catalog.model_candidate_names())
     for name in expected_new:
         record = catalog.feature_record(name)
@@ -93,8 +220,8 @@ def test_three_zone_robust_expansion_is_governed():
         "G_PAIR_SPECTRAL_CONSENSUS",
     }
 
-    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v7"
-    assert len(catalog.model_candidate_names()) == 111
+    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v8"
+    assert len(catalog.model_candidate_names()) == 126
     assert expected <= set(catalog.model_candidate_names())
     for name in expected:
         record = catalog.feature_record(name)
@@ -303,6 +430,14 @@ def test_raw_green_layouts_normalize_to_same_three_symmetric_zones():
 
     for actual, expected in zip(zones_grouped, zones_3):
         assert np.allclose(actual, expected)
+
+    assert not np.allclose(zones_3[0], zones_3[1])
+    ambient = np.zeros(n, dtype=float)
+    ir = np.zeros(n, dtype=float)
+    features_3 = s03.extract_feature_pool_from_window(ir, ambient, *zones_3)
+    features_9 = s03.extract_feature_pool_from_window(ir, ambient, *zones_grouped)
+    for name in _fixed_position_feature_names():
+        assert features_9[name] == pytest.approx(features_3[name], abs=1e-12)
 
 
 def test_new_three_zone_features_are_permutation_invariant():
@@ -792,7 +927,7 @@ def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
     )
     outputs = s04.export_full_feature_ranking(tmp_path, ranking)
 
-    assert len(ranking) == 111
+    assert len(ranking) == 126
     for item in ranking:
         record = catalog.feature_record(item["feature"])
         assert item["commercial_8_member"] == record["commercial_8_member"]
@@ -803,9 +938,9 @@ def test_full_ranking_exports_catalog_and_c_completeness_audit(tmp_path):
 
     completeness = json.loads(outputs["completeness"].read_text(encoding="utf-8"))
     assert completeness["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
-    assert completeness["catalog_count"] == 111
-    assert completeness["ranked_count"] == 111
-    assert completeness["unique_ranked_count"] == 111
+    assert completeness["catalog_count"] == 126
+    assert completeness["ranked_count"] == 126
+    assert completeness["unique_ranked_count"] == 126
     assert completeness["missing_from_ranking"] == []
     assert completeness["extra_in_ranking"] == []
     assert completeness["commercial_8_mapping"] == dict(catalog.COMMERCIAL_8_FEATURE_MAPPING)

@@ -7,6 +7,46 @@ import s04_feature_selection as s04
 import s06_deploy_eval as s06
 
 
+def test_s03_parallel_extraction_preserves_input_sample_order(monkeypatch):
+    class FakeFuture:
+        def __init__(self, args):
+            self.args = args
+
+        def result(self):
+            sample = self.args[0]
+            return [{"sample_name": sample["sample_name"], "target": sample["target"]}]
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, _fn, args):
+            return FakeFuture(args)
+
+    monkeypatch.setattr(s03, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(s03, "as_completed", lambda futures: list(reversed(list(futures))))
+    samples = [
+        {"sample_name": "sample_a", "h5_file": "a.h5", "target": 0},
+        {"sample_name": "sample_b", "h5_file": "b.h5", "target": 1},
+        {"sample_name": "sample_c", "h5_file": "c.h5", "target": 0},
+    ]
+
+    result = s03.extract_features_for_split(
+        samples,
+        dc_threshold=0.1e6,
+        ac_dc_threshold=1.0,
+        n_workers=2,
+    )
+
+    assert result["sample_name"].tolist() == ["sample_a", "sample_b", "sample_c"]
+
+
 def test_s01_accepts_prewindowed_ppg_shape():
     assert s01.is_supported_ppg_shape((40, 300))
     assert s01.is_supported_ppg_shape((5, 40, 300))

@@ -33,10 +33,10 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --dry_
 - 不加 `--auto_optimize_e2e` 时，阈值目标仍是 `accuracy`，`threshold_min_precision=0.95`，`model_search_fp_cost=2.0`，不会自动导出窗口 NPZ，也不会跑 `s07` 后处理搜索。
 - 加 `--auto_optimize_e2e` 后，会自动切换为 `feature_selection_mode=auto`，并进入产品指标优先的端到端优化链路：启用模型搜索、窗口 NPZ 导出、`s07` 后处理搜索，并把阈值目标改成 `precision_constrained`。
 - `--with_postprocess` 只是打开后处理搜索；它不会改成 auto E2E 的精度约束策略，也不会写 `auto_optimize/` 汇总。
-- 商用 8 特征全部进入 111 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。采集 `mode` 也作为可选候选参与排序；若选中，必须重点审计跨 subject/device/session/mode 泛化，防止硬件捷径。
-- 原始绿光布局统一映射成三个中心对称光区。光区特征仅使用置换不变的聚合、三对相关性、周期支持和绝对时延，不依赖绝对方位、顺逆时针方向或原始通道编号。
+- 商用 8 特征全部进入 126 项受治理特征池；其中 6 项映射到同公式规范特征，`COMM_GREEN_AC` 和 `COMM_AMB_AC` 作为独立候选。采集 `mode` 也作为可选候选参与排序；若选中，必须重点审计跨 subject/device/session/mode 泛化，防止硬件捷径。
+- 不同通道布局先按既有硬件/上游映射归一成三个固定物理光区，同一区域内部等权平均；本次不修改 mode0/mode1/mode2 的列映射。现有均值、中位数、top2、2-of-3 和 pair 特征继续提供置换不变证据；v8 另增加 15 项固定位置候选，保留单边翘起和局部漏光的方向信息。
 - 新增 7 项互补候选：top2 稳健偏度与谱熵、ACC jerk 尾部均值、ACC–PPG 有限延迟相关与 PSD 相似度、三光区 2-of-3 周期性和三对时延 RMS。
-- v7 包含 20 项三光区鲁棒候选：逐点中位波形、按 AC-RMS 能量排序且对并列值无编号偏置的 top2 复合波形、三种两区组合的周期性/主频差/ACDC/环境相关顺序统计、环境光线性投影残差、三光区相位集中度和频谱共识。RMS 只用于衡量脉动能量，不等同于信号质量；频率、相位和谱共识只使用同时通过相对 AC 幅值、频谱峰值与自相关三重有效性门控的光区。特征只依赖置换不变聚合，不依赖光区编号；相位与频谱共识带 `experimental_high_cost` 风险标记，供人工选择时单独审计。
+- v8 保留原有 20 项三光区鲁棒候选：逐点中位波形、按 AC-RMS 能量排序且对并列值无编号偏置的 top2 复合波形、三种两区组合的周期性/主频差/ACDC/环境相关顺序统计、环境光线性投影残差、三光区相位集中度和频谱共识。RMS 只用于衡量脉动能量，不等同于信号质量；频率、相位和谱共识只使用同时通过相对 AC 幅值、频谱峰值与自相关三重有效性门控的光区。另为每个固定光区提供相对 DC、相对 AC、AC/DC、周期性和环境光绝对相关性五类候选；它们带固定位置与跨硬件泛化风险标记，只由完整排序和人工 CSV 决定是否使用。
 - 手动特征会冻结为 `manual_selected_features.json`，随后驱动模型搜参、复杂度约束、hard-negative 候选和 C 部署特征顺序。
 - hard-negative 候选只使用 train OOF 误报；只有 valid accuracy 不下降且 FPR 不恶化才接受，否则自动回滚参考模型。
 - Stage1 与 Stage2 是两条并行方法：Stage2 对全量合法窗口持续完成特征、模型和 EMA/投票/状态机更新；Stage1 只在最终对外输出端做快速门控，不过滤 Stage2 数据，也不暂停或重置 Stage2 状态。
@@ -86,7 +86,7 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 s01 → s02 → s03 → s04 → 暂停，等待人工固化特征
 ```
 
-`s04` 输出完整 111 特征的 `feature_ranking_full.json/csv`、
+`s04` 输出完整 126 特征的 `feature_ranking_full.json/csv`、
 `manual_feature_selection.csv` 和
 `feature_pool_completeness.json`。默认流程不会用 Top-K、分组上限或 FFT 上限覆写人工选择。
 
@@ -103,6 +103,121 @@ python s08_run_pipeline.py \
 
 恢复后会训练固定特征集合，并生成 ROC/PR、端到端评估、错误分析和部署产物。
 
+### 3.1 如何人工给出最终训练特征
+
+人工筛选的唯一输入文件是：
+
+```text
+artifacts/manual_feature_selection.csv
+```
+
+该文件由 `s04` 根据同目录下的 `feature_ranking_full.json` 自动生成，包含完整特征池及其排序、稳定性、漂移、误报风险和部署成本信息。人工选择时只允许修改 `selected` 列：
+
+```text
+selected = 1    选中该特征
+selected = 0    不选该特征
+```
+
+必须同时满足以下约束：
+
+- 只能选择 `eligible=1` 的行；`eligible=0` 的特征即使写成 `selected=1` 也会被拒绝。
+- 除 `selected` 外，不能修改任何单元格、列名、列顺序、行顺序或行数。
+- 不要在 CSV 中增加备注列；需要记录选择理由时，应在实验记录或独立说明文件中记录。
+- `selected` 只能填写整数 `0` 或 `1`，不能使用 `yes`、`true`、空格或公式。
+- 至少选择一个特征。manual 模式不限制特征数量、信号类别或 FFT 数量，也不会使用 Top-K、group cap 或 local-swap 覆写人工结果。
+- CSV 必须与当前 `feature_ranking_full.json` 配套。重新运行 `s03/s04` 或升级特征池后，应使用新生成的 CSV 重新选择，不能沿用旧文件。
+
+加载时会核对 CSV schema、特征池版本、完整排序 SHA256、每一行不可变字段、train/valid 列是否存在以及特征是否具备候选资格。任何契约字段被 Excel/WPS 或人工误改，训练都会明确报错，而不是静默回退到自动选择。
+
+### 3.2 人工筛选时如何阅读各列
+
+| 列 | 含义 | 人工筛选建议 |
+|---|---|---|
+| `rank` | 当前完整排序名次 | 用于确定初始候选范围，不应简单等同于最终 Top-K |
+| `feature` | 唯一特征名 | 最终模型、部署导出和 C 特征顺序都使用该名称 |
+| `eligible` | 是否允许人工选择 | 只选择值为 `1` 的行 |
+| `group` | 特征所属信号/机理类别 | 用于避免只选同一类高度冗余特征 |
+| `ranking_score` | train 内部 group-CV 分离能力、FP proxy 和部署适配度的综合分数 | 适合作为第一轮候选排序依据 |
+| `train_group_fold_auc_mean` | train 内部分组折上的单特征平均 AUC | 应看其与 `0.5` 的距离；明显低于 `0.5` 也可能是稳定的反向判别特征 |
+| `valid_auc` | valid 上的单特征 AUC | 只作泛化旁证，不参与完整排序分数，也不能单独用于反复选特征 |
+| `fp_proxy_sample_fp_rate` | train-only 样本级误报代理 | 越高越需要谨慎，尤其是非佩戴误报敏感场景 |
+| `valid_psi` | train/valid 分布漂移 | `>0.25` 通常需要重点检查数据源、mode 或设备捷径 |
+| `deployment_cost` | 端侧计算成本 | 同等准确率下优先成本较低者 |
+| `signal_source` / `preprocessing` / `formula` / `unit` | 信号来源、预处理、定义和单位 | 用于判断机理是否互补、是否可解释 |
+| `fft` / `buffer_samples` / `accumulator` / `c_operators` | FFT、缓存和 C 实现需求 | 用于审计内存、时延和工程实现复杂度 |
+| `risk_flags` | 高漂移、低方差、实验性高成本等风险 | 有风险不代表绝对不能选，但必须用消融和分层指标证明增益 |
+| `commercial_8_member` | 是否属于保留的商用八特征映射 | 仅表示来源关系，不是自动入选规则 |
+
+完整排名的核心证据来自 train 内部按 `sample_name` 分组的评估；valid 指标用于诊断旁证，test 不参与人工筛选。对于单特征 AUC，XGBoost 可以利用正向或反向单调关系，因此不应把 AUC 小于 `0.5` 的特征直接判为无效。更重要的是跨 group-fold 的稳定性、与其他已选特征的互补性以及 valid 漂移是否可接受。
+
+### 3.3 面向单窗准确率的推荐人工组合
+
+不建议机械选择排名前 N。第一轮可以分别构造约 12、16、20 项的候选集合，并尽量覆盖以下互补机理：
+
+| 机理类别 | 建议初始数量 | 目的 |
+|---|---:|---|
+| 绿光接触强度、AC/DC | 2–3 | 描述总体接触和脉动幅度 |
+| 三光区空间一致性及弱区异常 | 3–5 | 处理单边翘起、局部漏光和部分光区失效 |
+| 固定位置光区候选 | 0–3 | 利用稳定区域顺序描述局部翘起/漏光；必须审计 device/mode 捷径 |
+| top2、逐点中位等稳健复合 | 2–4 | 在一个光区异常时保留可靠脉动信息 |
+| 周期、主频、相关性、时延 | 2–4 | 描述生理周期一致性，抑制随机光学扰动 |
+| ACC 运动强度 | 1–2 | 区分运动伪影和稳定佩戴 |
+| ACC–PPG 耦合 | 1–2 | 描述运动污染是否同步进入光学信号 |
+| 环境光影响或投影残差 | 1–2 | 识别外界光线泄漏及其对三光区的影响 |
+| `mode` | 0–1 | 可作为候选，但必须审计跨 subject/device/session/mode 泛化 |
+
+以上数量只是构造对照实验的起点，不是强制上限。相同机理下高度相关的多个均值、最大值或相近频域统计通常不应全部选入；优先选择跨分组稳定、漂移较低且能解释不同失败模式的代表特征。带 `experimental_high_cost` 的相位或频谱共识特征建议逐项做消融，只有在 group-CV 和独立 valid 上均有稳定增益时才保留。
+
+建议准备三套人工候选：
+
+```text
+manual_feature_selection_core.csv       约 12 项，低成本核心组合
+manual_feature_selection_robust.csv     约 16 项，增加三光区可靠性与运动耦合
+manual_feature_selection_expanded.csv   约 20 项，加入经审计的频域/相位候选
+```
+
+这三份文件都必须从同一次 `s04` 生成的原始 `manual_feature_selection.csv` 完整复制，只修改 `selected`。为避免模型、报告和部署产物互相覆盖，正式对照时应为每套候选使用独立的 `artifact_dir`；可以先复制完整的 s01–s04 产物目录，再分别编辑各目录中的 CSV。不要在同一目录连续训练多个候选后再比较残留文件。
+
+### 3.4 保存 CSV 后恢复训练
+
+使用默认文件恢复：
+
+```bash
+python s08_run_pipeline.py \
+  --artifact_dir artifacts \
+  --feature_selection_mode manual \
+  --manual_feature_file artifacts/manual_feature_selection.csv \
+  --skip s01,s02,s03,s04 \
+  --stop_after s06_cb
+```
+
+也可以显式指定同一排序对应的另一份人工候选 CSV：
+
+```bash
+python s08_run_pipeline.py \
+  --artifact_dir artifacts_robust \
+  --feature_selection_mode manual \
+  --manual_feature_file artifacts_robust/manual_feature_selection_robust.csv \
+  --skip s01,s02,s03,s04 \
+  --stop_after s06_cb
+```
+
+训练开始前会把实际选中的名称和顺序冻结到：
+
+```text
+artifacts/manual_selected_features.json
+```
+
+该冻结文件随后统一驱动 XGBoost 训练、模型复杂度检查、hard-negative 候选、错误分析、模型 bundle、C 部署特征顺序和 golden vectors。manual 模式下不会再执行特征数量搜索或 local-swap；最终特征及其数量完全由 CSV 中的 `selected` 决定。
+
+人工候选对照时至少比较以下冻结指标：
+
+- train 内部 repeated group-CV 的平均单窗 accuracy 和标准差；
+- valid 单窗 accuracy、FP、FN、precision、recall 和阈值；
+- 按 mode、H5、时间位置、三光区可靠性、质量和 OOD 分层的错误率；
+- 总节点数、FFT 来源数、最大缓存长度和端侧耗时；
+- 最终只对确定的候选运行一次独立 test，禁止根据 test 结果反复修改 `selected`。
+
 默认关键参数：
 
 ```text
@@ -113,8 +228,10 @@ use_stage2_ir:                 false
 max_features:                  仅用于 auto 模式；manual 不限数量
 feature_selection_mode:        manual
 model_search:                  true
-model_search_feature_counts:   8,10,12,15,18
+model_search_feature_counts:   8,10,12,15,18（仅 auto；manual 忽略）
 model_search_strategy:         staged_group_cv
+model_search_max_depth:        2,3,4,5
+model_search_n_workers:        默认跟随全局 n_workers（当前上限 4）
 max_model_nodes:               500
 threshold_objective:           accuracy
 threshold_min_precision:       0.95
@@ -122,6 +239,45 @@ model_search_fp_cost:          2.0
 runtime_profile:               balanced
 effective stop_after:          s04（没有人工文件时）
 ```
+
+### 3.5 当前并行策略
+
+项目中的“并行”包含三个不同层次，不能混为一谈：
+
+1. **Stage1/Stage2 业务语义并行**：Stage2 对全量合法窗口持续计算特征、模型概率和后处理状态；Stage1 只在最终输出处做快速门控。两条方法互不筛除数据，也不会互相暂停或重置，但单个样本内不要求为 Stage1 和 Stage2 各启动一个 CPU 线程。
+2. **数据与评估任务并行**：s01 按 H5 文件、s02/s03/s06 按样本、s04 按 `seed × group-fold`、s07 按后处理网格点使用多进程。
+3. **s05 模型候选并行**：single-split Stage A 以及 staged group-CV 的 Stage A/Stage B 在外层并行评估独立 XGBoost 候选；每个候选内部默认 `n_jobs=1`，避免嵌套线程抢占。
+
+主流程统一使用：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --n_workers 4
+```
+
+`--model_search_n_workers` 默认继承 `--n_workers`，也可以单独降低：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts \
+  --n_workers 4 \
+  --model_search_n_workers 2
+```
+
+并行安全约束：
+
+- worker 数会自动限制到实际任务数，空闲任务不会额外创建线程。
+- `WL_FORCE_SERIAL=1` 会强制所有支持该开关的阶段回退到单 worker，便于排查环境问题。
+- 主流程默认设置 `OMP_NUM_THREADS=1`、`MKL_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1`、`NUMEXPR_NUM_THREADS=1` 和 `VECLIB_MAXIMUM_THREADS=1`；如果调用者已经显式设置，则保留调用者的值。
+- `WL_INNER_N_JOBS` 默认未设置，此时单个 XGBoost 候选使用 1 个内部线程；如果显式提高该值，应相应降低 `--model_search_n_workers`，避免两层并行相乘。
+- s03 并行 worker 可以乱序完成，但主进程会按原始样本索引重组后再写 CSV，保证相同输入和配置下行顺序确定。
+- s05 候选可以乱序完成，但记录按候选输入索引重组；候选异常会终止搜索，不会静默删除失败候选后继续选择模型。
+- 小任务自动串行：s01 只有一个 H5、s02/s03/s06 不超过两个样本或 s04 不超过四个 fold 任务时，跳过进程池开销。
+
+manual 模式下，CSV 冻结的特征名称和数量不会改变；并行只作用于这组固定特征上的模型参数候选，不会重新搜索特征数或执行 local-swap。
 
 默认不会运行：
 
@@ -571,7 +727,7 @@ python s02_ir_dc_threshold.py \
 
 ### `s03_extract_feature_pool.py`
 
-作用：提取 111 项 Stage2 特征池 CSV，包括采集 `mode`、三个中心对称绿光区、环境光、ACC、三光区鲁棒共识/局部异常特征，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
+作用：提取 126 项 Stage2 特征池 CSV，包括采集 `mode`、三个固定位置绿光区、环境光、ACC、三光区鲁棒共识/局部异常特征、15 项固定位置候选，以及商用 8 特征的规范映射/独立 AC 候选；不使用 IR 派生特征。
 
 ```bash
 python s03_extract_feature_pool.py \
@@ -586,7 +742,7 @@ python s03_extract_feature_pool.py \
 
 ### `s04_feature_selection.py`
 
-作用：清洗并完整排序 111 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 CSV 选择接口。manual 模式不应用分组或数量上限；CSV 中只允许修改 `selected` 列。
+作用：清洗并完整排序 126 项特征，计算稳定性、FP proxy 和 C 工程元数据，并导出 CSV 选择接口。manual 模式不应用分组或数量上限；CSV 中只允许修改 `selected` 列。
 
 ```bash
 python s04_feature_selection.py \
@@ -782,7 +938,7 @@ artifacts/
 
 | 图片 | 说明 |
 |---|---|
-| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、111 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
+| `report_plots/s03_feature_pool_analysis.png` | 四栏展示各 split 窗口覆盖、有限值率、126 项特征的可解释物理分组，以及 train-only 标准化类别分离度；该分离度只用于诊断，不替代 grouped-valid 排名 |
 | `report_plots/s04_feature_selection_report.png` | 三栏：左栏 Top 20 特征排名柱状（已选深色标记 + 综合得分折线），右上选入特征的群组分布，右下 Top 12 特征 FP Proxy 风险双柱 |
 | `report_plots/s04_shap_importance.png` | 四栏 SHAP 报告：左上 Top 20 特征 mean(\|SHAP\|) 柱状（已选特征深色），右上 Train vs Valid SHAP 散点 + Spearman ρ 标注，左下 Top-K 重叠率柱状，右下可疑 Train-only 强特征红色柱状 |
 

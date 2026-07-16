@@ -153,6 +153,168 @@ def _model_search_args(**overrides):
     return argparse.Namespace(**values)
 
 
+def test_ordered_thread_map_preserves_input_order():
+    import threading
+
+    completed = []
+    lower_jobs_done = {1: threading.Event(), 2: threading.Event()}
+
+    def work(item):
+        if item == 3:
+            assert lower_jobs_done[1].wait(timeout=5)
+            assert lower_jobs_done[2].wait(timeout=5)
+        completed.append(item)
+        if item in lower_jobs_done:
+            lower_jobs_done[item].set()
+        return f"result_{item}"
+
+    results = s05.ordered_thread_map(work, [3, 1, 2], n_workers=3)
+
+    assert completed[-1] == 3
+    assert completed != [3, 1, 2]
+    assert results == ["result_3", "result_1", "result_2"]
+
+
+def test_model_search_workers_respect_force_serial(monkeypatch):
+    monkeypatch.setenv("WL_FORCE_SERIAL", "1")
+
+    assert s05.resolve_model_search_workers(4, n_items=20) == 1
+
+
+def test_s08_passes_global_workers_to_model_search():
+    result = _run_s08_dry_run(
+        "--feature_selection_mode", "auto",
+        "--n_workers", "3",
+        "--stop_after", "s05",
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "--model_search_n_workers 3" in output
+
+
+def _parallel_search_args(**overrides):
+    values = {
+        "max_model_nodes": 500,
+        "model_search_fp_cost": 0.0,
+        "model_search_size_cost": 0.0,
+        "model_search_accuracy_tolerance": 0.0,
+        "model_search_n_workers": 3,
+        "model_search_stage2_top_k": 2,
+        "model_search_cv_folds": 2,
+        "model_search_cv_repeats": 1,
+        "model_search_random_state": 42,
+        "model_search_max_candidates": 2,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def test_single_split_model_search_uses_outer_candidate_workers(monkeypatch):
+    calls = []
+    grid = [
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 1},
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 2},
+    ]
+
+    class FakeModel:
+        def __init__(self, params):
+            self.params = params
+
+    def ordered_spy(fn, items, n_workers):
+        items = list(items)
+        calls.append((len(items), n_workers))
+        return [fn(item) for item in items]
+
+    monkeypatch.setattr(s05, "build_model_search_grid", lambda *_args, **_kwargs: grid)
+    monkeypatch.setattr(s05, "ordered_thread_map", ordered_spy)
+    monkeypatch.setattr(s05, "train_xgb_with_params", lambda params, *_args, **_kwargs: FakeModel(params))
+    monkeypatch.setattr(s05, "count_xgb_nodes", lambda _model: 20)
+    monkeypatch.setattr(s05, "eval_model", lambda *_args, **_kwargs: {"accuracy": 0.8})
+    monkeypatch.setattr(
+        s05,
+        "evaluate_accuracy_first_threshold",
+        lambda model, *_args: {
+            "threshold": 0.5,
+            "accuracy": 0.90 + 0.01 * model.params["candidate_id"],
+            "precision": 0.9,
+            "recall": 0.9,
+            "f1": 0.9,
+            "fp_rate": 0.01,
+            "confusion_matrix": {"TN": 9, "FP": 1, "FN": 1, "TP": 9},
+        },
+    )
+
+    model, _summary, records = s05._search_xgb_hyperparameters_single_split(
+        _parallel_search_args(),
+        np.asarray([[0.0], [1.0]]),
+        np.asarray([0, 1]),
+        np.asarray([[0.0], [1.0]]),
+        np.asarray([0, 1]),
+    )
+
+    assert calls == [(2, 2)]
+    assert len(records) == 2
+    assert model.params["candidate_id"] == 2
+
+
+def test_staged_group_cv_model_search_uses_outer_candidate_workers(monkeypatch):
+    calls = []
+    grid = [
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 1},
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 2},
+    ]
+    splits = [
+        (np.asarray([0, 2]), np.asarray([1, 3])),
+        (np.asarray([1, 3]), np.asarray([0, 2])),
+    ]
+
+    class FakeModel:
+        def __init__(self, params):
+            self.params = params
+
+    def ordered_spy(fn, items, n_workers):
+        items = list(items)
+        calls.append((len(items), n_workers))
+        return [fn(item) for item in items]
+
+    monkeypatch.setattr(s05, "build_model_search_axes", lambda _args: {"candidate_id": [1, 2]})
+    monkeypatch.setattr(s05, "build_model_search_grid", lambda *_args, **_kwargs: grid)
+    monkeypatch.setattr(s05, "_ensure_default_params_in_grid", lambda items, **_kwargs: list(items))
+    monkeypatch.setattr(
+        s05,
+        "build_repeated_group_cv_splits",
+        lambda *_args, **_kwargs: (splits, {"fallback": False, "reason": "test"}),
+    )
+    monkeypatch.setattr(s05, "ordered_thread_map", ordered_spy)
+    monkeypatch.setattr(s05, "train_xgb_with_params", lambda params, *_args, **_kwargs: FakeModel(params))
+    monkeypatch.setattr(s05, "count_xgb_nodes", lambda _model: 20)
+    monkeypatch.setattr(
+        s05,
+        "evaluate_accuracy_first_threshold",
+        lambda model, *_args: {
+            "threshold": 0.5,
+            "accuracy": 0.90 + 0.01 * model.params["candidate_id"],
+            "precision": 0.9,
+            "recall": 0.9,
+            "f1": 0.9,
+            "fp_rate": 0.01,
+            "confusion_matrix": {"TN": 9, "FP": 1, "FN": 1, "TP": 9},
+        },
+    )
+
+    model, _summary, records = s05._search_xgb_hyperparameters_staged_group_cv(
+        _parallel_search_args(),
+        np.asarray([[0.0], [0.2], [0.8], [1.0]]),
+        np.asarray([0, 0, 1, 1]),
+        groups=np.asarray(["a", "b", "c", "d"], dtype=object),
+    )
+
+    assert calls == [(2, 2), (2, 2)]
+    assert len(records) == 2
+    assert model.params["candidate_id"] == 2
+
+
 def _sample_name_series(values):
     try:
         return pd.Series(values, dtype="string[pyarrow]")

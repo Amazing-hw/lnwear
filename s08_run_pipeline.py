@@ -1949,6 +1949,8 @@ def main():
                    help="s05 staged_group_cv repeats")
     p.add_argument("--model_search_random_state", type=int, default=42,
                    help="s05 model-search sampling/CV seed")
+    p.add_argument("--model_search_n_workers", type=int, default=None,
+                   help="parallel s05 model candidates; defaults to --n_workers")
     p.add_argument("--model_search_n_estimators", default="20,25,30,35,40,45,50,55,60",
                    help="comma-separated s05 n_estimators candidates")
     p.add_argument("--model_search_max_depth", default="2,3,4,5",
@@ -2023,6 +2025,8 @@ def main():
 
     _raw_argv = sys.argv[1:]
     args = p.parse_args()
+    if args.model_search_n_workers is None:
+        args.model_search_n_workers = args.n_workers
 
     if args.postprocess_split != "valid":
         p.error("postprocess_split must be 'valid'; test is reserved for frozen read-only replay")
@@ -2298,6 +2302,7 @@ def main():
             f'--model_search_cv_folds {args.model_search_cv_folds} '
             f'--model_search_cv_repeats {args.model_search_cv_repeats} '
             f'--model_search_random_state {args.model_search_random_state} '
+            f'--model_search_n_workers {args.model_search_n_workers} '
             f'--model_search_n_estimators "{args.model_search_n_estimators}" '
             f'--model_search_max_depth "{args.model_search_max_depth}" '
             f'--model_search_learning_rate "{args.model_search_learning_rate}" '
