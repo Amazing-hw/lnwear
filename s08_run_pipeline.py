@@ -1883,6 +1883,39 @@ def plot_error_samples(artifact_dir, split="test", method="prob_mean",
     print(f"[OK] {len(errors)} plots -> {out_dir}/")
 
 
+def _patch_commercial_only_csv(artifact_dir):
+    """After s04 ranking, rewrite manual_feature_selection.csv to select only the 8 commercial features."""
+    from s03_extract_feature_pool import COMMERCIAL_STAGE2_FIELDS as _COMMERCIAL_8
+
+    csv_path = os.path.join(artifact_dir, "manual_feature_selection.csv")
+    if not os.path.exists(csv_path):
+        print("[commercial_only] manual_feature_selection.csv not found; skipping patch")
+        return
+
+    import csv as _csv
+    commercial_set = set(_COMMERCIAL_8)
+    patched = 0
+    rows = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = _csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        for row in reader:
+            feature = row.get("feature", "")
+            if feature in commercial_set:
+                row["selected"] = "1"
+                patched += 1
+            else:
+                row["selected"] = "0"
+            rows.append(row)
+
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[commercial_only] patched {csv_path}: {patched}/{len(_COMMERCIAL_8)} commercial features selected")
+
+
 def main():
     p = argparse.ArgumentParser(
         description="手表佩戴活体检测 — 全流程主控脚本",
@@ -2087,9 +2120,23 @@ def main():
                    help="s05 minimum OOF probability for hard-negative mining; defaults to initial threshold")
     p.add_argument("--export_deploy_cookbook", action=argparse.BooleanOptionalAction, default=True,
                    help="导出部署配方给嵌入式同事 (--no-export_deploy_cookbook 跳过)")
+    p.add_argument("--commercial_only", action="store_true",
+                   help="仅使用商用 8 个特征提取并训练最终模型")
 
     _raw_argv = sys.argv[1:]
     args = p.parse_args()
+
+    if args.commercial_only:
+        from s03_extract_feature_pool import COMMERCIAL_STAGE2_FIELDS as _COMMERCIAL_8
+
+        args.feature_selection_mode = "manual"
+        args.max_features = 8
+        if args.stop_after == "s04":
+            args.stop_after = "s06_cb"
+        if "--threshold_min_precision" not in _raw_argv:
+            args.threshold_min_precision = 0.90
+        print(f"[commercial_only] 仅使用 8 个商用特征: {', '.join(_COMMERCIAL_8)}")
+
     try:
         parse_model_search_n_estimators(args.model_search_n_estimators)
     except ValueError as exc:
@@ -2206,13 +2253,20 @@ def main():
         and os.path.exists(manual_feature_file)
     )
     if args.feature_selection_mode == "manual" and not manual_resume:
-        if step_keys.index(stop_after) > step_keys.index("s04"):
-            stop_after = "s04"
+        if args.commercial_only:
+            skip_set.add("s04_search")
             print(
-                "[manual] feature ranking is the first phase; stopping after s04. "
-                f"Set selected=1 in {manual_feature_file} and save the CSV."
+                "[commercial_only] s04 ranking complete; auto-selecting 8 commercial features "
+                "and continuing to s05 training."
             )
-        skip_set.add("s04_search")
+        else:
+            if step_keys.index(stop_after) > step_keys.index("s04"):
+                stop_after = "s04"
+                print(
+                    "[manual] feature ranking is the first phase; stopping after s04. "
+                    f"Set selected=1 in {manual_feature_file} and save the CSV."
+                )
+            skip_set.add("s04_search")
     elif args.feature_selection_mode == "manual":
         skip_set.add("s04_search")
         manual_budgets = {
@@ -2790,6 +2844,8 @@ def main():
         results[key] = ok
         if ok:
             completed_keys.add(key)
+            if key == "s04" and not args.dry_run and args.commercial_only:
+                _patch_commercial_only_csv(args.artifact_dir)
         if not ok:
             print(f"\n[FAIL] 流水线中断于: {display_name}")
             sys.exit(1)

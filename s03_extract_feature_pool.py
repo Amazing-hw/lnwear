@@ -30,6 +30,7 @@ import os
 import json
 import argparse
 import re
+import warnings as _commercial_warnings
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -39,6 +40,8 @@ import pandas as pd
 
 from scipy.signal import resample_poly  # only for polyphase downsampling (C has equivalent)
 
+import commercial_liveness_features
+
 from stage2_feature_catalog import (
     FEATURE_CATALOG,
     FEATURE_POOL_VERSION as STAGE2_FEATURE_POOL_VERSION,
@@ -47,6 +50,8 @@ from stage2_feature_catalog import (
     model_candidate_names as stage2_model_candidate_names,
     validate_candidate_names as validate_stage2_candidate_names,
 )
+
+_commercial_port_main = commercial_liveness_features.main
 
 # =========================================================
 # 基本配置
@@ -69,6 +74,17 @@ COMMERCIAL_8_FEATURE_NAMES = [
     "GREEN_XCORR",
     "FFT_PEAK_MEDIAN_RATIO",
 ]
+
+COMMERCIAL_STAGE2_FIELDS = (
+    "GREEN_CORR",
+    "COMM_GREEN_AC",
+    "COMM_AMB_AC",
+    "ACC_MAG_MEAN",
+    "GREEN_DC_MEDIAN",
+    "AMBX_DC_MEDIAN",
+    "GREEN_AUTO_CORR_PEAK",
+    "GREEN_FFT_PEAK_MEDIAN_RATIO",
+)
 
 WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
 
@@ -3204,6 +3220,52 @@ def stage2_diagnostic_fields(ir, ambient, g1, g2, g3, acc_window=None):
     }
 
 
+def extract_commercial_feature_overrides(ppg_window, acc_window, frequency, ppg_config):
+    """Adapt a raw PPG/ACC window to the commercial float32 port.
+
+    Returns an OrderedDict of the 8 ``COMMERCIAL_STAGE2_FIELDS`` computed by
+    ``commercial_liveness_features.main``, overriding any Stage2 candidates that
+    share the same field names.
+    """
+    ppg = np.asarray(ppg_window)
+    if frequency not in (25, 100):
+        raise ValueError(f"commercial port requires frequency 25 or 100 Hz, got {frequency}")
+    stride = frequency // 25
+    expected_len = 125 * stride
+    if ppg.shape[0] != expected_len:
+        raise ValueError(
+            f"commercial PPG window must be {expected_len} samples "
+            f"at {frequency} Hz, got {ppg.shape[0]}"
+        )
+    if acc_window is None:
+        raise ValueError("commercial ACC window is required but got None")
+    acc = np.asarray(acc_window)
+    if acc.shape[0] != expected_len:
+        raise ValueError(
+            f"commercial ACC window must be {expected_len} samples "
+            f"at {frequency} Hz, got {acc.shape[0]}"
+        )
+
+    strided_ppg = ppg[::stride]
+    strided_acc = acc[::stride].astype(np.int16)
+
+    _, ambient, g1, g2, g3 = get_channels_from_window(strided_ppg, ppg_config)
+    green = ((np.asarray(g1, dtype=np.int64)
+              + np.asarray(g2, dtype=np.int64)
+              + np.asarray(g3, dtype=np.int64)) / 3.0).astype(np.int32)
+
+    port_ppg = np.zeros((125, 4), dtype=np.int32)
+    port_ppg[:, 0] = green
+    port_ppg[:, 3] = ambient.astype(np.int32)
+
+    result = _commercial_port_main(port_ppg, strided_acc)
+
+    return OrderedDict(
+        (name, float(value))
+        for name, value in zip(COMMERCIAL_STAGE2_FIELDS, result)
+    )
+
+
 def extract_stage2_window(
     ppg_window,
     mode,
@@ -3254,6 +3316,16 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None,
         acc_window=acc_window,
         use_stage2_ir=use_stage2_ir,
     )
+    if acc_window is not None:
+        try:
+            with _commercial_warnings.catch_warnings():
+                _commercial_warnings.simplefilter("ignore", RuntimeWarning)
+                commercial = extract_commercial_feature_overrides(
+                    ppg_window, acc_window, frequency=int(fs), ppg_config=resolved_mode,
+                )
+            features.update(commercial)
+        except Exception:
+            pass
     return features
 
 # =========================================================
