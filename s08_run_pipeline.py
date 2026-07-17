@@ -1628,7 +1628,7 @@ def generate_eval_csv(artifact_dir, split="test", method="prob_mean"):
     rows_sm_detail = []
     for d in details:
         name = d.get("sample_name", "")
-        states = d.get("stage2_states", d.get("window_states", []))
+        states = d.get("stage2_states", d.get("window_states", d.get("states", [])))
         if d.get("fallback", False) or len(states) == 0:
             continue
         wtargs = d.get("window_targets", [])
@@ -1820,7 +1820,7 @@ def plot_error_samples(artifact_dir, split="test", method="prob_mean",
         pred = d["pred"]
         probs = d.get("window_probs", [])
         scores = d.get("window_scores", [])
-        states = d.get("window_states", [])
+        states = d.get("window_states", d.get("states", []))
         n_win = d.get("n_windows", len(probs))
         t = _np.arange(n_win) * stride_sec + window_sec / 2.0 if n_win > 0 else _np.array([])
 
