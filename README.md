@@ -8,14 +8,20 @@
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 ```
 
+商用 8 特征快速流程（自动选特征、直接训练）：
+
+```bash
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_only
+```
+
 ## 1. 当前流程
 
 ```text
 H5 数据
   → s01 数据扫描、元数据校验、train/valid/test 分组切分
-  → s03 全量合法窗口特征提取
+  → s03 全量合法窗口特征提取（含商用 8 特征精确端口）
   → s04 完整特征排序与 manual_feature_selection.csv
-  → 人工只修改 selected 列
+  → 人工只修改 selected 列（或 --commercial_only 自动选商用 8 特征）
   → s05 固定所选特征，充分搜索 XGBoost 超参数并进行 hard-negative 候选训练
   → s06 纯 XGBoost 评估、错误分析与部署产物导出
   → s07 可选：独立的 EMA/状态机后处理搜索
@@ -94,6 +100,36 @@ python s08_run_pipeline.py \
 ```
 
 加载时会校验 CSV schema、完整排序 SHA256、特征池版本和所有不可变字段。训练、模型 JSON、独立部署特征提取脚本、公式文件和 C 契约严格使用 CSV 中选中特征的名称、顺序和数量。
+
+### 4.1 商用 8 特征快速模式
+
+`--commercial_only` 一键使用商用 8 特征提取并训练：
+
+```bash
+python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_only
+```
+
+内部流程：
+
+1. s03 通过 `commercial_liveness_features.main()`（float32 C 兼容端口）计算 8 个特征，覆盖 Stage2 特征池对应字段。
+2. s04 正常生成完整排名和 CSV。
+3. s04 结束后自动将 `manual_feature_selection.csv` 中 8 个商用特征设为 `selected=1`，其余置 0，无需人工编辑。
+4. s05 固定 8 个商用特征完成训练。
+
+商用 8 特征：
+
+| 商用端口名 | Stage2 字段名 | 说明 |
+|---|---|---|
+| `green_corr` | `GREEN_CORR` | 绿光脉动自相关 |
+| `green_ac` | `COMM_GREEN_AC` | 绿光 AC 幅值 |
+| `amb_ac` | `COMM_AMB_AC` | 环境光 AC 幅值 |
+| `acc_ysum` | `ACC_MAG_MEAN` | 加速度计幅值均值 |
+| `green_dc` | `GREEN_DC_MEDIAN` | 绿光 DC 中位数 |
+| `amb_dc` | `AMBX_DC_MEDIAN` | 环境光 DC 中位数 |
+| `green_xcorr` | `GREEN_AUTO_CORR_PEAK` | 绿光自相关峰值 |
+| `fft_peak_med` | `GREEN_FFT_PEAK_MEDIAN_RATIO` | 绿光 FFT 峰值/中位数比 |
+
+商用端口实现位于 `commercial_liveness_features.py`，输入为 `(125, 4)` int32 PPG 和 `(125, 3)` int16 ACC，输出 8 个 float32 特征值。
 
 ## 5. 模型训练与搜参
 
