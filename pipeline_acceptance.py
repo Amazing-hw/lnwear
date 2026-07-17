@@ -17,7 +17,6 @@ SECTION_ORDER = [
 
 MANDATORY_FIGURES = [
     Path("report_plots/s01_split_analysis.png"),
-    Path("stage1_scatter.png"),
     Path("report_plots/s03_feature_pool_analysis.png"),
     Path("report_plots/s04_feature_selection_report.png"),
     Path("report_plots/s05_threshold_fp_recall_tradeoff.png"),
@@ -80,10 +79,7 @@ def _test_evaluation_passed(payload):
         and contract.get("configuration_frozen") is True
         and contract.get("selection_performed") is False
         and isinstance(summary, dict)
-        and summary.get("parallel_semantics_version") == "stage1_mask_stage2_continuous_v1"
-        and isinstance(summary.get("stage1_only"), dict)
-        and isinstance(summary.get("stage2_independent"), dict)
-        and isinstance(summary.get("fused_output"), dict)
+        and summary.get("evaluation_semantics") == "xgboost_only_v1"
         and isinstance(payload.get("window_model_summary"), dict)
         and isinstance(payload.get("window_stream_summary"), dict)
     )

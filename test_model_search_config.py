@@ -16,6 +16,52 @@ from stage2_feature_catalog import FEATURE_POOL_VERSION
 ROOT = Path(__file__).resolve().parent
 
 
+def _literal_accuracy_first_threshold(probs, y):
+    best = None
+    best_key = None
+    y = np.asarray(y, dtype=int)
+    probs = np.asarray(probs, dtype=float)
+    for threshold in np.linspace(0.05, 0.95, 181):
+        pred = (probs >= threshold).astype(int)
+        accuracy = float(s05.accuracy_score(y, pred))
+        precision = float(s05.precision_score(y, pred, zero_division=0))
+        recall = float(s05.recall_score(y, pred, zero_division=0))
+        f1 = float(s05.f1_score(y, pred, zero_division=0))
+        tn, fp, fn, tp = s05.confusion_matrix(y, pred, labels=[0, 1]).ravel()
+        fp_rate = float(fp / max(tn + fp, 1))
+        item = {
+            "threshold": float(threshold),
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "fp_rate": fp_rate,
+            "confusion_matrix": {"TN": tn, "FP": fp, "FN": fn, "TP": tp},
+        }
+        key = (accuracy, -fp_rate, f1, precision, recall)
+        if best_key is None or key > best_key:
+            best = item
+            best_key = key
+    return best
+
+
+@pytest.mark.parametrize(
+    "probs,y",
+    [
+        ([0.01, 0.10, 0.49, 0.50, 0.90, 0.99], [0, 0, 1, 0, 1, 1]),
+        ([0.50, 0.50, 0.50, 0.50], [0, 1, 0, 1]),
+        ([np.nan, -np.inf, 0.50, np.inf], [0, 1, 0, 1]),
+        (np.random.RandomState(42).rand(257), np.random.RandomState(7).randint(0, 2, 257)),
+    ],
+)
+def test_vectorized_accuracy_threshold_matches_literal_reference(probs, y):
+    expected = _literal_accuracy_first_threshold(probs, y)
+
+    actual = s05.evaluate_accuracy_first_threshold_from_probs(probs, y)
+
+    assert actual == expected
+
+
 def _run_s08_dry_run(*args):
     return subprocess.run(
         [sys.executable, str(ROOT / "s08_run_pipeline.py"), "--dry_run", *args],
@@ -64,7 +110,7 @@ def test_s08_manual_resume_defaults_to_csv_selection_file(tmp_path):
     result = _run_s08_dry_run(
         "--artifact_dir", str(artifact_dir),
         "--feature_selection_mode", "manual",
-        "--skip", "s01,s02,s03,s04",
+        "--skip", "s01,s03,s04",
         "--stop_after", "s05",
     )
     output = result.stdout + result.stderr
@@ -82,7 +128,7 @@ def test_s08_manual_resume_runs_full_training_and_deploy_without_postprocess_sea
 
     result = _run_s08_dry_run(
         "--artifact_dir", str(artifact_dir),
-        "--skip", "s01,s02,s03,s04",
+        "--skip", "s01,s03,s04",
     )
     output = result.stdout + result.stderr
 
@@ -111,7 +157,7 @@ def test_s08_manual_resume_does_not_cap_user_feature_count(tmp_path):
         "--feature_selection_mode", "manual",
         "--manual_feature_file", str(selection_csv),
         "--max_features", "83",
-        "--skip", "s01,s02,s03,s04",
+        "--skip", "s01,s03,s04",
         "--stop_after", "s05",
     )
     output = result.stdout + result.stderr
@@ -131,7 +177,7 @@ def test_s08_with_postprocess_preserves_manual_selection_mode(tmp_path):
         "--feature_selection_mode", "manual",
         "--manual_feature_file", str(selection_csv),
         "--with_postprocess",
-        "--skip", "s01,s02,s03,s04",
+        "--skip", "s01,s03,s04",
         "--stop_after", "s07_post",
     )
     output = result.stdout + result.stderr
@@ -152,7 +198,7 @@ def test_s08_manual_resume_passes_frozen_feature_contract(tmp_path):
         "--artifact_dir", str(artifact_dir),
         "--feature_selection_mode", "manual",
         "--manual_feature_file", str(manual_file),
-        "--skip", "s01,s02,s03,s04",
+        "--skip", "s01,s03,s04",
         "--stop_after", "s05",
     )
     output = result.stdout + result.stderr
@@ -162,6 +208,75 @@ def test_s08_manual_resume_passes_frozen_feature_contract(tmp_path):
     assert f'--manual_feature_file "{manual_file}"' in output
     assert "--no-feature_search_local_swap" in output
     assert "--run_subset_search" not in output
+
+
+def test_s08_manual_resume_uses_smaller_balanced_model_search_budget(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    manual_file = artifact_dir / "manual_feature_selection.csv"
+    manual_file.write_text("feature,selected\nGREEN_AC_RMS,1\n", encoding="utf-8")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(manual_file),
+        "--skip", "s01,s03,s04",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert "--model_search_max_candidates 120" in output
+    assert "--model_search_stage2_top_k 12" in output
+    assert "--model_search_cache" in output
+
+
+def test_s08_manual_resume_fast_budget_and_explicit_override(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    manual_file = artifact_dir / "manual_feature_selection.csv"
+    manual_file.write_text("feature,selected\nGREEN_AC_RMS,1\n", encoding="utf-8")
+
+    fast = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(manual_file),
+        "--skip", "s01,s03,s04",
+        "--stop_after", "s05",
+        "--runtime_profile", "fast",
+    )
+    thorough = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(manual_file),
+        "--skip", "s01,s03,s04",
+        "--stop_after", "s05",
+        "--runtime_profile", "thorough",
+    )
+    overridden = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(manual_file),
+        "--skip", "s01,s03,s04",
+        "--stop_after", "s05",
+        "--model_search_max_candidates", "77",
+        "--model_search_stage2_top_k", "9",
+        "--no-model_search_cache",
+    )
+    fast_output = fast.stdout + fast.stderr
+    thorough_output = thorough.stdout + thorough.stderr
+    override_output = overridden.stdout + overridden.stderr
+
+    assert fast.returncode == 0, fast_output
+    assert "--model_search_max_candidates 80" in fast_output
+    assert "--model_search_stage2_top_k 12" in fast_output
+    assert thorough.returncode == 0, thorough_output
+    assert "--model_search_max_candidates 360" in thorough_output
+    assert "--model_search_stage2_top_k 48" in thorough_output
+    assert overridden.returncode == 0, override_output
+    assert "--model_search_max_candidates 77" in override_output
+    assert "--model_search_stage2_top_k 9" in override_output
+    assert "--no-model_search_cache" in override_output
 
 
 def _model_search_args(**overrides):
@@ -209,16 +324,82 @@ def test_model_search_workers_respect_force_serial(monkeypatch):
     assert s05.resolve_model_search_workers(4, n_items=20) == 1
 
 
+def test_model_search_workers_honor_large_explicit_request(monkeypatch):
+    monkeypatch.delenv("WL_FORCE_SERIAL", raising=False)
+
+    assert s05.resolve_model_search_workers(98, n_items=200) == 98
+    assert s05.resolve_model_search_workers(98, n_items=37) == 37
+
+
+def test_model_search_cache_fingerprint_covers_data_groups_and_cv():
+    X = np.asarray([[0.1, 0.2], [0.3, 0.4]], dtype=float)
+    y = np.asarray([0, 1], dtype=int)
+    groups = np.asarray(["a", "b"], dtype=object)
+    splits = [(np.asarray([0]), np.asarray([1]))]
+
+    baseline = s05.build_model_search_cache_fingerprint(X, y, groups, splits)
+    changed_x = s05.build_model_search_cache_fingerprint(X + 0.01, y, groups, splits)
+    changed_groups = s05.build_model_search_cache_fingerprint(
+        X, y, np.asarray(["a", "c"], dtype=object), splits)
+    changed_cv = s05.build_model_search_cache_fingerprint(
+        X, y, groups, [(np.asarray([1]), np.asarray([0]))])
+
+    assert baseline == s05.build_model_search_cache_fingerprint(X, y, groups, splits)
+    assert len({baseline, changed_x, changed_groups, changed_cv}) == 4
+
+
+def test_model_search_cache_ignores_corrupted_entry(tmp_path):
+    cache_file = tmp_path / "candidate.json"
+    cache_file.write_text("{not-json", encoding="utf-8")
+
+    assert s05.read_model_search_cache_entry(cache_file) is None
+
+    s05.write_model_search_cache_entry(cache_file, {"metrics": {"accuracy": np.float64(0.9)}})
+    loaded = s05.read_model_search_cache_entry(cache_file)
+
+    assert loaded["metrics"]["accuracy"] == 0.9
+
+
 def test_s08_passes_global_workers_to_model_search():
     result = _run_s08_dry_run(
         "--feature_selection_mode", "auto",
-        "--n_workers", "3",
+        "--n_workers", "98",
         "--stop_after", "s05",
     )
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output
-    assert "--model_search_n_workers 3" in output
+    assert "--model_search_n_workers 98" in output
+
+
+def test_s05_target_deploy_ratio_uses_full_stage2_population_semantics():
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "s05_train_final_model.py"), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    source = (ROOT / "s05_train_final_model.py").read_text(encoding="utf-8")
+    output = result.stdout + result.stderr
+
+    assert "P(target=1 | Stage1 pass)" not in source
+    assert "所有合法 Stage2 窗口" in output
+
+
+def test_s03_help_has_no_removed_threshold_gate_options():
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "s03_extract_feature_pool.py"), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    output = result.stdout + result.stderr
+
+    assert "test_gate" not in output
+    assert "dc_threshold" not in output
+    assert "ac_dc_threshold" not in output
 
 
 def _parallel_search_args(**overrides):
@@ -338,9 +519,142 @@ def test_staged_group_cv_model_search_uses_outer_candidate_workers(monkeypatch):
         groups=np.asarray(["a", "b", "c", "d"], dtype=object),
     )
 
-    assert calls == [(2, 2), (2, 2)]
+    assert calls == [
+        (2, 2),  # Stage A candidates
+        (4, 3),  # Stage B candidate x fold tasks
+        (2, 2),  # Stage B full-data node-count fits
+    ]
     assert len(records) == 2
     assert model.params["candidate_id"] == 2
+
+
+def test_staged_group_cv_keeps_default_baseline_inside_stage2_top_k(monkeypatch):
+    default_candidate = {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 0}
+    grid = [
+        default_candidate,
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 1, "learning_rate": 0.11},
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 2, "learning_rate": 0.12},
+    ]
+    splits = [
+        (np.asarray([0, 2]), np.asarray([1, 3])),
+        (np.asarray([1, 3]), np.asarray([0, 2])),
+    ]
+
+    class FakeModel:
+        def __init__(self, params):
+            self.params = params
+
+    monkeypatch.setattr(s05, "build_model_search_axes", lambda _args: {"candidate_id": [0, 1, 2]})
+    monkeypatch.setattr(s05, "build_model_search_grid", lambda *_args, **_kwargs: grid)
+    monkeypatch.setattr(
+        s05,
+        "build_repeated_group_cv_splits",
+        lambda *_args, **_kwargs: (splits, {"fallback": False, "reason": "test"}),
+    )
+    monkeypatch.setattr(
+        s05,
+        "train_xgb_with_params",
+        lambda params, *_args, **_kwargs: FakeModel(params),
+    )
+    monkeypatch.setattr(s05, "count_xgb_nodes", lambda _model: 20)
+    monkeypatch.setattr(
+        s05,
+        "evaluate_accuracy_first_threshold",
+        lambda model, *_args: {
+            "threshold": 0.5,
+            "accuracy": 0.80 + 0.05 * model.params.get("candidate_id", 0),
+            "precision": 0.9,
+            "recall": 0.9,
+            "f1": 0.9,
+            "fp_rate": 0.01,
+            "confusion_matrix": {"TN": 9, "FP": 1, "FN": 1, "TP": 9},
+        },
+    )
+    args = _parallel_search_args(
+        model_search_n_workers=1,
+        model_search_stage2_top_k=2,
+    )
+
+    _, summary, records = s05._search_xgb_hyperparameters_staged_group_cv(
+        args,
+        np.asarray([[0.0], [0.2], [0.8], [1.0]]),
+        np.asarray([0, 0, 1, 1]),
+        groups=np.asarray(["a", "b", "c", "d"], dtype=object),
+    )
+
+    assert summary["stage2_candidate_count"] == 2
+    assert len(records) == 2
+    assert any(record["is_default_params"] for record in records)
+    assert any(record["params"]["candidate_id"] == 2 for record in records)
+
+
+def test_staged_group_cv_reuses_metric_cache_but_refits_best_model(monkeypatch, tmp_path):
+    grid = [
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 1},
+        {**s05.DEFAULT_XGB_PARAMS, "candidate_id": 2},
+    ]
+    splits = [
+        (np.asarray([0, 2]), np.asarray([1, 3])),
+        (np.asarray([1, 3]), np.asarray([0, 2])),
+    ]
+    train_calls = []
+
+    class FakeModel:
+        def __init__(self, params):
+            self.params = params
+
+    def fake_train(params, *_args, **_kwargs):
+        train_calls.append(params["candidate_id"])
+        return FakeModel(params)
+
+    monkeypatch.setattr(s05, "build_model_search_axes", lambda _args: {"candidate_id": [1, 2]})
+    monkeypatch.setattr(s05, "build_model_search_grid", lambda *_args, **_kwargs: grid)
+    monkeypatch.setattr(s05, "_ensure_default_params_in_grid", lambda items, **_kwargs: list(items))
+    monkeypatch.setattr(
+        s05,
+        "build_repeated_group_cv_splits",
+        lambda *_args, **_kwargs: (splits, {"fallback": False, "reason": "test"}),
+    )
+    monkeypatch.setattr(s05, "train_xgb_with_params", fake_train)
+    monkeypatch.setattr(s05, "count_xgb_nodes", lambda _model: 20)
+    monkeypatch.setattr(
+        s05,
+        "evaluate_accuracy_first_threshold",
+        lambda model, *_args: {
+            "threshold": 0.5,
+            "accuracy": 0.90 + 0.01 * model.params["candidate_id"],
+            "precision": 0.9,
+            "recall": 0.9,
+            "f1": 0.9,
+            "fp_rate": 0.01,
+            "confusion_matrix": {"TN": 9, "FP": 1, "FN": 1, "TP": 9},
+        },
+    )
+    args = _parallel_search_args(
+        model_search_n_workers=1,
+        artifact_dir=tmp_path,
+        model_search_cache=True,
+    )
+    X = np.asarray([[0.0], [0.2], [0.8], [1.0]])
+    y = np.asarray([0, 0, 1, 1])
+    groups = np.asarray(["a", "b", "c", "d"], dtype=object)
+
+    _, first_summary, _ = s05._search_xgb_hyperparameters_staged_group_cv(
+        args, X, y, groups=groups)
+    first_fit_count = len(train_calls)
+    train_calls.clear()
+    _, second_summary, _ = s05._search_xgb_hyperparameters_staged_group_cv(
+        args, X, y, groups=groups)
+
+    assert first_fit_count == 9
+    assert len(train_calls) == 1
+    assert first_summary["cache"]["stage_a_hits"] == 0
+    assert second_summary["cache"]["stage_a_hits"] == 2
+    assert second_summary["cache"]["stage_b_cv_hits"] == 4
+    assert second_summary["cache"]["stage_b_full_hits"] == 2
+    assert set(second_summary["runtime_seconds"]) == {
+        "stage_a", "stage_b_cv", "stage_b_full", "best_refit", "total"
+    }
 
 
 def _sample_name_series(values):
@@ -1782,6 +2096,101 @@ def test_hard_negative_oof_splits_keep_sample_groups_disjoint():
         assert train_groups.isdisjoint(valid_groups)
 
 
+def test_hard_negative_oof_training_parallelizes_across_folds(monkeypatch):
+    df_train = pd.DataFrame({
+        "sample_name": ["a", "b", "c", "d"],
+        "h5_file": ["train.h5"] * 4,
+        "window_index": [0, 1, 2, 3],
+        "target": [0, 1, 0, 1],
+        "mode": [1, 1, 2, 2],
+        "quality_bin": ["ok"] * 4,
+    })
+    X_train = np.asarray([[0.1], [0.9], [0.2], [0.8]], dtype=float)
+    y_train = df_train["target"].to_numpy(dtype=int)
+    groups = np.asarray(["a", "b", "c", "d"], dtype=object)
+    splits = [
+        (np.asarray([0, 1]), np.asarray([2, 3])),
+        (np.asarray([2, 3]), np.asarray([0, 1])),
+    ]
+    map_calls = []
+
+    class FakeModel:
+        def predict_proba(self, X):
+            positive = np.asarray(X[:, 0], dtype=float)
+            return np.column_stack([1.0 - positive, positive])
+
+    monkeypatch.setattr(
+        s05,
+        "build_hard_negative_oof_splits",
+        lambda *args, **kwargs: (splits, {"n_splits": 2, "source_split": "train_only"}),
+    )
+    monkeypatch.setattr(s05, "train_xgb_with_params", lambda *args, **kwargs: FakeModel())
+
+    def ordered_map_spy(fn, items, n_workers=1):
+        items = list(items)
+        map_calls.append((len(items), n_workers))
+        return [fn(item) for item in items]
+
+    monkeypatch.setattr(s05, "ordered_thread_map", ordered_map_spy)
+
+    _, _, summary = s05.mine_hard_negative_training_weights(
+        df_train,
+        X_train,
+        y_train,
+        groups,
+        params={"n_estimators": 20},
+        n_folds=2,
+        n_workers=3,
+    )
+
+    assert map_calls == [(2, 2)]
+    assert summary["oof_covered_rows"] == 4
+    assert summary["oof_workers"] == 2
+
+
+def test_hard_negative_parallel_and_serial_oof_results_match(monkeypatch):
+    df_train = pd.DataFrame({
+        "sample_name": ["a", "b", "c", "d"],
+        "h5_file": ["train.h5"] * 4,
+        "window_index": [0, 1, 2, 3],
+        "target": [0, 1, 0, 1],
+        "mode": [1, 1, 2, 2],
+        "quality_bin": ["ok"] * 4,
+    })
+    X_train = np.asarray([[0.1], [0.9], [0.2], [0.8]], dtype=float)
+    y_train = df_train["target"].to_numpy(dtype=int)
+    groups = np.asarray(["a", "b", "c", "d"], dtype=object)
+    splits = [
+        (np.asarray([0, 1]), np.asarray([2, 3])),
+        (np.asarray([2, 3]), np.asarray([0, 1])),
+    ]
+
+    class FakeModel:
+        def predict_proba(self, X):
+            positive = np.asarray(X[:, 0], dtype=float)
+            return np.column_stack([1.0 - positive, positive])
+
+    monkeypatch.setattr(
+        s05,
+        "build_hard_negative_oof_splits",
+        lambda *args, **kwargs: (splits, {"n_splits": 2, "source_split": "train_only"}),
+    )
+    monkeypatch.setattr(s05, "train_xgb_with_params", lambda *args, **kwargs: FakeModel())
+
+    serial = s05.mine_hard_negative_training_weights(
+        df_train, X_train, y_train, groups, params={}, n_folds=2, n_workers=1)
+    parallel = s05.mine_hard_negative_training_weights(
+        df_train, X_train, y_train, groups, params={}, n_folds=2, n_workers=3)
+
+    np.testing.assert_array_equal(serial[0], parallel[0])
+    pd.testing.assert_frame_equal(serial[1], parallel[1])
+    serial_summary = {k: v for k, v in serial[2].items() if k != "oof_workers"}
+    parallel_summary = {k: v for k, v in parallel[2].items() if k != "oof_workers"}
+    assert serial_summary == parallel_summary
+    assert serial[2]["oof_workers"] == 1
+    assert parallel[2]["oof_workers"] == 2
+
+
 def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -1878,15 +2287,14 @@ def test_s05_mine_hard_negatives_writes_weights_and_config(tmp_path):
     }
 
 
-def test_default_feature_count_search_grid_matches_docs_and_s05():
+def test_manual_mode_does_not_search_feature_count():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     s08_source = (ROOT / "s08_run_pipeline.py").read_text(encoding="utf-8")
     s05_source = (ROOT / "s05_train_final_model.py").read_text(encoding="utf-8")
-    expected = '8,10,12,15,18'
 
-    assert expected in readme
-    assert f'default="{expected}"' in s08_source
-    assert f'default="{expected}"' in s05_source
+    assert "不搜索特征数量" in readme
+    assert 'if args.feature_selection_mode == "auto"' in s08_source
+    assert 'args.model_search_feature_counts = ""' in s05_source
 
 
 def test_s08_model_search_can_be_disabled_for_fast_dry_runs():

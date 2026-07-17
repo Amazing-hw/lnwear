@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 import s01_data_split as s01
-import s02_ir_dc_threshold as s02
 import s03_extract_feature_pool as s03
 import s04_feature_selection as s04
 import s05_train_final_model as s05
@@ -18,7 +17,7 @@ import s08_run_pipeline as s08
 ROOT = Path(__file__).resolve().parent
 
 
-@pytest.mark.parametrize("module", [s01, s02, s03, s06])
+@pytest.mark.parametrize("module", [s01, s03, s06])
 def test_sample_level_stages_use_requested_bounded_workers(module, monkeypatch):
     monkeypatch.delenv("WL_FORCE_SERIAL", raising=False)
 
@@ -27,7 +26,7 @@ def test_sample_level_stages_use_requested_bounded_workers(module, monkeypatch):
     assert module.resolve_n_workers(4, n_items=2) <= 2
 
 
-@pytest.mark.parametrize("module", [s01, s02, s03, s04, s06, s07])
+@pytest.mark.parametrize("module", [s01, s03, s04, s06, s07])
 def test_process_stages_support_force_serial_fallback(module, monkeypatch):
     monkeypatch.setenv("WL_FORCE_SERIAL", "1")
 
@@ -73,7 +72,7 @@ def test_s08_propagates_global_workers_to_enabled_pipeline_stages():
             "--feature_selection_mode",
             "auto",
             "--n_workers",
-            "3",
+            "98",
         ],
         cwd=ROOT,
         capture_output=True,
@@ -83,14 +82,15 @@ def test_s08_propagates_global_workers_to_enabled_pipeline_stages():
     )
 
     output = result.stdout + result.stderr
-    assert output.count("--n_workers 3") >= 7
-    assert "--model_search_n_workers 3" in output
+    # s02 阈值阶段已删除；其余六个支持 worker 的步骤必须全部继承全局值。
+    assert output.count("--n_workers 98") >= 6
+    assert "--model_search_n_workers 98" in output
     assert "OMP_NUM_THREADS=1" in output
     assert "MKL_NUM_THREADS=1" in output
 
 
 def test_parallel_executor_implementations_remain_present():
-    process_modules = [s01, s02, s03, s04, s06]
+    process_modules = [s01, s03, s04, s06]
 
     assert all(hasattr(module, "ProcessPoolExecutor") for module in process_modules)
     assert hasattr(s05, "ThreadPoolExecutor")

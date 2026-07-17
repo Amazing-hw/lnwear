@@ -23,14 +23,14 @@ from s06_deploy_eval import (
 
 REQUIRED_NPZ_KEYS = [
     "sample_name", "target", "window_start_sec", "window_end_sec",
-    "stage1_enabled", "prob_raw", "pred_raw", "quality", "ood_rate",
+    "prob_raw", "pred_raw", "quality", "ood_rate",
     "mode", "fallback", "model_threshold", "window_sec", "stride_sec",
     "cache_schema_version", "model_fingerprint_json", "feature_names_json",
     "skip_initial_windows",
 ]
 
 DEFAULT_WARMUP_FRAMES = 5
-EXPECTED_CACHE_SCHEMA_VERSION = "window_outputs_v2"
+EXPECTED_CACHE_SCHEMA_VERSION = "xgboost_window_outputs_v1"
 CACHE_CONTRACT_FIELDS = (
     "cache_schema_version",
     "model_fingerprint",
@@ -76,16 +76,11 @@ def load_window_cache_npz(path):
         out = {key: data[key].copy() for key in data.files}
 
     prob = np.asarray(out["prob_raw"], dtype=float)
-    for key in ["window_start_sec", "window_end_sec", "stage1_enabled",
-                 "pred_raw", "quality", "ood_rate"]:
+    for key in ["window_start_sec", "window_end_sec", "pred_raw", "quality", "ood_rate"]:
         arr = np.asarray(out[key])
         if arr.shape != prob.shape:
             raise ValueError(
                 f"{path} key {key} shape {arr.shape} != prob_raw shape {prob.shape}")
-    if "stage1_gate" in out and np.asarray(out["stage1_gate"]).shape != prob.shape:
-        raise ValueError(
-            f"{path} key stage1_gate shape {np.asarray(out['stage1_gate']).shape} "
-            f"!= prob_raw shape {prob.shape}")
     for key in ["window_indices", "window_targets"]:
         if key in out:
             arr = np.asarray(out[key])
@@ -101,8 +96,6 @@ def load_window_cache_npz(path):
     out["window_sec"] = float(_scalar(out["window_sec"]))
     out["stride_sec"] = float(_scalar(out["stride_sec"]))
     out["cache_schema_version"] = str(_scalar(out["cache_schema_version"]))
-    if "parallel_semantics_version" in out:
-        out["parallel_semantics_version"] = str(_scalar(out["parallel_semantics_version"]))
     out["model_fingerprint"] = json.loads(str(_scalar(out["model_fingerprint_json"])))
     out["feature_names"] = json.loads(str(_scalar(out["feature_names_json"])))
     out["skip_initial_windows"] = int(_scalar(out["skip_initial_windows"]))
@@ -189,7 +182,6 @@ def causal_median_filter_1d(x, k):
 
 def run_postprocess_on_cache(cache, params):
     probs = np.asarray(cache["prob_raw"], dtype=float)
-    enabled = np.asarray(cache.get("stage1_gate", cache["stage1_enabled"]), dtype=int)
     quality = np.asarray(cache["quality"], dtype=float)
     ends = np.asarray(cache["window_end_sec"], dtype=float)
     stride_sec = float(cache.get("stride_sec", 1.0))
@@ -208,7 +200,6 @@ def run_postprocess_on_cache(cache, params):
         K_off=int(params["K_off"]),
         cooldown_sec=float(params.get("cooldown_sec", 0.0)),
     )
-    stage2_states = []
     states = []
     scores = []
     state = 0
@@ -219,8 +210,7 @@ def run_postprocess_on_cache(cache, params):
         decision_time = float(ends[i]) if i < len(ends) else float((i + 1) * stride_sec)
         q = float(np.clip(quality[i] if i < len(quality) else 1.0, 0.0, 1.0))
         state, score = sm.update(float(p), quality=q, stride_sec=stride_sec)
-        stage2_states.append(int(state))
-        output_state = int(state) if i < len(enabled) and int(enabled[i]) > 0 else 0
+        output_state = int(state)
         scores.append(float(score))
         if output_state == 1:
             if first_output_sec is None:
@@ -238,18 +228,11 @@ def run_postprocess_on_cache(cache, params):
         strategy=params.get("sample_pred_strategy", "final_state"),
         warmup_frames=params.get("sample_pred_warmup_frames", 0),
     )
-    stage2_pred = sample_pred_from_states(
-        stage2_states,
-        strategy=params.get("sample_pred_strategy", "final_state"),
-        warmup_frames=params.get("sample_pred_warmup_frames", 0),
-    )
     return {
         "sample_name": cache["sample_name"],
         "target": int(cache["target"]),
         "pred": int(pred),
-        "stage2_pred": int(stage2_pred),
         "states": states,
-        "stage2_states": stage2_states,
         "window_targets": np.asarray(
             cache.get("window_targets", np.full(len(states), int(cache["target"]))),
             dtype=int,
@@ -413,35 +396,7 @@ def compute_dataset_metrics(details, params_label="", warmup_frames=0):
         "false_worn_duration_mean_sec": false_worn_duration_mean,
         "state_flip_count": state_flip_count,
     }
-    stage2_pred = np.array([d.get("stage2_pred", d["pred"]) for d in details])
-    s2_tn, s2_fp, s2_fn, s2_tp = confusion_matrix(
-        y_true, stage2_pred, labels=[0, 1]).ravel()
-    stage2_true_windows, stage2_pred_windows = [], []
-    for d in details:
-        targets = list(d.get("window_targets", []))
-        states = list(d.get("stage2_states", d.get("states", [])))
-        start = min(warmup_frames, len(states))
-        for idx, state in enumerate(states[start:], start=start):
-            stage2_true_windows.append(
-                int(targets[idx]) if idx < len(targets) else int(d["target"]))
-            stage2_pred_windows.append(int(state))
-    out.update({
-        "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
-        "stage2_sample_accuracy": float(accuracy_score(y_true, stage2_pred)),
-        "stage2_sample_fp_rate": float(s2_fp / max(int(s2_tn + s2_fp), 1)),
-        "stage2_sample_tp": int(s2_tp),
-        "stage2_sample_fp": int(s2_fp),
-        "stage2_sample_fn": int(s2_fn),
-        "stage2_sample_tn": int(s2_tn),
-        "stage2_window_accuracy": (
-            float(accuracy_score(stage2_true_windows, stage2_pred_windows))
-            if stage2_true_windows else 0.0
-        ),
-        "fused_sample_accuracy": sample_accuracy,
-        "fused_sample_fp_rate": sample_fp_rate,
-        "fused_window_accuracy": window_accuracy,
-        "fused_window_fp_rate": window_fp_rate,
-    })
+    out["evaluation_semantics"] = "xgboost_postprocess_only_v1"
     out.update(early_accuracy)
     return out
 

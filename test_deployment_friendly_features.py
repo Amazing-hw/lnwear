@@ -266,11 +266,6 @@ def test_export_deploy_cookbook_writes_performance_profile(tmp_path):
         },
         artifact_dir / "model_bundle.pkl",
     )
-    (artifact_dir / "stage1_threshold.json").write_text(
-        '{"deploy_stage1_threshold":{"dc_threshold":100000,"ac_dc_threshold":1.0}}',
-        encoding="utf-8",
-    )
-
     s08.export_feature_extractor_script(str(artifact_dir))
     s08.export_deploy_cookbook(str(artifact_dir))
 

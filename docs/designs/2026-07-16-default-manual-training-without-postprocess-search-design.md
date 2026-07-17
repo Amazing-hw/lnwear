@@ -22,7 +22,7 @@
 
 ### 第二阶段：训练与部署
 
-- 使用 `--skip s01,s02,s03,s04` 和同一 artifact 目录恢复。
+- 使用 `--skip s01,s03,s04` 和同一 artifact 目录恢复。
 - `s05` 严格读取人工 CSV，不搜索特征数量。
 - 默认执行 staged group-CV XGBoost 搜参，最大深度候选为 2、3、4、5，并按配置并行评估候选。
 - manual 恢复训练默认启用 train OOF hard-negative 候选；只有 valid 不退化时才接受。
@@ -43,4 +43,3 @@
 - 导出模型和独立特征脚本的 `FEATURE_ORDER` 与人工 CSV 完全一致。
 - README 首要运行说明与代码默认值一致。
 - 全项目测试、编译、错误级静态检查和差异检查通过。
-

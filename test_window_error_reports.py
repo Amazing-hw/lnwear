@@ -14,12 +14,11 @@ import s07_postprocess_optimize as s07
 ROOT = Path(__file__).resolve().parent
 
 
-def test_window_model_metrics_include_stage1_closed_windows():
+def test_window_model_metrics_include_all_xgboost_windows():
     metrics = s06.compute_window_model_metrics([
         {
-            "sample_name": "closed_but_computed",
+            "sample_name": "computed",
             "target": 1,
-            "stage1_pass": False,
             "fallback": False,
             "window_preds": [1, 1],
             "window_targets": [1, 1],
@@ -30,7 +29,7 @@ def test_window_model_metrics_include_stage1_closed_windows():
     assert metrics["accuracy"] == 1.0
 
 
-def test_stage2_state_warms_while_stage1_masks_external_output():
+def test_state_machine_output_is_not_masked_by_legacy_gate_fields():
     cfg = {
         **s06.DEFAULT_POSTPROCESS_CONFIG,
         "alpha": 1.0,
@@ -45,12 +44,11 @@ def test_stage2_state_warms_while_stage1_masks_external_output():
         [{
             "sample_name": "parallel",
             "target": 1,
-            "stage1_pass": True,
             "fallback": False,
             "window_probs": [0.9, 0.9, 0.9],
             "window_preds": [1, 1, 1],
             "quality_metas": [{}, {}, {}],
-            "stage1_gate_flags": [0, 0, 1],
+            "stage1_gate_flags": [0, 0, 0],
         }],
         method="state_machine",
         cfg=cfg,
@@ -59,16 +57,13 @@ def test_stage2_state_warms_while_stage1_masks_external_output():
     )
 
     detail = details[0]
-    assert detail["stage2_states"] == [0, 1, 1]
-    assert detail["output_states"] == [0, 0, 1]
-    assert detail["window_states"] == detail["output_states"]
-    assert detail["stage2_pred"] == 1
+    assert detail["window_states"] == [0, 1, 1]
     assert detail["pred"] == 1
-    assert summary["stage2_independent"]["accuracy"] == 1.0
-    assert summary["fused_output"]["accuracy"] == 1.0
+    assert summary["accuracy"] == 1.0
+    assert summary["evaluation_semantics"] == "xgboost_postprocess_only_v1"
 
 
-def test_stage1_closed_masks_output_without_changing_stage2_prediction():
+def test_legacy_closed_gate_cannot_mask_xgboost_output():
     cfg = {
         **s06.DEFAULT_POSTPROCESS_CONFIG,
         "alpha": 1.0,
@@ -82,7 +77,6 @@ def test_stage1_closed_masks_output_without_changing_stage2_prediction():
         [{
             "sample_name": "closed",
             "target": 1,
-            "stage1_pass": False,
             "fallback": False,
             "window_probs": [0.9, 0.9],
             "window_preds": [1, 1],
@@ -94,10 +88,33 @@ def test_stage1_closed_masks_output_without_changing_stage2_prediction():
         model_threshold=0.5,
     )
 
-    assert details[0]["stage2_pred"] == 1
-    assert details[0]["pred"] == 0
-    assert details[0]["stage2_states"] == [1, 1]
-    assert details[0]["output_states"] == [0, 0]
+    assert details[0]["pred"] == 1
+    assert details[0]["window_states"] == [1, 1]
+
+
+def test_sample_metrics_preserve_partial_window_feature_failures():
+    summary, details = s06.compute_sample_metrics(
+        [{
+            "sample_name": "partial_failure",
+            "target": 1,
+            "fallback": False,
+            "window_probs": [0.9],
+            "window_preds": [1],
+            "quality_metas": [{}],
+            "window_feature_failure_count": 2,
+            "window_feature_failure_examples": [
+                {"window_position": 0, "error": "RuntimeError: failed"},
+            ],
+        }],
+        method="prob_mean",
+        cfg=s06.DEFAULT_POSTPROCESS_CONFIG,
+        model_threshold=0.5,
+    )
+
+    assert summary["samples_with_window_feature_failures"] == 1
+    assert summary["total_window_feature_failures"] == 2
+    assert details[0]["window_feature_failure_count"] == 2
+    assert details[0]["window_feature_failure_examples"][0]["window_position"] == 0
 
 
 class _DeployTestBooster:
@@ -284,8 +301,6 @@ def test_window_cache_preserves_window_indices_and_targets(tmp_path):
         "mode": 0,
         "window_probs": [0.2, 0.8],
         "window_preds": [0, 1],
-        "stage1_gate_flags": [0, 1],
-        "stage2_enabled_flags": [1, 1],
         "window_start_sec": [3.0, 20.0],
         "window_end_sec": [6.0, 23.0],
         "window_indices": [3, 20],
@@ -304,7 +319,8 @@ def test_window_cache_preserves_window_indices_and_targets(tmp_path):
 
     assert cache["window_indices"].tolist() == [3, 20]
     assert cache["window_targets"].tolist() == [0, 1]
-    assert cache["stage1_gate"].tolist() == [0, 1]
+    assert "stage1_gate" not in cache
+    assert "stage1_enabled" not in cache
 
 
 def test_window_cache_export_removes_only_top_level_obsolete_npz(tmp_path):
@@ -412,15 +428,6 @@ def test_export_deploy_artifacts_writes_selected_stage2_contracts(
             "use_stage2_ir": False,
         },
     }
-    (tmp_path / "stage1_threshold.json").write_text(
-        json.dumps({
-            "deploy_stage1_threshold": {
-                "dc_threshold": 1.0,
-                "ac_dc_threshold": 0.1,
-            }
-        }),
-        encoding="utf-8",
-    )
     monkeypatch.setattr(s06.joblib, "load", lambda _path: bundle)
 
     s06.export_deploy_artifacts(tmp_path, skip_initial_windows=3)

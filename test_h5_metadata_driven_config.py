@@ -160,8 +160,6 @@ def test_stage2_downsampling_is_controlled_only_by_frequency_metadata(
             "frequency": frequency,
             "ppg_config": 0,
         },
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_len=500,
         stride_len=100,
         fs=100,

@@ -168,7 +168,7 @@ def test_s08_dry_run_can_add_feature_embedding_report_step():
             "--stop_after",
             "s04_embed",
             "--skip",
-            "s01,s02,s03,s04,s04_search",
+            "s01,s03,s04,s04_search",
         ],
         cwd=root,
         text=True,

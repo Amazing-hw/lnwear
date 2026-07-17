@@ -764,7 +764,7 @@ def test_shared_window_interface_returns_candidates_diagnostics_and_preprocessed
     assert diagnostics["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
     assert features["mode"] == 0.0
     assert diagnostics["ACC_AVAILABLE"] == 1.0
-    assert "AMB_STAGE1_RATIO" in diagnostics
+    assert "AMB_STAGE1_RATIO" not in diagnostics
     assert {"g_top2_bp", "g_top2_raw", "g_mean_bp"} <= set(preprocessed)
 
 
@@ -792,7 +792,6 @@ def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
 
     monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
     monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
-    monkeypatch.setattr(s03, "stage1_sample_pass", lambda *_args, **_kwargs: True)
 
     def fake_shared(window, mode, fs, acc_window, use_stage2_ir):
         calls.append((window.shape, mode, fs, acc_window is not None, use_stage2_ir))
@@ -803,9 +802,6 @@ def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
             "PPG_INVALID_COUNT": 0.0,
             "GREEN_INVALID_COUNT": 0.0,
             "ACC_AVAILABLE": float(acc_window is not None),
-            "AMB_STAGE1_RATIO": 0.0,
-            "AMB_STAGE1_PASS": 1.0,
-            "IR_DC_LEVEL": 0.0,
         }
         return features, diagnostics, {}
 
@@ -815,8 +811,6 @@ def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
             "sample_name": "sample", "h5_file": "x.h5", "target": 1,
             "frequency": 100, "ppg_config": 0,
         },
-        dc_threshold=1.0,
-        ac_dc_threshold=1.0,
         window_len=300,
         stride_len=100,
         fs=100,

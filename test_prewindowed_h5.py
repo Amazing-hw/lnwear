@@ -37,8 +37,6 @@ def test_s03_prewindowed_sample_trims_both_ends_when_read(monkeypatch, tmp_path)
             "sample_name": "sample_trim", "h5_file": str(h5_path), "target": 1,
             "frequency": 100, "ppg_config": 0,
         },
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_len=300,
         stride_len=100,
         fs=100,
@@ -84,8 +82,6 @@ def test_s03_parallel_extraction_preserves_input_sample_order(monkeypatch):
 
     result = s03.extract_features_for_split(
         samples,
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         n_workers=2,
     )
 
@@ -107,7 +103,7 @@ def test_s03_normalizes_h5_prewindowed_channel_points_layout():
     assert float(normalized[0, 0, 0]) == 4.0e6
 
 
-def test_s03_prewindowed_sample_uses_all_windows_when_stage1_is_closed(monkeypatch):
+def test_s03_prewindowed_sample_uses_all_windows(monkeypatch):
     ppg_windows = np.zeros((4, 40, 300), dtype=float)
     ppg_windows[:, 0, :] = 4.0e6
     ppg_windows[:, 1, :] = 1.0e5
@@ -115,8 +111,6 @@ def test_s03_prewindowed_sample_uses_all_windows_when_stage1_is_closed(monkeypat
 
     monkeypatch.setattr(s03, "load_ppg", lambda sample: s03.normalize_ppg_array(ppg_windows))
     monkeypatch.setattr(s03, "load_acc", lambda sample: None)
-    monkeypatch.setattr(s03, "stage1_sample_pass", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(s03, "stage1_ambient_check", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         s03,
         "extract_stage2_window",
@@ -132,8 +126,6 @@ def test_s03_prewindowed_sample_uses_all_windows_when_stage1_is_closed(monkeypat
             "sample_name": "sample_a", "h5_file": "x.h5", "target": 1,
             "frequency": 100, "ppg_config": 0,
         },
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_len=300,
         stride_len=100,
         fs=100,
@@ -148,7 +140,7 @@ def test_s03_prewindowed_sample_uses_all_windows_when_stage1_is_closed(monkeypat
     assert [r["start_100hz"] for r in rows] == [100, 200, 300]
 
 
-def test_s06_prewindowed_inference_runs_stage2_when_stage1_is_closed(monkeypatch):
+def test_s06_prewindowed_inference_runs_xgboost_for_all_windows(monkeypatch):
     ppg_windows = np.zeros((4, 40, 300), dtype=float)
     ppg_windows[:, 0, :] = 4.0e6
     ppg_windows[:, 1, :] = 1.0e5
@@ -160,19 +152,15 @@ def test_s06_prewindowed_inference_runs_stage2_when_stage1_is_closed(monkeypatch
         "target": 1,
         "frequency": 100,
         "ppg_config": 0,
-        "stage1_pass": True,
         "mode": 0,
         "window_probs": [],
         "window_preds": [],
         "quality_metas": [],
         "window_ood_scores": [],
-        "stage2_enabled_flags": [],
         "window_start_sec": [],
         "window_end_sec": [],
     }
 
-    monkeypatch.setattr(s06, "stage1_sample_pass", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(s06, "stage1_ambient_check", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         s06,
         "get_channels_from_window",
@@ -193,8 +181,6 @@ def test_s06_prewindowed_inference_runs_stage2_when_stage1_is_closed(monkeypatch
         base,
         normalized_ppg,
         acc=None,
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_sec=3,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
@@ -206,11 +192,11 @@ def test_s06_prewindowed_inference_runs_stage2_when_stage1_is_closed(monkeypatch
     assert result["window_end_sec"] == [4.0, 5.0, 6.0]
     assert result["window_preds"] == [1, 1, 1]
     assert result["window_probs"] == [0.8, 0.8, 0.8]
-    assert result["stage1_gate_flags"] == [0, 0, 0]
-    assert result["stage2_enabled_flags"] == result["stage1_gate_flags"]
+    assert "stage1_gate_flags" not in result
+    assert "stage2_enabled_flags" not in result
 
 
-def test_s06_continuous_inference_runs_stage2_when_stage1_is_closed(monkeypatch):
+def test_s06_continuous_inference_runs_xgboost_for_all_windows(monkeypatch):
     ppg = np.zeros((1200, 40), dtype=float)
     ppg[:, 0] = 4.0e6
     ppg[:, 1] = 1.0e5
@@ -219,11 +205,6 @@ def test_s06_continuous_inference_runs_stage2_when_stage1_is_closed(monkeypatch)
     monkeypatch.setattr(s06, "validate_h5_file", lambda *_args, **_kwargs: (True, None))
     monkeypatch.setattr(s06, "load_ppg", lambda _sample: ppg)
     monkeypatch.setattr(s06, "load_acc", lambda _sample: None)
-    monkeypatch.setattr(
-        s06,
-        "_advance_stage1_gate_to_step",
-        lambda _gate, _ir, _win, _stride, _last, target: (False, target),
-    )
     monkeypatch.setattr(
         s06,
         "get_channels_from_window",
@@ -245,8 +226,6 @@ def test_s06_continuous_inference_runs_stage2_when_stage1_is_closed(monkeypatch)
             "sample_name": "continuous", "h5_file": "x.h5", "target": 1,
             "frequency": 100, "ppg_config": 0,
         },
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_sec=3,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
@@ -256,8 +235,124 @@ def test_s06_continuous_inference_runs_stage2_when_stage1_is_closed(monkeypatch)
 
     assert result["window_probs"] == [0.8, 0.8, 0.8, 0.8]
     assert result["window_preds"] == [1, 1, 1, 1]
-    assert result["stage1_gate_flags"] == [0, 0, 0, 0]
-    assert result["stage2_enabled_flags"] == result["stage1_gate_flags"]
+    assert "stage1_gate_flags" not in result
+    assert "stage2_enabled_flags" not in result
+
+
+def test_s06_prewindowed_all_feature_failures_are_explicit_fallback(monkeypatch):
+    ppg = np.zeros((2, 125, 12), dtype=float)
+    base = {
+        "sample_name": "all_failed",
+        "target": 1,
+        "frequency": 25,
+        "ppg_config": 1,
+        "mode": 1,
+        "fallback": False,
+        "fallback_reason": None,
+        "window_indices": [],
+        "window_labels": [],
+    }
+    monkeypatch.setattr(
+        s06,
+        "extract_feature_pool_from_window",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("forced feature failure")),
+    )
+
+    result = s06._infer_prewindowed_sample(
+        base,
+        ppg,
+        acc=None,
+        window_sec=5,
+        stride_sec=1,
+        bundle={"feature_quantiles": None, "feature_names": []},
+        use_stage2_ir=False,
+        skip_initial_windows=0,
+    )
+
+    assert result["fallback"] is True
+    assert result["fallback_reason"].startswith("all_window_feature_extraction_failed")
+    assert "RuntimeError: forced feature failure" in result["fallback_reason"]
+    assert result["window_probs"] == []
+    assert result["window_preds"] == []
+    assert result["window_feature_failure_count"] == 2
+
+
+def test_s06_prewindowed_partial_failure_drops_invalid_window_and_keeps_alignment(monkeypatch):
+    ppg = np.zeros((3, 125, 12), dtype=float)
+    base = {
+        "sample_name": "partial_failed",
+        "target": 1,
+        "frequency": 25,
+        "ppg_config": 1,
+        "mode": 1,
+        "fallback": False,
+        "fallback_reason": None,
+        "window_indices": [10, 11, 12],
+        "window_labels": [1, 0, 1],
+        "window_layout": None,
+    }
+    calls = {"count": 0}
+
+    def extract_or_fail(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("first window failed")
+        return {"GREEN_CORR": 1.0}, {"g_top2_bp": np.ones(125)}
+
+    monkeypatch.setattr(s06, "extract_feature_pool_from_window", extract_or_fail)
+    monkeypatch.setattr(
+        s06,
+        "predict_label_windows",
+        lambda feats, bundle: (np.ones(len(feats), dtype=int), np.full(len(feats), 0.8)),
+    )
+
+    result = s06._infer_prewindowed_sample(
+        base,
+        ppg,
+        acc=None,
+        window_sec=5,
+        stride_sec=1,
+        bundle={"feature_quantiles": None, "feature_names": []},
+        use_stage2_ir=False,
+        skip_initial_windows=0,
+    )
+
+    assert result["fallback"] is False
+    assert result["window_feature_failure_count"] == 1
+    assert result["window_probs"] == [0.8, 0.8]
+    assert result["window_preds"] == [1, 1]
+    assert result["window_start_sec"] == [1.0, 2.0]
+    assert result["window_end_sec"] == [6.0, 7.0]
+
+
+def test_s06_continuous_all_feature_failures_are_explicit_fallback(monkeypatch):
+    ppg = np.zeros((1200, 40), dtype=float)
+    monkeypatch.setattr(s06, "validate_h5_file", lambda *_args, **_kwargs: (True, None))
+    monkeypatch.setattr(s06, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s06, "load_acc", lambda _sample: None)
+    monkeypatch.setattr(
+        s06,
+        "extract_feature_pool_from_window",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("continuous feature failure")),
+    )
+
+    result = s06._infer_one_sample(
+        {
+            "sample_name": "continuous_failed", "h5_file": "x.h5", "target": 1,
+            "frequency": 100, "ppg_config": 0,
+        },
+        window_sec=3,
+        stride_sec=1,
+        bundle={"feature_quantiles": None, "feature_names": []},
+        skip_initial_windows=0,
+        use_stage2_ir=False,
+    )
+
+    assert result["fallback"] is True
+    assert result["fallback_reason"].startswith("all_window_feature_extraction_failed")
+    assert "RuntimeError: continuous feature failure" in result["fallback_reason"]
+    assert result["window_probs"] == []
+    assert result["window_feature_failure_count"] == 4
 
 
 def test_s01_scans_grouped_window_h5_layout(tmp_path):
@@ -334,8 +429,6 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
         "ppg_config": 0,
     }
 
-    monkeypatch.setattr(s03, "stage1_sample_pass", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(s03, "stage1_ambient_check", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         s03,
         "extract_stage2_window",
@@ -348,8 +441,6 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
 
     rows = s03._extract_rows_for_sample(
         sample,
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_len=300,
         stride_len=100,
         fs=100,
@@ -394,8 +485,6 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
         "ppg_config": 0,
     }
 
-    monkeypatch.setattr(s06, "stage1_sample_pass", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(s06, "stage1_ambient_check", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         s06,
         "get_channels_from_window",
@@ -414,8 +503,6 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
 
     result = s06._infer_one_sample(
         sample,
-        dc_threshold=0.1e6,
-        ac_dc_threshold=1.0,
         window_sec=3,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},

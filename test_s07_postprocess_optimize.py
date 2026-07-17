@@ -25,7 +25,6 @@ def _write_cache(path, sample_name, target, probs, **contract_overrides):
         "target": np.asarray(target, dtype=np.int32),
         "window_start_sec": starts,
         "window_end_sec": ends,
-        "stage1_enabled": np.ones(n, dtype=np.int32),
         "prob_raw": probs,
         "pred_raw": pred_raw,
         "quality": np.ones(n, dtype=float),
@@ -39,7 +38,7 @@ def _write_cache(path, sample_name, target, probs, **contract_overrides):
         "stride_sec": np.asarray(
             contract_overrides.get("stride_sec", 1.0), dtype=float),
         "cache_schema_version": np.asarray(
-            contract_overrides.get("cache_schema_version", "window_outputs_v2")),
+            contract_overrides.get("cache_schema_version", "xgboost_window_outputs_v1")),
         "model_fingerprint_json": np.asarray(json.dumps(
             contract_overrides.get("model_fingerprint", {"source": "test"}))),
         "feature_names_json": np.asarray(json.dumps(
@@ -72,7 +71,7 @@ def test_s06_window_contract_rejects_cli_mismatch():
 @pytest.mark.parametrize(
     ("field", "override"),
     [
-        ("cache_schema_version", "window_outputs_v1"),
+        ("cache_schema_version", "window_outputs_v2"),
         ("model_fingerprint", {"source": "other"}),
         ("feature_names", ["GREEN_DC_MEAN"]),
         ("model_threshold", 0.6),
@@ -104,7 +103,7 @@ def test_s07_rejects_uniformly_obsolete_cache_schema(tmp_path):
         cache_schema_version="window_outputs_v1",
     )
 
-    with pytest.raises(ValueError, match="window_outputs_v2"):
+    with pytest.raises(ValueError, match="xgboost_window_outputs_v1"):
         s07.load_split_caches(artifact_dir, "window_outputs", "valid")
 
 
@@ -231,7 +230,7 @@ def test_s07_parallel_grid_search_initializes_worker_caches(tmp_path):
     final_config = json.loads(
         (artifact_dir / "final_model_config.json").read_text(encoding="utf-8"))
     provenance = optimized["cache_provenance"]
-    assert provenance["cache_schema_version"] == "window_outputs_v2"
+    assert provenance["cache_schema_version"] == "xgboost_window_outputs_v1"
     assert provenance["model_fingerprint"] == {"source": "test"}
     assert provenance["feature_names"] == ["GREEN_AC_RMS"]
     assert provenance["model_threshold"] == 0.5
@@ -277,7 +276,6 @@ def test_s07_window_accuracy_uses_per_window_targets_from_cache():
         "sample_name": "mixed-record",
         "target": 1,
         "window_end_sec": np.array([1.0, 2.0, 3.0]),
-        "stage1_enabled": np.array([1, 1, 1]),
         "prob_raw": np.array([0.1, 0.9, 0.9]),
         "quality": np.ones(3),
         "stride_sec": 1.0,
@@ -303,7 +301,6 @@ def test_s07_window_accuracy_can_skip_state_machine_warmup_windows():
         "sample_name": "warmup-pos",
         "target": 1,
         "window_end_sec": np.array([1.0, 2.0, 3.0]),
-        "stage1_enabled": np.array([1, 1, 1]),
         "prob_raw": np.array([0.9, 0.9, 0.9]),
         "quality": np.ones(3),
         "stride_sec": 1.0,
@@ -334,7 +331,6 @@ def test_s07_first_worn_latency_is_relative_to_first_valid_stage2_probability():
         "sample_name": "relative-latency",
         "target": 1,
         "window_end_sec": np.array([5.0, 6.0, 7.0]),
-        "stage1_enabled": np.array([1, 1, 1]),
         "prob_raw": np.array([0.9, 0.9, 0.9]),
         "quality": np.ones(3),
         "stride_sec": 1.0,
@@ -486,7 +482,6 @@ def test_s07_any_worn_strategy_keeps_positive_sample_after_late_drop():
         "sample_name": "late-drop-pos",
         "target": 1,
         "window_end_sec": np.arange(1, 7, dtype=float),
-        "stage1_enabled": np.ones(6, dtype=int),
         "prob_raw": np.array([0.9, 0.9, 0.9, 0.1, 0.1, 0.1]),
         "quality": np.ones(6),
         "stride_sec": 1.0,
@@ -510,12 +505,11 @@ def test_s07_any_worn_strategy_keeps_positive_sample_after_late_drop():
     assert detail["pred"] == 1
 
 
-def test_s07_stage2_state_warms_while_stage1_masks_output():
+def test_s07_state_machine_warms_before_positive_output():
     cache = {
-        "sample_name": "gate-opens-after-warmup",
+        "sample_name": "unmasked-after-warmup",
         "target": 1,
         "window_end_sec": np.arange(1, 4, dtype=float),
-        "stage1_enabled": np.array([0, 0, 1], dtype=int),
         "prob_raw": np.array([0.9, 0.9, 0.9]),
         "quality": np.ones(3),
         "stride_sec": 1.0,
@@ -535,9 +529,7 @@ def test_s07_stage2_state_warms_while_stage1_masks_output():
 
     detail = s07.run_postprocess_on_cache(cache, params)
 
-    assert detail["stage2_states"] == [0, 1, 1]
-    assert detail["states"] == [0, 0, 1]
-    assert detail["stage2_pred"] == 1
+    assert detail["states"] == [0, 1, 1]
     assert detail["pred"] == 1
 
 
@@ -555,7 +547,6 @@ def test_s07_postprocess_handles_empty_window_cache_without_unbound_state():
         "sample_name": "empty",
         "target": 1,
         "window_end_sec": np.array([], dtype=float),
-        "stage1_enabled": np.array([], dtype=int),
         "prob_raw": np.array([], dtype=float),
         "quality": np.array([], dtype=float),
         "stride_sec": 1.0,
@@ -594,7 +585,6 @@ def test_s07_postprocess_state_machine_matches_s06_leaky_counter_semantics():
         "sample_name": "pos",
         "target": 1,
         "window_end_sec": np.arange(1, len(probs) + 1, dtype=float),
-        "stage1_enabled": np.ones(len(probs), dtype=int),
         "prob_raw": np.asarray(probs, dtype=float),
         "quality": np.ones(len(probs), dtype=float),
         "stride_sec": 1.0,

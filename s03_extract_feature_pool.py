@@ -13,8 +13,7 @@
 
 功能：
 1. 读取 artifacts/splits.json
-2. 读取 artifacts/stage1_threshold.json
-3. 对全部合法样本/窗口提取 5s/25Hz Stage2 特征；Stage1 仅独立统计，不过滤 Stage2
+2. 对全部合法样本/窗口提取 5s/25Hz XGBoost 特征
    读入并排序后固定删除每条数据的前三个和后三个窗口。
 4. 复用原始 H5 读取方式
 5. 只按 H5 `ppg_config` 构建三个固定物理光区，不做信号方差判断。
@@ -57,10 +56,6 @@ EPS = 1e-12
 MIN_ZONE_RELATIVE_AC_RMS = 1e-8
 MIN_ZONE_ABSOLUTE_AC_RMS = 1e-9
 DEFAULT_FS = 100.0
-STAGE1_PRIMITIVE_SEC = 1.0
-STAGE1_DECISION_SEC = 3.0
-STAGE1_FS = 5
-STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
 DEFAULT_SKIP_INITIAL_WINDOWS = 0
 EDGE_WINDOW_TRIM = 3
 DEFAULT_USE_STAGE2_IR = False
@@ -264,7 +259,7 @@ _REDUNDANT_FEATURES = {
 }
 
 # =========================================================
-# H5 读取与 Stage1 工具
+# H5 读取工具
 # =========================================================
 
 def normalize_ppg_array(arr):
@@ -421,114 +416,6 @@ def get_sample_ppg_config(sample):
 def _is_25hz_sample(sample):
     """Compatibility helper backed only by explicit H5 frequency metadata."""
     return get_sample_frequency(sample) == 25
-def stage1_ambient_check(ppg, ambient_ratio_threshold=0.8):
-    """Stage1 环境光检查: median(ambient) / median(ir) < threshold。
-
-    比对值过高说明环境光异常强或传感器未贴紧皮肤。
-    此函数保留用于极端硬过滤；比值本身作为特征写入特征池，让模型学习决策边界。
-    """
-    if is_prewindowed_signal(ppg):
-        ppg = flatten_prewindowed_signal(ppg)
-    if ppg is None or ppg.shape[1] < 2:
-        return True  # no ambient channel, pass
-    ir_dc = float(np.median(ppg[:, 0]))
-    amb_dc = float(np.median(ppg[:, 1]))
-    # 只过滤极端无效情况（IR 完全无信号，或环境光绝对淹没了IR）
-    if ir_dc < 1e2:
-        return False
-    try:
-        ambient_ratio_threshold = float(ambient_ratio_threshold)
-    except (TypeError, ValueError):
-        ambient_ratio_threshold = 0.8
-    return (amb_dc / ir_dc) < ambient_ratio_threshold
-
-def compute_ambient_stage1_features(raw_window):
-    """计算环境光 Stage1 软特征（供模型学习，不硬过滤）。
-
-    返回 dict 含 AMB_STAGE1_RATIO / AMB_STAGE1_PASS / IR_DC_LEVEL。
-    用于区分"真离腕"和"佩戴但环境光强"。"""
-    feats = {}
-    if raw_window is None:
-        feats["AMB_STAGE1_RATIO"] = 0.0
-        feats["AMB_STAGE1_PASS"] = 1.0
-        feats["IR_DC_LEVEL"] = 0.0
-        return feats
-    ppg_flat = flatten_prewindowed_signal(raw_window) if is_prewindowed_signal(raw_window) else raw_window
-    if ppg_flat is None or ppg_flat.shape[1] < 2:
-        feats["AMB_STAGE1_RATIO"] = 0.0
-        feats["AMB_STAGE1_PASS"] = 1.0
-        feats["IR_DC_LEVEL"] = 0.0
-        return feats
-    ir_dc = float(np.median(ppg_flat[:, 0]))
-    amb_dc = float(np.median(ppg_flat[:, 1]))
-    ratio = float(amb_dc / max(ir_dc, EPS))
-    feats["AMB_STAGE1_RATIO"] = ratio
-    feats["AMB_STAGE1_PASS"] = 1.0 if stage1_ambient_check(raw_window) else 0.0
-    feats["IR_DC_LEVEL"] = ir_dc
-    return feats
-
-
-def downsample_to_5hz(signal, fs_original=100, fs_target=5):
-    if fs_original == fs_target:
-        return signal
-
-    gcd = np.gcd(fs_original, fs_target)
-    up = fs_target // gcd
-    down = fs_original // gcd
-
-    return resample_poly(signal, up, down)
-
-def stage1_sample_pass(ppg, dc_threshold, ac_dc_threshold, ppg_fs=100):
-    """
-    Stage1 逻辑（与 s02 固定阈值配置保持一致）：
-    IR 通道 ppg[:, 0]
-    ppg_fs -> 5Hz
-    3s窗口，15点
-    只要任意一个 3s 窗口通过，就认为该 sample 进入第二阶段。
-
-    pass 条件：
-        dc > dc_threshold and ac_dc_ratio < ac_dc_threshold
-
-    DC = min(neighbor_mean) where neighbor_mean[i] = (x[i] + x[i+1]) / 2
-    AC = median(|diff(x)|)
-    """
-    if is_prewindowed_signal(ppg):
-        ppg = flatten_prewindowed_signal(ppg)
-    ir = ppg[:, 0]
-    ir_5hz = downsample_to_5hz(ir, ppg_fs, 5)
-
-    win = int(round(STAGE1_PRIMITIVE_SEC * STAGE1_FS))
-    stride = win
-    pass_count = 0
-
-    for i in range(0, len(ir_5hz) - win + 1, stride):
-        x = ir_5hz[i:i + win]
-
-        # DC: min(邻均值) —— 对单点毛刺鲁棒（与 s02 一致）
-        if len(x) >= 2:
-            neighbor_mean = (x[:-1] + x[1:]) / 2.0
-            dc = float(np.min(neighbor_mean))
-        else:
-            dc = float(np.mean(x))
-
-        # AC: 邻差 MAD —— 与 s02 一致
-        if len(x) >= 2:
-            ac = float(np.median(np.abs(np.diff(x))))
-        else:
-            ac = 0.0
-
-        ac_dc_ratio = ac / (np.abs(dc) + EPS)
-
-        if dc > dc_threshold and ac_dc_ratio < ac_dc_threshold:
-            pass_count += 1
-        else:
-            pass_count = 0
-
-        if pass_count >= STAGE1_GATE_K:
-            return True
-
-    return False
-
 # =========================================================
 # 绿光通道构建逻辑
 # =========================================================
@@ -667,9 +554,6 @@ STAGE2_IR_FEATURE_PREFIXES = (
 
 STAGE2_IR_FEATURE_NAMES = {
     "corr_Ambient_IR",
-    "AMB_STAGE1_RATIO",
-    "AMB_STAGE1_PASS",
-    "IR_DC_LEVEL",
 }
 
 
@@ -1345,7 +1229,7 @@ def _diff_spike_ratio(x, k=6.0):
 def short_window_sqi_features(ir_raw_in, amb_raw_in, g_raw_in):
     """Fast Stage2 SQI features from ambient and green only.
 
-    IR is intentionally ignored here: Stage1 owns IR gating, and Stage2 must not
+    IR is intentionally ignored here so XGBoost does not
     carry hidden IR information through generic SQI feature names.
     """
     channels = [
@@ -2452,8 +2336,9 @@ def _extract_legacy_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, ret
     # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
 
     # ---- Invalid feature count (before NaN→0.0 fill) ----
-    # Stage2 starts after Stage1 IR gating. IR-derived keys must not be created
-    # in the model-facing pool; failing here catches new leaks at the source.
+    # XGBoost runs on every legal window and excludes IR-derived candidates.
+    # IR-derived keys must not enter the Stage2 model-facing pool; failing here
+    # catches new cross-stage feature leaks at the source.
     _stage2_ir_leaks = [k for k in feat.keys() if is_stage2_ir_feature(k)]
     if _stage2_ir_leaks:
         raise ValueError(
@@ -3348,7 +3233,6 @@ def extract_stage2_window(
     diagnostics = stage2_diagnostic_fields(
         raw_ir, ambient, g1, g2, g3, acc_window=acc_window
     )
-    diagnostics.update(compute_ambient_stage1_features(ppg))
     diagnostics['mode'] = int(mode)
     return features, diagnostics, preprocessed
 
@@ -3394,16 +3278,14 @@ def _downsample_ppg(ppg, src_fs=100, tgt_fs=25):
     return np.concatenate(out_parts, axis=1)
 
 
-def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
-                              window_len, stride_len, fs,
+def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                               target_aware_stride, stride_neg, stride_pos,
                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                               use_stage2_ir=DEFAULT_USE_STAGE2_IR):
     """
     单样本全量抽窗特征。返回 rows list（失败时返回 []）。
 
-    Stage1 与 Stage2 并行运行；dc_threshold/ac_dc_threshold 仅为旧调用接口
-    兼容参数，不过滤 Stage2 训练、验证或测试窗口。3D 预切窗样本直接使用
+    所有合法窗口直接进入 XGBoost 特征提取。3D 预切窗样本直接使用
     已有窗口；连续时序样本降采样到 25Hz 后滑窗。
     fs 参数为降采样后目标采样率 (25Hz)。
     """
@@ -3551,19 +3433,17 @@ def _extract_rows_for_sample(sample, dc_threshold, ac_dc_threshold,
 
 def _worker_extract(args_tuple):
     """子进程入口。"""
-    (sample, dc_threshold, ac_dc_threshold, window_len, stride_len, fs,
+    (sample, window_len, stride_len, fs,
      target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
      use_stage2_ir) = args_tuple
     return _extract_rows_for_sample(
-        sample, dc_threshold, ac_dc_threshold, window_len, stride_len, fs,
+        sample, window_len, stride_len, fs,
         target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
     )
 
 
 def extract_features_for_split(samples,
-                               dc_threshold,
-                               ac_dc_threshold,
                                window_sec=5,
                                stride_sec=1,
                                fs=100,
@@ -3577,8 +3457,6 @@ def extract_features_for_split(samples,
 
     参数:
         samples: 样本列表
-        dc_threshold: Stage1 DC阈值
-        ac_dc_threshold: Stage1 AC/DC阈值
         window_sec: 窗口秒数
         stride_sec: 默认步长秒数
         fs: 采样率
@@ -3594,7 +3472,7 @@ def extract_features_for_split(samples,
     n_workers = resolve_n_workers(n_workers, n_items=len(samples))
 
     args_list = [
-        (s, dc_threshold, ac_dc_threshold, window_len, stride_len, fs,
+        (s, window_len, stride_len, fs,
          target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
          use_stage2_ir)
         for s in samples
@@ -3635,45 +3513,6 @@ def extract_features_for_split(samples,
 # =========================================================
 # main
 # =========================================================
-def resolve_stage1_thresholds(th):
-    """
-    兼容新旧 stage1_threshold.json。
-
-    新版：
-        th["deploy_stage1_threshold"]
-        th["train_stage1_threshold"]
-
-    旧版：
-        th["dc_threshold"]
-        th["ac_dc_threshold"]
-    """
-    if "deploy_stage1_threshold" in th:
-        deploy_dc = th["deploy_stage1_threshold"]["dc_threshold"]
-        deploy_acdc = th["deploy_stage1_threshold"]["ac_dc_threshold"]
-    else:
-        deploy_dc = th["dc_threshold"]
-        deploy_acdc = th["ac_dc_threshold"]
-
-    if "train_stage1_threshold" in th:
-        train_dc = th["train_stage1_threshold"]["dc_threshold"]
-        train_acdc = th["train_stage1_threshold"]["ac_dc_threshold"]
-    else:
-        # 旧版没有宽松阈值时，退化为 deploy 阈值
-        train_dc = deploy_dc
-        train_acdc = deploy_acdc
-
-    return {
-        "deploy": {
-            "dc_threshold": float(deploy_dc),
-            "ac_dc_threshold": float(deploy_acdc),
-        },
-        "train": {
-            "dc_threshold": float(train_dc),
-            "ac_dc_threshold": float(train_acdc),
-        }
-    }
-
-
 def main(args=None):
     parser = argparse.ArgumentParser()
 
@@ -3700,14 +3539,6 @@ def main(args=None):
     parser.add_argument("--target_ratio", type=float, default=5.0,
                         help="target 感知 stride 启用时的目标 neg/pos 比例")
 
-    parser.add_argument(
-        "--test_gate",
-        type=str,
-        default="deploy",
-        choices=["deploy", "train"],
-        help="test 特征池提取使用哪个 Stage1 门控。防过拟合推荐 deploy。"
-    )
-
     parser.add_argument("--n_workers", type=int,
                         default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                         help="并行 worker 数")
@@ -3716,25 +3547,8 @@ def main(args=None):
         args = parser.parse_args()
 
     split_path = os.path.join(args.artifact_dir, "splits.json")
-    th_path = os.path.join(args.artifact_dir, "stage1_threshold.json")
-
     with open(split_path, "r", encoding="utf-8") as f:
         split = json.load(f)
-
-    with open(th_path, "r", encoding="utf-8") as f:
-        th = json.load(f)
-
-    thresholds = resolve_stage1_thresholds(th)
-
-    print("=" * 80)
-    print("Stage1 thresholds")
-    print("=" * 80)
-    print("deploy threshold:")
-    print(f"  dc_threshold    = {thresholds['deploy']['dc_threshold']}")
-    print(f"  acdc_threshold  = {thresholds['deploy']['ac_dc_threshold']}")
-    print("train/feature threshold:")
-    print(f"  dc_threshold    = {thresholds['train']['dc_threshold']}")
-    print(f"  acdc_threshold  = {thresholds['train']['ac_dc_threshold']}")
 
     feature_pool_frames = {}
     for part in ["train", "valid", "test"]:
@@ -3742,18 +3556,6 @@ def main(args=None):
         print(f"提取 {part} 特征")
         print("=" * 80)
 
-        if part in ["train", "valid"]:
-            gate_name = "train"
-        else:
-            gate_name = args.test_gate
-
-        dc_threshold = thresholds[gate_name]["dc_threshold"]
-        ac_dc_threshold = thresholds[gate_name]["ac_dc_threshold"]
-
-        print(f"{part} 使用 Stage1 gate: {gate_name}")
-        print(f"  dc_threshold    = {dc_threshold}")
-        print(f"  ac_dc_threshold  = {ac_dc_threshold}")
-        
         if args.target_aware_stride:
             print("  ⚠ target_aware_stride: 启用 (不推荐)")
             print("    target=0 stride=1s, target=1 stride=3s -> 制造窗口级不平衡")
@@ -3765,8 +3567,6 @@ def main(args=None):
 
         df = extract_features_for_split(
             samples=split[part],
-            dc_threshold=dc_threshold,
-            ac_dc_threshold=ac_dc_threshold,
             window_sec=args.window_sec,
             stride_sec=args.stride_sec,
             fs=100,

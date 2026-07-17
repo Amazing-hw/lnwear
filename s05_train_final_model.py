@@ -18,6 +18,8 @@ import argparse
 import hashlib
 import logging
 import joblib
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import product
 from pathlib import Path
@@ -243,10 +245,138 @@ def _candidate_record(name, model, metrics):
 
 def _atomic_json_dump(payload, path):
     path = Path(path)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+MODEL_SEARCH_CACHE_SCHEMA_VERSION = "model_search_metrics_v1"
+
+
+def _json_compatible(value):
+    """Convert NumPy/path values to stable JSON primitives for cache files."""
+    if isinstance(value, dict):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return [_json_compatible(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _update_digest_with_array(digest, name, values):
+    digest.update(str(name).encode("utf-8"))
+    if values is None:
+        digest.update(b"<none>")
+        return
+    array = np.asarray(values)
+    digest.update(json.dumps(list(array.shape), separators=(",", ":")).encode("ascii"))
+    digest.update(str(array.dtype).encode("ascii", errors="replace"))
+    if array.dtype.kind in {"O", "U", "S"}:
+        payload = json.dumps(
+            [None if item is None else str(item) for item in array.ravel(order="C")],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        digest.update(payload)
+    else:
+        digest.update(np.ascontiguousarray(array).tobytes())
+
+
+def build_model_search_cache_fingerprint(X, y, groups, cv_splits, sample_weight=None):
+    """Hash all data and split inputs that determine reusable search metrics."""
+    digest = hashlib.sha256()
+    digest.update(MODEL_SEARCH_CACHE_SCHEMA_VERSION.encode("ascii"))
+    digest.update(str(getattr(xgb, "__version__", "unknown")).encode("utf-8"))
+    _update_digest_with_array(digest, "X", X)
+    _update_digest_with_array(digest, "y", y)
+    _update_digest_with_array(digest, "groups", groups)
+    _update_digest_with_array(digest, "sample_weight", sample_weight)
+    for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits):
+        _update_digest_with_array(digest, f"fold_{fold_idx}_train", train_idx)
+        _update_digest_with_array(digest, f"fold_{fold_idx}_valid", valid_idx)
+    return digest.hexdigest()
+
+
+def _model_search_params_hash(params):
+    canonical = json.dumps(
+        _json_compatible(params),
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def write_model_search_cache_entry(path, payload):
+    """Atomically write a versioned model-search metric cache entry."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "schema_version": MODEL_SEARCH_CACHE_SCHEMA_VERSION,
+        **_json_compatible(payload),
+    }
+    _atomic_json_dump(entry, path)
+
+
+def read_model_search_cache_entry(path):
+    """Return a valid cache entry, or None for absent/corrupted/stale data."""
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            entry = json.load(handle)
+        if entry.get("schema_version") != MODEL_SEARCH_CACHE_SCHEMA_VERSION:
+            return None
+        return entry
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def _valid_cached_node_count(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_cached_threshold_metrics(metrics):
+    if not isinstance(metrics, dict):
+        return False
+    for key in ["threshold", "accuracy", "precision", "recall", "f1", "fp_rate"]:
+        value = metrics.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not np.isfinite(value):
+            return False
+    confusion = metrics.get("confusion_matrix")
+    if not isinstance(confusion, dict):
+        return False
+    return all(_valid_cached_node_count(confusion.get(key)) for key in ["TN", "FP", "FN", "TP"])
+
+
+def _model_search_cache_root(args, X, y, groups, cv_splits, sample_weight=None):
+    if not bool(getattr(args, "model_search_cache", True)):
+        return None
+    artifact_dir = getattr(args, "artifact_dir", None)
+    if not artifact_dir:
+        return None
+    fingerprint = build_model_search_cache_fingerprint(
+        X, y, groups, cv_splits, sample_weight=sample_weight)
+    # Keep paths short enough for Windows installations without long-path support.
+    root = Path(artifact_dir) / "model_search_cache" / fingerprint[:32]
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("model-search cache disabled because its directory is unavailable: %s", exc)
+        return None
+    return root
 
 MODEL_SEARCH_PARAM_KEYS = [
     "n_estimators",
@@ -287,14 +417,14 @@ def _env_flag(name):
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def resolve_model_search_workers(n_workers=None, n_items=None, cap=4):
-    """Resolve bounded outer-search concurrency while preserving a serial escape hatch."""
+def resolve_model_search_workers(n_workers=None, n_items=None):
+    """Resolve requested outer-search concurrency with task and serial bounds."""
     if _env_flag("WL_FORCE_SERIAL"):
         return 1
     if n_workers is None:
         n_workers = 1
     try:
-        resolved = max(1, min(int(n_workers), int(cap)))
+        resolved = max(1, int(n_workers))
     except (TypeError, ValueError):
         resolved = 1
     if n_items is not None:
@@ -987,17 +1117,43 @@ def score_model_search_candidate(metrics, total_nodes, max_model_nodes=400,
     }
 
 
-def evaluate_accuracy_first_threshold(model, X, y):
-    probs = model.predict_proba(X)[:, 1]
+def evaluate_accuracy_first_threshold_from_probs(probs, y):
+    """Evaluate the fixed threshold grid from sorted cumulative class counts."""
+    probs = np.asarray(probs, dtype=float)
+    y = np.asarray(y, dtype=int)
+    if probs.ndim != 1 or y.ndim != 1 or len(probs) != len(y) or len(y) == 0:
+        raise ValueError("probs and y must be non-empty aligned 1D arrays")
+
+    # NumPy comparisons classify NaN as false at every threshold. Exclude NaNs
+    # from the sorted search while keeping their labels in the negative side of
+    # each confusion matrix. +/-inf retain their ordinary comparison semantics.
+    comparable = ~np.isnan(probs)
+    comparable_probs = probs[comparable]
+    comparable_y = y[comparable]
+    order = np.argsort(comparable_probs, kind="mergesort")
+    sorted_probs = comparable_probs[order]
+    sorted_positive = (comparable_y[order] == 1).astype(np.int64)
+    positive_prefix = np.concatenate(([0], np.cumsum(sorted_positive, dtype=np.int64)))
+    comparable_positive = int(positive_prefix[-1])
+    total_positive = int(np.sum(y == 1))
+    total_negative = int(len(y) - total_positive)
+    thresholds = np.linspace(0.05, 0.95, 181)
+    first_positive = np.searchsorted(sorted_probs, thresholds, side="left")
+
     best = None
     best_key = None
-    for threshold in np.linspace(0.05, 0.95, 181):
-        pred = (probs >= threshold).astype(int)
-        accuracy = float(accuracy_score(y, pred))
-        precision = float(precision_score(y, pred, zero_division=0))
-        recall = float(recall_score(y, pred, zero_division=0))
-        f1 = float(f1_score(y, pred, zero_division=0))
-        tn, fp, fn, tp = confusion_matrix(y, pred, labels=[0, 1]).ravel()
+    for threshold, split_idx in zip(thresholds, first_positive):
+        split_idx = int(split_idx)
+        tp = int(comparable_positive - positive_prefix[split_idx])
+        predicted_positive = int(len(sorted_probs) - split_idx)
+        fp = int(predicted_positive - tp)
+        fn = int(total_positive - tp)
+        tn = int(total_negative - fp)
+        accuracy = float((tn + tp) / len(y))
+        precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        f1_denom = 2 * tp + fp + fn
+        f1 = float(2 * tp / f1_denom) if f1_denom > 0 else 0.0
         fp_rate = float(fp) / float(max(tn + fp, 1))
         item = {
             "threshold": float(threshold),
@@ -1014,6 +1170,12 @@ def evaluate_accuracy_first_threshold(model, X, y):
         if best_key is None or key > best_key:
             best = item
             best_key = key
+    return best
+
+
+def evaluate_accuracy_first_threshold(model, X, y):
+    probs = model.predict_proba(X)[:, 1]
+    best = evaluate_accuracy_first_threshold_from_probs(probs, y)
     try:
         best["auc"] = float(roc_auc_score(y, probs))
     except Exception:
@@ -1275,17 +1437,31 @@ def build_hard_negative_training_weights_from_oof(
 def mine_hard_negative_training_weights(
         df_train, X_train, y_train, groups, params, min_probability=0.5,
         top_percentile=0.10, hard_negative_weight=3.0, n_folds=3,
-        random_state=42):
+        random_state=42, n_workers=1):
     """Run train-only group-aware OOF mining and return final sample weights plus audit report."""
     splits, split_meta = build_hard_negative_oof_splits(
         y_train, groups=groups, n_folds=n_folds, random_state=random_state)
     oof_sum = np.zeros(len(y_train), dtype=float)
     oof_count = np.zeros(len(y_train), dtype=int)
-    for train_idx, valid_idx in splits:
+
+    def evaluate_oof_fold(item):
+        fold_idx, (train_idx, valid_idx) = item
         if len(train_idx) == 0 or len(valid_idx) == 0 or len(np.unique(y_train[train_idx])) < 2:
-            continue
+            return int(fold_idx), valid_idx, None
         fold_model = train_xgb_with_params(params, X_train[train_idx], y_train[train_idx])
-        oof_sum[valid_idx] += fold_model.predict_proba(X_train[valid_idx])[:, 1]
+        fold_probs = fold_model.predict_proba(X_train[valid_idx])[:, 1]
+        return int(fold_idx), valid_idx, np.asarray(fold_probs, dtype=float)
+
+    effective_workers = resolve_model_search_workers(n_workers, n_items=len(splits))
+    fold_results = ordered_thread_map(
+        evaluate_oof_fold,
+        list(enumerate(splits)),
+        n_workers=effective_workers,
+    )
+    for _, valid_idx, fold_probs in fold_results:
+        if fold_probs is None:
+            continue
+        oof_sum[valid_idx] += fold_probs
         oof_count[valid_idx] += 1
     oof_probs = np.full(len(y_train), np.nan, dtype=float)
     covered = oof_count > 0
@@ -1299,6 +1475,7 @@ def mine_hard_negative_training_weights(
     )
     summary["oof_split"] = split_meta
     summary["oof_covered_rows"] = int(np.sum(covered))
+    summary["oof_workers"] = int(effective_workers)
     return weights, report, summary
 
 
@@ -1598,6 +1775,7 @@ def score_fixed_params_with_train_cv(args, X_train, y_train, groups, params,
 
 def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y_select,
                                              scale_pos_weight=1.0, sample_weight=None):
+    search_started = time.perf_counter()
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
     n_workers = resolve_model_search_workers(
         getattr(args, "model_search_n_workers", 1), n_items=len(grid))
@@ -1637,11 +1815,13 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
             "params": params,
         }
 
+    candidates_started = time.perf_counter()
     records = ordered_thread_map(
         evaluate_candidate,
         list(enumerate(grid, 1)),
         n_workers=n_workers,
     )
+    candidate_seconds = time.perf_counter() - candidates_started
 
     best = choose_accuracy_first_model_search_record(
         records,
@@ -1652,8 +1832,10 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
             f"model_search found no candidate under max_model_nodes={args.max_model_nodes}. "
             "Relax --max_model_nodes or shrink the search grid."
         )
+    best_refit_started = time.perf_counter()
     best_model = train_xgb_with_params(
         best["params"], X_train, y_train, sample_weight=sample_weight)
+    best_refit_seconds = time.perf_counter() - best_refit_started
 
     records.sort(key=lambda r: (
         not r["eligible"],
@@ -1672,6 +1854,11 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
         "selection_policy": "accuracy_first_size_second",
         "grid_size": int(len(grid)),
         "outer_workers": int(n_workers),
+        "runtime_seconds": {
+            "candidates": float(candidate_seconds),
+            "best_refit": float(best_refit_seconds),
+            "total": float(time.perf_counter() - search_started),
+        },
         "best": _json_safe_model_search_record(best),
         "top_candidates": [_json_safe_model_search_record(r) for r in records[:20]],
     }, records
@@ -1679,6 +1866,7 @@ def _search_xgb_hyperparameters_single_split(args, X_train, y_train, X_select, y
 
 def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=None,
                                                 scale_pos_weight=1.0, sample_weight=None):
+    search_started = time.perf_counter()
     axes = build_model_search_axes(args)
     total_combinations = _model_search_combo_count(axes)
     grid = build_model_search_grid(args, scale_pos_weight=scale_pos_weight)
@@ -1694,6 +1882,25 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         cv_splits = [(idx, idx)]
         cv_meta = {"fallback": True, "reason": "empty_cv_splits", "n_splits": 1, "n_repeats": 1}
 
+    cache_root = _model_search_cache_root(
+        args,
+        X_train,
+        y_train,
+        groups,
+        cv_splits,
+        sample_weight=sample_weight,
+    )
+    cache_stats = {
+        "enabled": cache_root is not None,
+        "root": str(cache_root) if cache_root is not None else None,
+        "stage_a_hits": 0,
+        "stage_a_misses": 0,
+        "stage_b_cv_hits": 0,
+        "stage_b_cv_misses": 0,
+        "stage_b_full_hits": 0,
+        "stage_b_full_misses": 0,
+    }
+
     stage_train_idx, stage_valid_idx = cv_splits[0]
     n_workers = resolve_model_search_workers(
         getattr(args, "model_search_n_workers", 1), n_items=len(grid))
@@ -1705,17 +1912,44 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         n_workers,
     )
 
+    stage_a_started = time.perf_counter()
+
     def evaluate_stage_a_candidate(item):
         idx, params = item
-        sw_stage = sample_weight[stage_train_idx] if sample_weight is not None else None
-        candidate = train_xgb_with_params(
-            params, X_train[stage_train_idx], y_train[stage_train_idx], sample_weight=sw_stage)
-        selection_metrics = evaluate_accuracy_first_threshold(
-            candidate,
-            X_train[stage_valid_idx],
-            y_train[stage_valid_idx],
+        cache_path = None
+        cached = None
+        if cache_root is not None:
+            param_hash = _model_search_params_hash(params)[:20]
+            cache_path = cache_root / f"stage_a_{param_hash}.json"
+            cached = read_model_search_cache_entry(cache_path)
+        cache_hit = (
+            isinstance(cached, dict)
+            and _valid_cached_threshold_metrics(cached.get("selection_metrics"))
+            and _valid_cached_node_count(cached.get("total_nodes"))
+            and cached.get("params") == _json_compatible(params)
         )
-        total_nodes = count_xgb_nodes(candidate)
+        if cache_hit:
+            selection_metrics = cached["selection_metrics"]
+            total_nodes = int(cached["total_nodes"])
+        else:
+            sw_stage = sample_weight[stage_train_idx] if sample_weight is not None else None
+            candidate = train_xgb_with_params(
+                params, X_train[stage_train_idx], y_train[stage_train_idx], sample_weight=sw_stage)
+            selection_metrics = evaluate_accuracy_first_threshold(
+                candidate,
+                X_train[stage_valid_idx],
+                y_train[stage_valid_idx],
+            )
+            total_nodes = count_xgb_nodes(candidate)
+            if cache_path is not None:
+                try:
+                    write_model_search_cache_entry(cache_path, {
+                        "params": params,
+                        "selection_metrics": selection_metrics,
+                        "total_nodes": int(total_nodes),
+                    })
+                except OSError as exc:
+                    logger.warning("model-search cache write failed for Stage A: %s", exc)
         score = score_model_search_candidate(
             selection_metrics,
             total_nodes=total_nodes,
@@ -1739,6 +1973,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
             "chosen_reason": "",
             "metrics": selection_metrics,
             "params": params,
+            "_cache_hit": bool(cache_hit),
         }
 
     stage_records = ordered_thread_map(
@@ -1746,6 +1981,9 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         list(enumerate(grid, 1)),
         n_workers=n_workers,
     )
+    stage_a_seconds = time.perf_counter() - stage_a_started
+    cache_stats["stage_a_hits"] = int(sum(bool(r.pop("_cache_hit", False)) for r in stage_records))
+    cache_stats["stage_a_misses"] = int(len(stage_records) - cache_stats["stage_a_hits"])
 
     stage_records.sort(key=lambda r: (
         not r["eligible"],
@@ -1758,7 +1996,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
     stage2_params = _ensure_default_params_in_grid(
         stage2_params,
         scale_pos_weight=scale_pos_weight,
-        max_candidates=0,
+        max_candidates=stage2_top_k,
     )
     logger.info(
         "model_search staged_group_cv: stage B CV evaluating %d candidates across %d folds",
@@ -1767,22 +2005,117 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
     )
 
     fold_count = len(cv_splits)
+    stage_b_cv_started = time.perf_counter()
 
-    def evaluate_stage_b_candidate(item):
-        idx, params = item
-        fold_metrics = []
-        for fold_idx, (train_idx, valid_idx) in enumerate(cv_splits, 1):
+    def evaluate_stage_b_fold(item):
+        candidate_idx, fold_idx, params = item
+        train_idx, valid_idx = cv_splits[fold_idx]
+        cache_path = None
+        cached = None
+        if cache_root is not None:
+            param_hash = _model_search_params_hash(params)[:20]
+            cache_path = cache_root / f"stage_b_cv_{param_hash}_fold_{fold_idx}.json"
+            cached = read_model_search_cache_entry(cache_path)
+        cache_hit = (
+            isinstance(cached, dict)
+            and _valid_cached_threshold_metrics(cached.get("metrics"))
+            and cached.get("params") == _json_compatible(params)
+            and cached.get("fold_index") == int(fold_idx)
+        )
+        if cache_hit:
+            metrics = cached["metrics"]
+        else:
             sw_fold = sample_weight[train_idx] if sample_weight is not None else None
             fold_model = train_xgb_with_params(
                 params, X_train[train_idx], y_train[train_idx], sample_weight=sw_fold)
-            fold_metrics.append(evaluate_accuracy_first_threshold(
+            metrics = evaluate_accuracy_first_threshold(
                 fold_model,
                 X_train[valid_idx],
                 y_train[valid_idx],
-            ))
+            )
+            if cache_path is not None:
+                try:
+                    write_model_search_cache_entry(cache_path, {
+                        "params": params,
+                        "fold_index": int(fold_idx),
+                        "metrics": metrics,
+                    })
+                except OSError as exc:
+                    logger.warning("model-search cache write failed for Stage B CV: %s", exc)
+        return int(candidate_idx), int(fold_idx), metrics, bool(cache_hit)
+
+    fold_tasks = [
+        (candidate_idx, fold_idx, params)
+        for candidate_idx, params in enumerate(stage2_params)
+        for fold_idx in range(fold_count)
+    ]
+    fold_results = ordered_thread_map(
+        evaluate_stage_b_fold,
+        fold_tasks,
+        n_workers=resolve_model_search_workers(
+            getattr(args, "model_search_n_workers", 1), n_items=len(fold_tasks)),
+    )
+    fold_metrics_by_candidate = [dict() for _ in stage2_params]
+    for candidate_idx, fold_idx, metrics, cache_hit in fold_results:
+        fold_metrics_by_candidate[candidate_idx][fold_idx] = metrics
+        cache_stats["stage_b_cv_hits" if cache_hit else "stage_b_cv_misses"] += 1
+    stage_b_cv_seconds = time.perf_counter() - stage_b_cv_started
+
+    stage_b_full_started = time.perf_counter()
+    def evaluate_stage_b_full(item):
+        candidate_idx, params = item
+        cache_path = None
+        cached = None
+        if cache_root is not None:
+            param_hash = _model_search_params_hash(params)[:20]
+            cache_path = cache_root / f"stage_b_full_{param_hash}.json"
+            cached = read_model_search_cache_entry(cache_path)
+        cache_hit = (
+            isinstance(cached, dict)
+            and _valid_cached_node_count(cached.get("total_nodes"))
+            and cached.get("params") == _json_compatible(params)
+        )
+        if cache_hit:
+            total_nodes = int(cached["total_nodes"])
+        else:
+            final_model = train_xgb_with_params(
+                params, X_train, y_train, sample_weight=sample_weight)
+            total_nodes = int(count_xgb_nodes(final_model))
+            if cache_path is not None:
+                try:
+                    write_model_search_cache_entry(cache_path, {
+                        "params": params,
+                        "total_nodes": int(total_nodes),
+                    })
+                except OSError as exc:
+                    logger.warning("model-search cache write failed for Stage B full fit: %s", exc)
+        return int(candidate_idx), int(total_nodes), bool(cache_hit)
+
+    full_results = ordered_thread_map(
+        evaluate_stage_b_full,
+        list(enumerate(stage2_params)),
+        n_workers=resolve_model_search_workers(
+            getattr(args, "model_search_n_workers", 1), n_items=len(stage2_params)),
+    )
+    stage_b_full_seconds = time.perf_counter() - stage_b_full_started
+    final_nodes_by_candidate = {
+        int(candidate_idx): int(total_nodes)
+        for candidate_idx, total_nodes, _ in full_results
+    }
+    for _, _, cache_hit in full_results:
+        cache_stats["stage_b_full_hits" if cache_hit else "stage_b_full_misses"] += 1
+
+    cv_records = []
+    for candidate_idx, params in enumerate(stage2_params):
+        fold_metrics_map = fold_metrics_by_candidate[candidate_idx]
+        if len(fold_metrics_map) != fold_count:
+            raise RuntimeError(
+                f"Stage B candidate {candidate_idx} completed "
+                f"{len(fold_metrics_map)}/{fold_count} folds"
+            )
+        fold_metrics = [fold_metrics_map[fold_idx] for fold_idx in range(fold_count)]
         cv_summary = summarize_cv_metrics(fold_metrics)
-        final_model = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
-        final_total_nodes = count_xgb_nodes(final_model)
+        final_total_nodes = final_nodes_by_candidate[candidate_idx]
         mean_accuracy = float(cv_summary.get("mean_cv_accuracy") or 0.0)
         mean_fp_rate = float(cv_summary.get("mean_cv_fp_rate") or 0.0)
         size_ratio = (
@@ -1797,7 +2130,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         ) if eligible else float("-inf")
         mean_threshold = _mean_or_none([m.get("threshold") for m in fold_metrics])
         record = {
-            "rank_input_order": int(idx),
+            "rank_input_order": int(candidate_idx + 1),
             "eligible": bool(eligible),
             "score": float(score),
             "fp_rate": float(mean_fp_rate),
@@ -1828,14 +2161,7 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         }
         record.update(cv_summary)
         record["cv_folds_completed"] = int(min(record["cv_folds_completed"], fold_count))
-        return record
-
-    cv_records = ordered_thread_map(
-        evaluate_stage_b_candidate,
-        list(enumerate(stage2_params, 1)),
-        n_workers=resolve_model_search_workers(
-            getattr(args, "model_search_n_workers", 1), n_items=len(stage2_params)),
-    )
+        cv_records.append(record)
 
     best = choose_cv_model_search_record(
         cv_records,
@@ -1846,8 +2172,10 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
             f"model_search found no candidate under max_model_nodes={args.max_model_nodes}. "
             "Relax --max_model_nodes or shrink the search grid."
         )
+    best_refit_started = time.perf_counter()
     best_model = train_xgb_with_params(
         best["params"], X_train, y_train, sample_weight=sample_weight)
+    best_refit_seconds = time.perf_counter() - best_refit_started
 
     cv_records.sort(key=lambda r: (
         not r["eligible"],
@@ -1857,6 +2185,18 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         int(r.get("final_total_nodes", r.get("total_nodes", 0))),
     ))
     default_baseline = next((r for r in cv_records if r.get("is_default_params")), None)
+    total_seconds = time.perf_counter() - search_started
+    logger.info(
+        "model-search timing: stage_a=%.2fs, stage_b_cv=%.2fs, "
+        "stage_b_full=%.2fs, best_refit=%.2fs, total=%.2fs; cache hits=%d",
+        stage_a_seconds,
+        stage_b_cv_seconds,
+        stage_b_full_seconds,
+        best_refit_seconds,
+        total_seconds,
+        int(cache_stats["stage_a_hits"] + cache_stats["stage_b_cv_hits"]
+            + cache_stats["stage_b_full_hits"]),
+    )
     return best_model, {
         "enabled": True,
         "strategy": "staged_group_cv",
@@ -1875,6 +2215,14 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         "random_state": int(args.model_search_random_state),
         "max_candidates": int(args.model_search_max_candidates),
         "outer_workers": int(n_workers),
+        "cache": cache_stats,
+        "runtime_seconds": {
+            "stage_a": float(stage_a_seconds),
+            "stage_b_cv": float(stage_b_cv_seconds),
+            "stage_b_full": float(stage_b_full_seconds),
+            "best_refit": float(best_refit_seconds),
+            "total": float(total_seconds),
+        },
         "parameter_space": {
             "total_combinations": int(total_combinations),
             "sampled_grid_size": int(len(grid)),
@@ -2678,8 +3026,6 @@ def main(args=None):
                         help="fraction of the valid calibration pool reserved for single_split model-search selection")
     parser.add_argument("--model_search_max_candidates", type=int, default=360,
                         help="maximum sampled candidates from the search grid; <=0 disables sampling")
-    parser.add_argument("--model_search_stage1_top_k", type=int, default=4,
-                        help="number of stage-1 structure candidates advanced to stage-2 refine")
     parser.add_argument("--model_search_stage2_top_k", type=int, default=48,
                         help="number of stage-A candidates kept for staged_group_cv")
     parser.add_argument("--model_search_cv_folds", type=int, default=3,
@@ -2690,6 +3036,8 @@ def main(args=None):
                         help="random seed for deterministic candidate sampling and CV splits")
     parser.add_argument("--model_search_n_workers", type=int, default=1,
                         help="parallel outer model candidates; each XGBoost fit defaults to WL_INNER_N_JOBS=1")
+    parser.add_argument("--model_search_cache", action=argparse.BooleanOptionalAction, default=True,
+                        help="reuse versioned staged_group_cv metrics under artifact_dir/model_search_cache")
     parser.add_argument("--model_search_n_estimators", type=str,
                         default=_model_search_default_csv("n_estimators"),
                         help=(
@@ -2729,9 +3077,9 @@ def main(args=None):
     parser.add_argument("--ood_q_high", type=float, default=0.95)
     parser.add_argument(
         "--target_deploy_ratio", type=float, default=None,
-        help=("部署时 Stage2 输入的期望 P(target=1 | Stage1 pass)。"
+        help=("部署时所有合法 Stage2 窗口的期望正类比例 P(target=1)。"
               "给出后按公式 r*(1-p_train)/((1-r)*p_train) 计算 scale_pos_weight，"
-              "让训练 effective 分布对齐部署条件分布。"
+              "让训练 effective 分布对齐 Stage2 全量部署输入分布。"
               "默认 None：scale_pos_weight=1.0（既不补偿不平衡也不强加权）。")
     )
     parser.add_argument(
@@ -3017,8 +3365,8 @@ def main(args=None):
     #   把 FP 控制在产品可接受范围。
     #
     # 显式期望（--target_deploy_ratio r）：
-    #   按部署时 Stage2 输入的期望 P(target=1 | Stage1 pass) 重加权，
-    #   使训练 effective 分布 ≈ 部署条件分布。
+    #   按部署时所有合法 Stage2 窗口的期望正类比例 P(target=1) 重加权，
+    #   使训练 effective 分布 ≈ Stage2 全量部署输入分布。
     #   公式: scale_pos_weight = r * (1 - p_train) / ((1 - r) * p_train)
     # 普通单 k 或空：走正常训练流程；显式 feature_counts 分支上方已经训练完成
     if not _using_feature_count_search:
@@ -3048,7 +3396,10 @@ def main(args=None):
         logger.info(f"  scale_pos_weight 策略: {scale_pos_weight_strategy}")
         logger.info(f"  scale_pos_weight: {scale_pos_weight:.4f}")
         if args.target_deploy_ratio is None and not args.legacy_scale_pos_weight:
-            logger.info("  提示：未指定 --target_deploy_ratio。FP 高代价场景建议先估部署条件分布再传入。")
+            logger.info(
+                "  提示：未指定 --target_deploy_ratio。FP 高代价场景建议先估计"
+                "所有合法 Stage2 窗口的部署正类比例再传入。"
+            )
 
         model_search_records = []
         model_search_summary = {
@@ -3123,6 +3474,7 @@ def main(args=None):
             model_search_summary.get("best", {}).get("params")
             or build_default_xgb_params(scale_pos_weight=scale_pos_weight)
         )
+        hard_negative_started = time.perf_counter()
         hn_weights, hn_report, hard_negative_summary = mine_hard_negative_training_weights(
             df_train_for_hn,
             X_train_hn,
@@ -3134,7 +3486,9 @@ def main(args=None):
             hard_negative_weight=args.hard_negative_weight,
             n_folds=args.model_search_cv_folds,
             random_state=args.model_search_random_state,
+            n_workers=args.model_search_n_workers,
         )
+        hard_negative_oof_seconds = time.perf_counter() - hard_negative_started
         hard_negative_summary["threshold_source"] = threshold_source
         hard_negative_summary["params_source"] = (
             "model_search_best" if model_search_summary.get("best") else "default_xgb_params"
@@ -3158,12 +3512,19 @@ def main(args=None):
             int(hard_negative_summary.get("n_train_rows", len(y_train_hn))),
         )
         reference_raw_model = raw_model
+        hard_negative_refit_started = time.perf_counter()
         hard_negative_raw_model = train_xgb_with_params(
             hn_params,
             X_train_hn,
             y_train_hn,
             sample_weight=hn_weights,
         )
+        hard_negative_refit_seconds = time.perf_counter() - hard_negative_refit_started
+        hard_negative_summary["runtime_seconds"] = {
+            "oof_mining": float(hard_negative_oof_seconds),
+            "weighted_refit": float(hard_negative_refit_seconds),
+            "total": float(time.perf_counter() - hard_negative_started),
+        }
         reference_threshold = search_threshold_by_valid(
             reference_raw_model,
             X_threshold,

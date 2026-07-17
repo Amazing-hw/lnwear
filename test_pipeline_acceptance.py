@@ -192,10 +192,7 @@ def test_pipeline_acceptance_recognizes_frozen_read_only_test_evaluation(tmp_pat
         },
         "summary": {
             "accuracy": 0.9,
-            "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
-            "stage1_only": {"accuracy": 0.8},
-            "stage2_independent": {"accuracy": 0.9},
-            "fused_output": {"accuracy": 0.9},
+            "evaluation_semantics": "xgboost_only_v1",
         },
         "window_model_summary": {"accuracy": 0.9},
         "window_stream_summary": {"accuracy": 0.9},

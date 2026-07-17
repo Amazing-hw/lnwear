@@ -242,7 +242,7 @@ def test_s08_dry_run_can_insert_generalization_audit_after_eval():
     audit_pos = output.index("__generalization_audit__")
     assert eval_pos < audit_pos
     assert "--split test" in output
-    assert "--method state_machine" in output
+    assert "--method prob_mean" in output
 
 
 def test_audit_action_items_include_quality_aware_threshold_and_search_stability():

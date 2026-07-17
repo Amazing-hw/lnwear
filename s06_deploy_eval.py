@@ -5,24 +5,18 @@
 步骤6：部署/端到端推理评估（优化版）
 
 主要改进：
-1. 单趟推理 + ProcessPoolExecutor 并行；推理结果在主进程做三套指标计算。
-2. 删除每窗对 g1 / ir 的重复 preprocess_signal 调用：
+1. 单趟推理 + ProcessPoolExecutor 并行；推理结果在主进程统一计算窗口与样本指标。
+2. 删除每窗对绿光/IR 的重复 preprocess_signal 调用：
    直接走 extract_feature_pool_from_window(..., return_preprocessed=True)，
-   从返回的 preprocessed dict 拿 g1_bp / ir_bp 给 cross-features 用。
-3. 三套指标显式拆分：
-   (a) Stage1 独立快速判断；
-   (b) Stage2 全量窗口模型与持续后处理；
-   (c) Stage1 门控最终 Stage2 状态的融合输出。
+   从返回的 preprocessed dict 复用三光区聚合信号给交叉特征使用。
+3. 主结果仅使用 XGBoost 窗口概率和冻结阈值；后处理仅作可选独立分析。
 4. 状态机网格搜索并行化（probs 缓存复用）。
 5. 预切窗和 grouped-window H5 直接按窗口编号推理；窗口缓存保留
    window_indices/window_targets，供后处理按原始顺序组合。
 
-公共接口（main / predict_sample / predict_sample_with_bundle /
+公共接口包括 main / predict_sample / predict_sample_with_bundle /
 predict_sample_safe / evaluate_streaming_window_accuracy /
-optimize_state_machine_params / get_deploy_stage1_threshold / load_bundle）
-全部保留原签名。
-
-CLI 参数与输出文件名、JSON 主要字段保持向后兼容。
+optimize_state_machine_params / load_bundle。输出 JSON 使用显式语义版本字段。
 """
 
 import os
@@ -45,11 +39,9 @@ from s03_extract_feature_pool import (
     _downsample_ppg,
     load_ppg,
     load_acc,
-    stage1_sample_pass,
     get_sample_frequency,
     get_sample_ppg_config,
     is_prewindowed_signal,
-    stage1_ambient_check,
     get_channels_from_window,
     is_stage2_ir_feature,
     extract_feature_pool_from_window,
@@ -85,10 +77,6 @@ DEFAULT_POSTPROCESS_CONFIG = {
     "sample_pred_warmup_frames": 0,
 }
 
-STAGE1_PRIMITIVE_SEC = 1.0
-STAGE1_DECISION_SEC = 3.0
-STAGE1_FS = 5
-STAGE1_GATE_K = int(round(STAGE1_DECISION_SEC / STAGE1_PRIMITIVE_SEC))
 DEFAULT_SKIP_INITIAL_WINDOWS = 0
 DEFAULT_USE_STAGE2_IR = False
 
@@ -132,7 +120,7 @@ def resolve_postprocess_thresholds(cfg, model_threshold=0.5):
 
 def resolve_use_stage2_ir(bundle, requested=None):
     # Legacy CLI compatibility only. Stage2 model features are always
-    # ambient/green/ACC; IR is reserved for Stage1 gating.
+    # Model candidates use ambient/green/ACC; IR-derived features remain excluded.
     return DEFAULT_USE_STAGE2_IR
 
 
@@ -498,111 +486,95 @@ def apply_postprocess(window_probs, quality_metas, method, cfg, model_threshold,
     return final_pred, [], window_preds, []
 
 
-def resolve_stage1_gate_flags(record, n_windows):
-    """Return a length-aligned Stage1 output mask without controlling Stage2 execution."""
-    n_windows = max(0, int(n_windows))
-    flags = record.get("stage1_gate_flags")
-    if flags is None:
-        flags = record.get("stage2_enabled_flags")
-    if flags is None:
-        flags = [int(bool(record.get("stage1_pass", True)))] * n_windows
-    flags = [int(bool(value)) for value in list(flags)[:n_windows]]
-    if len(flags) < n_windows:
-        fill = flags[-1] if flags else int(bool(record.get("stage1_pass", True)))
-        flags.extend([fill] * (n_windows - len(flags)))
-    return flags
+def _window_error_record(position, exc):
+    return {
+        "window_position": int(position),
+        "error": f"{type(exc).__name__}: {exc}",
+    }
 
 
-def fuse_stage1_stage2_states(stage2_states, stage1_gate_flags):
-    """Mask external output while leaving the independent Stage2 state untouched."""
-    states = [int(bool(value)) for value in list(stage2_states)]
-    gates = [int(bool(value)) for value in list(stage1_gate_flags)]
-    return [int(state and (gates[idx] if idx < len(gates) else 1))
-            for idx, state in enumerate(states)]
+def _finalize_window_inference(
+    base,
+    feats_list,
+    quality_metas,
+    window_start_sec,
+    window_end_sec,
+    bundle,
+    window_errors,
+    window_indices=None,
+    window_targets=None,
+):
+    """Predict valid windows only and preserve aligned metadata."""
+    valid_indices = [i for i, feat in enumerate(feats_list) if feat is not None]
+    candidate_count = len(feats_list)
+    failure_count = len(window_errors)
+    base["candidate_window_count"] = int(candidate_count)
+    base["window_feature_failure_count"] = int(failure_count)
+    base["window_feature_failure_examples"] = list(window_errors[:5])
 
-
-# =========================================================
-# Stage1 流式门控 (1s stride, 3 consecutive same → toggle)
-# =========================================================
-
-class Stage1StreamingGate:
-    """Stage1 流式滞回门控：连续 K 帧相同结果才翻转 Stage2 开关。"""
-
-    def __init__(self, dc_threshold, ac_dc_threshold, K=STAGE1_GATE_K):
-        self.dc_threshold = dc_threshold
-        self.ac_dc_threshold = ac_dc_threshold
-        self.K = K
-        self.stage2_enabled = False   # 初始关闭
-        self.pass_count = 0
-        self.fail_count = 0
-
-    def _check_one(self, ir_5hz_window):
-        """对单个 3s/5Hz IR 窗做 DC/ACDC 判断。"""
-        x = ir_5hz_window
-        if len(x) >= 2:
-            dc = float(np.min((x[:-1] + x[1:]) / 2.0))
+    if not valid_indices:
+        base["fallback"] = True
+        if candidate_count == 0:
+            base["fallback_reason"] = "no_eligible_windows_after_trim"
         else:
-            dc = float(np.mean(x))
-        if len(x) >= 2:
-            ac = float(np.median(np.abs(np.diff(x))))
-        else:
-            ac = 0.0
-        return dc > self.dc_threshold and (ac / (np.abs(dc) + 1e-12)) < self.ac_dc_threshold
+            first_error = window_errors[0]["error"] if window_errors else "unknown error"
+            base["fallback_reason"] = (
+                "all_window_feature_extraction_failed: "
+                f"{failure_count}/{candidate_count}; first={first_error}"
+            )
+        base["window_probs"] = []
+        base["window_preds"] = []
+        base["quality_metas"] = []
+        base["window_ood_scores"] = []
+        base["window_start_sec"] = []
+        base["window_end_sec"] = []
+        if window_indices is not None:
+            base["window_indices"] = []
+        if window_targets is not None:
+            base["window_targets"] = []
+        return base
 
-    def update(self, ir_5hz_window):
-        """输入当前 1s stride 的 IR 5Hz 窗，返回当前 Stage2 是否启用。"""
-        ok = self._check_one(ir_5hz_window)
-        if ok:
-            self.pass_count += 1
-            self.fail_count = 0
-            if self.pass_count >= self.K:
-                self.stage2_enabled = True
-        else:
-            self.fail_count += 1
-            self.pass_count = 0
-            if self.fail_count >= self.K:
-                self.stage2_enabled = False
-        return self.stage2_enabled
+    valid_feats = [feats_list[i] for i in valid_indices]
+    window_preds, window_probs = predict_label_windows(valid_feats, bundle=bundle)
+    feature_quantiles = bundle.get("feature_quantiles")
+    feature_names = bundle.get("feature_names", [])
+    ood_scores = [
+        None if not feature_quantiles else compute_ood_score(feat, feature_quantiles, feature_names)
+        for feat in valid_feats
+    ]
 
-
-def _advance_stage1_gate_to_step(gate, ir_5hz, s1_win_5hz, s1_stride_5hz,
-                                 last_s1_step, target_s1_step):
-    """Advance the 1s Stage1 gate through every primitive step up to target."""
-    n_s1 = (len(ir_5hz) - s1_win_5hz) // s1_stride_5hz + 1
-    if n_s1 <= 0:
-        return False, last_s1_step
-    target_s1_step = min(int(target_s1_step), n_s1 - 1)
-    if target_s1_step <= last_s1_step:
-        return bool(getattr(gate, "stage2_enabled", False)), last_s1_step
-
-    enabled = bool(getattr(gate, "stage2_enabled", False))
-    for s1_step in range(last_s1_step + 1, target_s1_step + 1):
-        s1_start = s1_step * s1_stride_5hz
-        enabled = bool(gate.update(ir_5hz[s1_start:s1_start + s1_win_5hz]))
-        last_s1_step = s1_step
-    return enabled, last_s1_step
+    base["window_probs"] = [float(value) for value in window_probs]
+    base["window_preds"] = [int(value) for value in window_preds]
+    base["quality_metas"] = [quality_metas[i] for i in valid_indices]
+    base["window_ood_scores"] = ood_scores
+    base["window_start_sec"] = [float(window_start_sec[i]) for i in valid_indices]
+    base["window_end_sec"] = [float(window_end_sec[i]) for i in valid_indices]
+    if window_indices is not None:
+        base["window_indices"] = [int(window_indices[i]) for i in valid_indices]
+    if window_targets is not None:
+        base["window_targets"] = [int(window_targets[i]) for i in valid_indices]
+    return base
 
 
-def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
+def _infer_prewindowed_sample(base, ppg, acc,
                               window_sec, stride_sec, bundle, use_stage2_ir,
                               skip_initial_windows):
-    """Run Stage2 on every stored window while recording the parallel Stage1 gate."""
+    """Run XGBoost inference on every stored window."""
     FEATURE_FS = 25
     window_meta = load_grouped_window_metadata(base)
     window_indices = list(window_meta.get("window_indices") or []) if window_meta else []
     window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
     native_25hz = get_sample_frequency(base) == FEATURE_FS
-    ppg_src_fs = 25 if native_25hz else 100
     mode = get_sample_ppg_config(base)
     base["mode"] = int(mode)
 
     feats_list = []
     quality_metas = []
-    stage1_gate_flags = []
     window_start_sec = []
     window_end_sec = []
     emitted_window_indices = []
     emitted_window_targets = []
+    window_errors = []
 
     first_step = max(0, int(skip_initial_windows))
     for step in range(first_step, ppg.shape[0]):
@@ -614,9 +586,6 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
         window_end_sec.append(start_sec + float(window_sec))
         emitted_window_indices.append(window_number)
         emitted_window_targets.append(window_target)
-
-        enabled = stage1_sample_pass(raw_window, dc_threshold, ac_dc_threshold, ppg_fs=ppg_src_fs)
-        stage1_gate_flags.append(int(enabled))
 
         try:
             window = raw_window.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
@@ -651,54 +620,35 @@ def _infer_prewindowed_sample(base, ppg, acc, dc_threshold, ac_dc_threshold,
                 "Ambient_std": feat.get("Ambient_std"),
                 "G_mean_mean": feat.get("G_mean_mean"),
             })
-        except Exception:
+        except Exception as exc:
             feats_list.append(None)
             quality_metas.append(None)
+            window_errors.append(_window_error_record(step, exc))
 
-    valid_indices = [i for i, f in enumerate(feats_list) if f is not None]
-    probs = np.zeros(len(feats_list), dtype=float)
-    wpreds = np.zeros(len(feats_list), dtype=int)
-    if valid_indices:
-        valid_feats = [feats_list[i] for i in valid_indices]
-        _wpreds, _probs = predict_label_windows(valid_feats, bundle=bundle)
-        for vi, idx in enumerate(valid_indices):
-            probs[idx] = float(_probs[vi])
-            wpreds[idx] = int(_wpreds[vi])
-
-    feature_quantiles = bundle.get("feature_quantiles")
-    feature_names = bundle.get("feature_names", [])
-    ood_scores = [
-        None if f is None or not feature_quantiles else compute_ood_score(f, feature_quantiles, feature_names)
-        for f in feats_list
-    ]
-
-    base["window_probs"] = probs.tolist()
-    base["window_preds"] = wpreds.tolist()
-    base["quality_metas"] = [qm if qm is not None else {} for qm in quality_metas]
-    base["window_ood_scores"] = ood_scores
-    base["stage1_gate_flags"] = stage1_gate_flags
-    base["stage2_enabled_flags"] = list(stage1_gate_flags)
-    base["stage1_pass"] = bool(any(stage1_gate_flags))
-    base["window_start_sec"] = window_start_sec
-    base["window_end_sec"] = window_end_sec
-    base["window_indices"] = emitted_window_indices
-    base["window_targets"] = emitted_window_targets
-    return base
+    return _finalize_window_inference(
+        base,
+        feats_list,
+        quality_metas,
+        window_start_sec,
+        window_end_sec,
+        bundle,
+        window_errors,
+        window_indices=emitted_window_indices,
+        window_targets=emitted_window_targets,
+    )
 
 
 # =========================================================
-# 单样本推理（流式 Stage1 + Stage2）
+# 单样本 XGBoost 推理
 # =========================================================
 
-def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_sec, bundle,
+def _infer_one_sample(sample, window_sec, stride_sec, bundle,
                       skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                       use_stage2_ir=DEFAULT_USE_STAGE2_IR):
     """
-    并行流式推理：Stage1 产生 1s 对齐的门控标志，Stage2 在全部合法窗口持续
-    提取特征并预测。Stage1 只在最终对外输出阶段屏蔽 Stage2 结果。
+    对全部合法窗口提取特征并执行 XGBoost 预测。
     """
     from scipy.signal import resample_poly as _rp
-    from s03_extract_feature_pool import downsample_to_5hz
 
     FEATURE_FS = 25
 
@@ -707,12 +657,11 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
 
     base = {
         "sample_name": sample_name, "target": target,
-        "stage1_pass": True,  # streaming mode: always "passed" in the old sense
         "frequency": sample.get("frequency"),
         "ppg_config": sample.get("ppg_config"),
         "mode": sample.get("ppg_config"),
         "window_probs": [], "window_preds": [], "quality_metas": [],
-        "window_ood_scores": [], "stage1_gate_flags": [], "stage2_enabled_flags": [],
+        "window_ood_scores": [],
         "window_start_sec": [], "window_end_sec": [],
         "window_layout": sample.get("window_layout"),
         "window_indices": list(sample.get("window_indices", [])),
@@ -741,7 +690,7 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
 
     if is_prewindowed_signal(ppg):
         return _infer_prewindowed_sample(
-            base, ppg, acc, dc_threshold, ac_dc_threshold,
+            base, ppg, acc,
             window_sec, stride_sec, bundle, use_stage2_ir,
             skip_initial_windows,
         )
@@ -752,7 +701,6 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
         base["mode"] = int(mode)
 
         native_25hz = get_sample_frequency(sample) == FEATURE_FS
-        ppg_src_fs = 25 if native_25hz else 100
 
         if native_25hz:
             ppg_25 = ppg.astype(np.float64)
@@ -766,42 +714,22 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
                 except Exception:
                     pass
 
-        # Stage1 用 IR 通道 → 5Hz
-        ir_raw = ppg[:, 0]
-        ir_5hz = downsample_to_5hz(ir_raw, ppg_src_fs, 5)
-        s1_win_5hz = int(round(STAGE1_PRIMITIVE_SEC * STAGE1_FS))
-        s1_stride_5hz = s1_win_5hz
-
-        gate = Stage1StreamingGate(dc_threshold, ac_dc_threshold, K=STAGE1_GATE_K)
-
         # Stage2 窗口参数
         win_25 = int(window_sec * FEATURE_FS)
         stride_25 = int(stride_sec * FEATURE_FS)
 
-        # 多少步可以对齐 Stage1 和 Stage2
         n_steps_s2 = (len(ppg_25) - win_25) // stride_25 + 1
-        n_steps_s1 = (len(ir_5hz) - s1_win_5hz) // s1_stride_5hz + 1
         quality_metas = []
         feats_list = []
-        stage1_gate_flags = []
         window_start_sec = []
         window_end_sec = []
-        last_s1_step = -1
+        window_errors = []
 
         window_steps = trim_ordered_windows(list(range(max(0, n_steps_s2))))
         if skip_initial_windows:
             window_steps = window_steps[max(0, int(skip_initial_windows)):]
         for step in window_steps:
-            # Stage1: IR @5Hz, 3s窗, 1s stride
             s2_start = step * stride_25
-            target_s1_step = int(np.floor(s2_start / FEATURE_FS + 1e-9))
-            if target_s1_step >= n_steps_s1:
-                break
-            s2_on, last_s1_step = _advance_stage1_gate_to_step(
-                gate, ir_5hz, s1_win_5hz, s1_stride_5hz,
-                last_s1_step, target_s1_step
-            )
-            stage1_gate_flags.append(int(s2_on))
             window_start_sec.append(float(s2_start / FEATURE_FS))
             window_end_sec.append(float(s2_start / FEATURE_FS + window_sec))
 
@@ -830,42 +758,20 @@ def _infer_one_sample(sample, dc_threshold, ac_dc_threshold, window_sec, stride_
                     "Ambient_std": feat.get("Ambient_std"),
                     "G_mean_mean": feat.get("G_mean_mean"),
                 })
-            except Exception:
+            except Exception as exc:
                 feats_list.append(None)
                 quality_metas.append(None)
+                window_errors.append(_window_error_record(step, exc))
 
-        # 批量预测有效窗口
-        valid_indices = [i for i, f in enumerate(feats_list) if f is not None]
-        n_emitted_steps = len(feats_list)
-        probs = np.zeros(n_emitted_steps, dtype=float)
-        wpreds = np.zeros(n_emitted_steps, dtype=int)
-        if valid_indices:
-            valid_feats = [feats_list[i] for i in valid_indices]
-            _wpreds, _probs = predict_label_windows(valid_feats, bundle=bundle)
-            for vi, idx in enumerate(valid_indices):
-                probs[idx] = float(_probs[vi])
-                wpreds[idx] = int(_wpreds[vi])
-
-        # OOD
-        feature_quantiles = bundle.get("feature_quantiles")
-        feature_names = bundle.get("feature_names", [])
-        ood_scores = []
-        for i, f in enumerate(feats_list):
-            if f is None or not feature_quantiles:
-                ood_scores.append(None)
-            else:
-                ood_scores.append(compute_ood_score(f, feature_quantiles, feature_names))
-
-        base["window_probs"] = probs.tolist()
-        base["window_preds"] = wpreds.tolist()
-        base["quality_metas"] = [qm if qm is not None else {} for qm in quality_metas]
-        base["window_ood_scores"] = ood_scores
-        base["stage1_gate_flags"] = stage1_gate_flags
-        base["stage2_enabled_flags"] = list(stage1_gate_flags)
-        base["stage1_pass"] = bool(any(stage1_gate_flags))
-        base["window_start_sec"] = window_start_sec
-        base["window_end_sec"] = window_end_sec
-        return base
+        return _finalize_window_inference(
+            base,
+            feats_list,
+            quality_metas,
+            window_start_sec,
+            window_end_sec,
+            bundle,
+            window_errors,
+        )
 
     except Exception as e:
         base["fallback"] = True
@@ -893,17 +799,15 @@ def _init_worker(bundle_path):
 
 def _worker_infer(args_tuple):
     """子进程入口。"""
-    (sample, dc_threshold, ac_dc_threshold, window_sec, stride_sec,
-     skip_initial_windows, use_stage2_ir) = args_tuple
+    (sample, window_sec, stride_sec, skip_initial_windows, use_stage2_ir) = args_tuple
     return _infer_one_sample(
-        sample, dc_threshold, ac_dc_threshold, window_sec, stride_sec, _WORKER_BUNDLE,
+        sample, window_sec, stride_sec, _WORKER_BUNDLE,
         skip_initial_windows=skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
     )
 
 
-def run_inference_parallel(samples, dc_threshold, ac_dc_threshold,
-                           window_sec, stride_sec, bundle_path, n_workers,
+def run_inference_parallel(samples, window_sec, stride_sec, bundle_path, n_workers,
                            skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                            use_stage2_ir=None):
     """
@@ -914,8 +818,7 @@ def run_inference_parallel(samples, dc_threshold, ac_dc_threshold,
         bundle_for_meta = _BUNDLE if _BUNDLE is not None else joblib.load(bundle_path)
         use_stage2_ir = resolve_use_stage2_ir(bundle_for_meta)
     args_list = [
-        (s, dc_threshold, ac_dc_threshold, window_sec, stride_sec,
-         skip_initial_windows, bool(use_stage2_ir))
+        (s, window_sec, stride_sec, skip_initial_windows, bool(use_stage2_ir))
         for s in samples
     ]
 
@@ -924,7 +827,7 @@ def run_inference_parallel(samples, dc_threshold, ac_dc_threshold,
         bundle = _BUNDLE if _BUNDLE is not None else joblib.load(bundle_path)
         return [
             _infer_one_sample(
-                s, dc_threshold, ac_dc_threshold, window_sec, stride_sec, bundle,
+                s, window_sec, stride_sec, bundle,
                 skip_initial_windows=skip_initial_windows,
                 use_stage2_ir=use_stage2_ir,
             )
@@ -952,7 +855,6 @@ def run_inference_parallel(samples, dc_threshold, ac_dc_threshold,
                 results[i] = {
                     "sample_name": samples[i].get("sample_name", "unknown"),
                     "target": int(samples[i].get("target", 0)),
-                    "stage1_pass": False,
                     "mode": 0,
                     "window_probs": [],
                     "window_preds": [],
@@ -1027,70 +929,54 @@ def build_evaluation_contract(split):
 
 
 def compute_sample_metrics(results, method, cfg, model_threshold, stride_sec=1.0):
-    """
-    Sample 级并行评估：Stage2 始终后处理完整概率流，Stage1 只屏蔽对外状态。
-    """
-    y_true, y_pred, y_stage2, y_stage1 = [], [], [], []
+    """Compute sample metrics from XGBoost probabilities only."""
+    y_true, y_pred = [], []
     fallback_count = 0
-    stage1_pass_count = 0
+    samples_with_window_feature_failures = 0
+    total_window_feature_failures = 0
     details = []
 
     for r in results:
         target = int(r["target"])
         if r.get("fallback", False):
             fallback_count += 1
+        window_feature_failure_count = max(
+            0, int(r.get("window_feature_failure_count", 0) or 0)
+        )
+        total_window_feature_failures += window_feature_failure_count
+        if window_feature_failure_count > 0:
+            samples_with_window_feature_failures += 1
         probs = r.get("window_probs", [])
-        gate_flags = resolve_stage1_gate_flags(r, len(probs))
-        stage1_pred = int(any(gate_flags))
-        if stage1_pred:
-            stage1_pass_count += 1
         scores = []
         if r.get("fallback", False) or len(probs) == 0:
             final_pred = 0
-            stage2_pred = 0
-            stage2_states = []
-            output_states = []
             window_preds = list(r.get("window_preds", []))
+            states = []
         else:
-            stage2_pred, states, window_preds, scores = apply_postprocess(
+            final_pred, states, window_preds, scores = apply_postprocess(
                 probs, r.get("quality_metas", []), method, cfg, model_threshold,
                 stride_sec=stride_sec,
-            )
-            stage2_states = list(states) if len(states) == len(probs) else list(window_preds)
-            output_states = fuse_stage1_stage2_states(stage2_states, gate_flags)
-            final_pred = sample_pred_from_states(
-                output_states,
-                strategy=cfg.get("sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]),
-                warmup_frames=cfg.get(
-                    "sample_pred_warmup_frames",
-                    DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"],
-                ),
             )
 
         y_true.append(target)
         y_pred.append(int(final_pred))
-        y_stage2.append(int(stage2_pred))
-        y_stage1.append(int(stage1_pred))
 
         fallback = r.get("fallback", False)
         details.append({
             "sample_name": r.get("sample_name"),
             "target": target,
             "pred": int(final_pred),
-            "stage2_pred": int(stage2_pred),
-            "stage1_pred": int(stage1_pred),
-            "stage1_pass": bool(stage1_pred),
             "mode": int(r.get("mode", 0)),
             "fallback": bool(fallback),
             "fallback_reason": r.get("fallback_reason"),
+            "window_feature_failure_count": window_feature_failure_count,
+            "window_feature_failure_examples": list(
+                r.get("window_feature_failure_examples", []) or []
+            ),
             "window_probs": probs,
             "window_preds": list(window_preds),
-            "window_states": list(output_states),
-            "stage2_states": list(stage2_states),
-            "output_states": list(output_states),
+            "window_states": list(states),
             "window_scores": list(scores) if not fallback else [],
-            "stage1_gate_flags": list(gate_flags),
-            "stage2_enabled_flags": list(gate_flags),
             "window_start_sec": r.get("window_start_sec", []),
             "window_end_sec": r.get("window_end_sec", []),
             "quality_metas": r.get("quality_metas", []),
@@ -1100,39 +986,25 @@ def compute_sample_metrics(results, method, cfg, model_threshold, stride_sec=1.0
 
     y_true_a = np.asarray(y_true)
     y_pred_a = np.asarray(y_pred)
-    y_stage2_a = np.asarray(y_stage2)
-    y_stage1_a = np.asarray(y_stage1)
     tn, fp, fn, tp = _safe_confusion(y_true_a, y_pred_a)
-
-    def _summary_for(predictions):
-        _tn, _fp, _fn, _tp = _safe_confusion(y_true_a, predictions)
-        return {
-            "confusion_matrix": {"TN": _tn, "FP": _fp, "FN": _fn, "TP": _tp},
-            "accuracy": float(accuracy_score(y_true_a, predictions)) if len(y_true_a) > 0 else 0.0,
-            "precision": float(precision_score(y_true_a, predictions, zero_division=0)),
-            "recall": float(recall_score(y_true_a, predictions, zero_division=0)),
-            "f1": float(f1_score(y_true_a, predictions, zero_division=0)),
-        }
-
-    stage1_only = _summary_for(y_stage1_a)
-    stage2_independent = _summary_for(y_stage2_a)
-    fused_output = _summary_for(y_pred_a)
 
     summary = {
         "method": method,
         "total_samples": int(len(results)),
-        "stage1_pass_samples": int(stage1_pass_count),
         "fallback_samples": int(fallback_count),
+        "samples_with_window_feature_failures": int(samples_with_window_feature_failures),
+        "total_window_feature_failures": int(total_window_feature_failures),
         "confusion_matrix": {"TN": tn, "FP": fp, "FN": fn, "TP": tp},
         "accuracy": float(accuracy_score(y_true_a, y_pred_a)) if len(y_true_a) > 0 else 0.0,
         "precision": float(precision_score(y_true_a, y_pred_a, zero_division=0)),
         "recall": float(recall_score(y_true_a, y_pred_a, zero_division=0)),
         "f1": float(f1_score(y_true_a, y_pred_a, zero_division=0)),
         "postprocess": cfg,
-        "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
-        "stage1_only": stage1_only,
-        "stage2_independent": stage2_independent,
-        "fused_output": fused_output,
+        "evaluation_semantics": (
+            "xgboost_postprocess_only_v1"
+            if method == "state_machine"
+            else "xgboost_only_v1"
+        ),
     }
     return summary, details
 
@@ -1205,7 +1077,6 @@ def _bucket_ood(v):
 def compute_stratified_error_analysis(details):
     """Compute sample-level metrics by deployment-relevant strata."""
     strata = {
-        "stage1_pass": defaultdict(list),
         "mode": defaultdict(list),
         "n_windows": defaultdict(list),
         "mean_prob": defaultdict(list),
@@ -1213,7 +1084,6 @@ def compute_stratified_error_analysis(details):
     }
     for d in details:
         stats = _detail_prob_stats(d)
-        strata["stage1_pass"][f"stage1_pass={bool(d.get('stage1_pass', False))}"].append(d)
         strata["mode"][f"mode={int(d.get('mode', 0))}"].append(d)
         strata["n_windows"][_bucket_n_windows(stats["n_windows"])].append(d)
         strata["mean_prob"][_bucket_prob(stats["mean_prob"])].append(d)
@@ -1240,7 +1110,6 @@ def mine_hard_negatives(details, top_k=50):
             "sample_name": d.get("sample_name"),
             "target": int(d.get("target", 0)),
             "pred": int(d.get("pred", 0)),
-            "stage1_pass": bool(d.get("stage1_pass", False)),
             "mode": int(d.get("mode", 0)),
             "n_windows": stats["n_windows"],
             "mean_prob": stats["mean_prob"],
@@ -1298,11 +1167,10 @@ def export_deploy_report_plot(payload, artifact_dir, split="test", method="state
     ax_strata = fig.add_subplot(gs[1, 2])
 
     total = int(sample.get("total_samples", len(details)))
-    stage1 = int(sample.get("stage1_pass_samples", 0))
     pred_pos = int(sample.get("confusion_matrix", {}).get("FP", 0) + sample.get("confusion_matrix", {}).get("TP", 0))
-    ax_funnel.bar(["input", "stage1 pass", "final positive"], [total, stage1, pred_pos],
-                  color=["#4c78a8", "#72b7b2", "#d35f2d"])
-    ax_funnel.set_title("Stage Funnel")
+    ax_funnel.bar(["input", "XGBoost positive"], [total, pred_pos],
+                  color=["#4c78a8", "#72b7b2"])
+    ax_funnel.set_title("XGBoost Sample Output")
     ax_funnel.set_ylabel("samples")
     ax_funnel.grid(axis="y", alpha=0.18)
 
@@ -1362,11 +1230,11 @@ def export_deploy_report_plot(payload, artifact_dir, split="test", method="state
     ax_hard.set_title("Top False Positives")
     ax_hard.grid(axis="x", alpha=0.18)
 
-    stage1_buckets = strat.get("stage1_pass", {}) or {}
-    if stage1_buckets:
-        labels = list(stage1_buckets.keys())
-        fp_vals = [int(stage1_buckets[k].get("confusion_matrix", {}).get("FP", 0)) for k in labels]
-        fn_vals = [int(stage1_buckets[k].get("confusion_matrix", {}).get("FN", 0)) for k in labels]
+    mode_buckets = strat.get("mode", {}) or {}
+    if mode_buckets:
+        labels = list(mode_buckets.keys())
+        fp_vals = [int(mode_buckets[k].get("confusion_matrix", {}).get("FP", 0)) for k in labels]
+        fn_vals = [int(mode_buckets[k].get("confusion_matrix", {}).get("FN", 0)) for k in labels]
         xx = np.arange(len(labels))
         ax_strata.bar(xx - 0.18, fp_vals, width=0.36, color="#c44e52", label="FP")
         ax_strata.bar(xx + 0.18, fn_vals, width=0.36, color="#4c78a8", label="FN")
@@ -1375,7 +1243,7 @@ def export_deploy_report_plot(payload, artifact_dir, split="test", method="state
     else:
         ax_strata.text(0.5, 0.5, "No strata", ha="center", va="center")
         ax_strata.set_axis_off()
-    ax_strata.set_title("Error by Stage1 Stratum")
+    ax_strata.set_title("Error by PPG Configuration")
     ax_strata.grid(axis="y", alpha=0.18)
 
     fig.suptitle(f"Deployment Evaluation Report ({split}, {method})", fontsize=16, weight="bold")
@@ -1412,7 +1280,7 @@ def export_deploy_report_plot(payload, artifact_dir, split="test", method="state
         panel_map={
             "a": "Stage funnel.", "b": "Sample confusion matrix.",
             "c": "Window probability distributions.", "d": "Metric comparison.",
-            "e": "Highest-confidence false positives.", "f": "Errors by Stage1 stratum.",
+            "e": "Highest-confidence false positives.", "f": "Errors by PPG configuration.",
         },
         split=str(split),
         n_definition="samples in the frozen evaluation split; probability panel uses eligible windows",
@@ -1431,19 +1299,16 @@ def compute_window_model_metrics(results):
     逐窗 XGBoost 预测 (window_preds) vs window_targets；旧数据缺少
     window_targets 时回退到整条样本的 target。
 
-    模型无状态，不做 warmup 跳过。Stage1 状态只用于分层，不过滤窗口。
+    模型无状态，不做 warmup 跳过。
     """
     y_true, y_pred = [], []
     samples_with_no_windows = 0
     total_input_samples = len(results)
-    stage1_pass_samples = 0
     for r in results:
         wp = r.get("window_preds", [])
         if r.get("fallback", False) or len(wp) == 0:
             samples_with_no_windows += 1
             continue
-        if r.get("stage1_pass", False):
-            stage1_pass_samples += 1
         sample_target = int(r["target"])
         window_targets = r.get("window_targets", [])
         for idx, p in enumerate(wp):
@@ -1454,7 +1319,6 @@ def compute_window_model_metrics(results):
     if len(y_true) == 0:
         return {
             "total_input_samples": total_input_samples,
-            "stage1_pass_samples": stage1_pass_samples,
             "samples_with_no_windows": samples_with_no_windows,
             "total_windows": 0,
             "confusion_matrix": {"TN": 0, "FP": 0, "FN": 0, "TP": 0},
@@ -1466,7 +1330,6 @@ def compute_window_model_metrics(results):
     tn, fp, fn, tp = _safe_confusion(y_true_a, y_pred_a)
     return {
         "total_input_samples": total_input_samples,
-        "stage1_pass_samples": stage1_pass_samples,
         "samples_with_no_windows": samples_with_no_windows,
         "total_windows": int(len(y_true_a)),
         "confusion_matrix": {"TN": tn, "FP": fp, "FN": fn, "TP": tp},
@@ -1572,7 +1435,6 @@ def _window_rows_from_details(details):
         window_indices = detail.get("window_indices", [])
         sample_name = detail.get("sample_name")
         mode = int(detail.get("mode", 0))
-        enabled = detail.get("stage1_gate_flags", detail.get("stage2_enabled_flags", []))
         starts = detail.get("window_start_sec", [])
         ends = detail.get("window_end_sec", [])
         q_metas = detail.get("quality_metas", [])
@@ -1583,7 +1445,6 @@ def _window_rows_from_details(details):
             window_index = int(_safe_list_get(window_indices, idx, idx))
             start = float(_safe_list_get(starts, idx, idx))
             end = float(_safe_list_get(ends, idx, start))
-            stage2_enabled = int(_safe_list_get(enabled, idx, 1))
             q_meta = _safe_list_get(q_metas, idx, {})
             ood = _safe_list_get(oods, idx, None)
             error_type = _window_error_type(target, pred)
@@ -1600,8 +1461,6 @@ def _window_rows_from_details(details):
                 "prob_bin": _bucket_window_prob(prob),
                 "time_bin": _bucket_window_time(start),
                 "mode": mode,
-                "stage1_gate": stage2_enabled,
-                "stage2_enabled": stage2_enabled,
                 "ood_rate": None if ood is None else float(ood),
                 "ood_bin": _bucket_window_ood(ood),
                 "quality_bin": _bucket_quality_meta(q_meta),
@@ -1665,7 +1524,6 @@ def compute_window_error_analysis(details):
             "prob_bin": _summarize_strata(rows, "prob_bin"),
             "time_bin": _summarize_strata(rows, "time_bin"),
             "mode": _summarize_strata(rows, "mode"),
-            "stage2_enabled": _summarize_strata(rows, "stage2_enabled"),
             "ood_bin": _summarize_strata(rows, "ood_bin"),
             "quality_bin": _summarize_strata(rows, "quality_bin"),
         },
@@ -1805,8 +1663,7 @@ def _score_grid_point(args_tuple):
     return params, {"recall": float(rec), "precision": float(prec), "f1": float(f1)}
 
 
-def optimize_state_machine_params(samples, dc_threshold, ac_dc_threshold,
-                                   window_sec=5, stride_sec=1, min_recall=0.95,
+def optimize_state_machine_params(samples, window_sec=5, stride_sec=1, min_recall=0.95,
                                    bundle_path=None, n_workers=None,
                                    skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                    use_stage2_ir=None):
@@ -1834,8 +1691,7 @@ def optimize_state_machine_params(samples, dc_threshold, ac_dc_threshold,
 
     print("预计算样本窗口概率（并行）...")
     results = run_inference_parallel(
-        samples, dc_threshold, ac_dc_threshold,
-        window_sec, stride_sec, bundle_path, n_workers,
+        samples, window_sec, stride_sec, bundle_path, n_workers,
         skip_initial_windows=skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
     )
@@ -1847,7 +1703,6 @@ def optimize_state_machine_params(samples, dc_threshold, ac_dc_threshold,
             "target": int(r["target"]),
             "probs": r.get("window_probs", []),
             "quality_metas": r.get("quality_metas", []),
-            "stage1_pass": bool(r.get("stage1_pass", False)) and not r.get("fallback", False),
         })
     target_1 = [s for s in sample_cache if s["target"] == 1]
     print(f"有效样本: {len(sample_cache)}, target=1 样本: {len(target_1)}")
@@ -1910,36 +1765,7 @@ def optimize_state_machine_params(samples, dc_threshold, ac_dc_threshold,
 # 向后兼容 API
 # =========================================================
 
-def get_deploy_stage1_threshold(th):
-    """读取部署阈值，兼容旧 schema。"""
-    if "deploy_stage1_threshold" in th:
-        return {
-            "dc_threshold": float(th["deploy_stage1_threshold"]["dc_threshold"]),
-            "ac_dc_threshold": float(th["deploy_stage1_threshold"]["ac_dc_threshold"]),
-        }
-    return {
-        "dc_threshold": float(th["dc_threshold"]),
-        "ac_dc_threshold": float(th["ac_dc_threshold"]),
-    }
-
-
-def summarize_stage1_target1_pass_rate(results):
-    """统计 target=1 样本在第一阶段的通过率。"""
-    positives = [r for r in results if int(r.get("target", 0)) == 1]
-    total = len(positives)
-    passed = sum(
-        1 for r in positives
-        if bool(r.get("stage1_pass", False)) and not bool(r.get("fallback", False))
-    )
-    return {
-        "target1_total_samples": int(total),
-        "target1_stage1_pass_samples": int(passed),
-        "target1_stage1_pass_rate": (float(passed / total) if total > 0 else None),
-    }
-
-
-def predict_sample_with_bundle(sample, dc_threshold, ac_dc_threshold,
-                                window_sec=5, stride_sec=1,
+def predict_sample_with_bundle(sample, window_sec=5, stride_sec=1,
                                 method="state_machine", postprocess_cfg=None,
                                 skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                 use_stage2_ir=None):
@@ -1951,8 +1777,7 @@ def predict_sample_with_bundle(sample, dc_threshold, ac_dc_threshold,
     if postprocess_cfg is None:
         postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
 
-    r = _infer_one_sample(sample, dc_threshold, ac_dc_threshold,
-                          window_sec, stride_sec, _BUNDLE,
+    r = _infer_one_sample(sample, window_sec, stride_sec, _BUNDLE,
                           skip_initial_windows=skip_initial_windows,
                           use_stage2_ir=resolve_use_stage2_ir(_BUNDLE, use_stage2_ir))
     target = int(r["target"])
@@ -1961,43 +1786,26 @@ def predict_sample_with_bundle(sample, dc_threshold, ac_dc_threshold,
             "sample_name": r["sample_name"],
             "target": target,
             "pred": 0,
-            "stage1_pass": bool(r["stage1_pass"]),
             "window_probs": list(r.get("window_probs", [])),
             "window_preds": list(r.get("window_preds", [])),
         }
 
-    stage2_pred, stage2_states, window_preds, _scores = apply_postprocess(
+    final_pred, states, window_preds, _scores = apply_postprocess(
         r["window_probs"], r["quality_metas"], method, postprocess_cfg,
         _BUNDLE["threshold"], stride_sec=stride_sec,
-    )
-    stage2_states = list(stage2_states) if len(stage2_states) == len(r["window_probs"]) else list(window_preds)
-    gate_flags = resolve_stage1_gate_flags(r, len(stage2_states))
-    output_states = fuse_stage1_stage2_states(stage2_states, gate_flags)
-    final_pred = sample_pred_from_states(
-        output_states,
-        postprocess_cfg.get("sample_pred_strategy", DEFAULT_POSTPROCESS_CONFIG["sample_pred_strategy"]),
-        postprocess_cfg.get(
-            "sample_pred_warmup_frames",
-            DEFAULT_POSTPROCESS_CONFIG["sample_pred_warmup_frames"],
-        ),
     )
     return {
         "sample_name": r["sample_name"],
         "target": target,
         "pred": int(final_pred),
-        "stage2_pred": int(stage2_pred),
-        "stage1_pass": bool(any(gate_flags)),
         "mode": int(r["mode"]),
         "window_probs": list(r["window_probs"]),
         "window_preds": list(window_preds),
-        "stage2_states": [int(s) for s in stage2_states],
-        "output_states": [int(s) for s in output_states],
-        "stage1_gate_flags": list(gate_flags),
+        "window_states": [int(s) for s in states],
     }
 
 
-def predict_sample_safe(sample, dc_threshold, ac_dc_threshold,
-                        window_sec=5, stride_sec=1,
+def predict_sample_safe(sample, window_sec=5, stride_sec=1,
                         method="state_machine", postprocess_cfg=None,
                         skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                         use_stage2_ir=None):
@@ -2006,7 +1814,6 @@ def predict_sample_safe(sample, dc_threshold, ac_dc_threshold,
         "sample_name": sample.get("sample_name", "unknown"),
         "target": int(sample.get("target", 0)),
         "pred": 0,
-        "stage1_pass": False,
         "mode": 0,
         "window_probs": [],
         "window_preds": [],
@@ -2024,7 +1831,7 @@ def predict_sample_safe(sample, dc_threshold, ac_dc_threshold,
         return fallback_result
     try:
         res = predict_sample_with_bundle(
-            sample, dc_threshold=dc_threshold, ac_dc_threshold=ac_dc_threshold,
+            sample,
             window_sec=window_sec, stride_sec=stride_sec,
             method=method, postprocess_cfg=postprocess_cfg,
             skip_initial_windows=skip_initial_windows,
@@ -2039,8 +1846,7 @@ def predict_sample_safe(sample, dc_threshold, ac_dc_threshold,
         return fallback_result
 
 
-def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
-                                       window_sec=5, stride_sec=1, postprocess_cfg=None,
+def evaluate_streaming_window_accuracy(samples, window_sec=5, stride_sec=1, postprocess_cfg=None,
                                        bundle_path=None, n_workers=None,
                                        skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                        use_stage2_ir=None):
@@ -2057,8 +1863,7 @@ def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
         if n_workers is None:
             n_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
         results = run_inference_parallel(
-            samples, dc_threshold, ac_dc_threshold,
-            window_sec, stride_sec, bundle_path, n_workers,
+            samples, window_sec, stride_sec, bundle_path, n_workers,
             skip_initial_windows=skip_initial_windows,
             use_stage2_ir=use_stage2_ir,
         )
@@ -2067,7 +1872,7 @@ def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
         assert _BUNDLE is not None, "must call load_bundle() first"
         results = [
             _infer_one_sample(
-                s, dc_threshold, ac_dc_threshold, window_sec, stride_sec, _BUNDLE,
+                s, window_sec, stride_sec, _BUNDLE,
                 skip_initial_windows=skip_initial_windows,
                 use_stage2_ir=resolve_use_stage2_ir(_BUNDLE, use_stage2_ir),
             )
@@ -2137,7 +1942,6 @@ def evaluate_streaming_window_accuracy(samples, dc_threshold, ac_dc_threshold,
 
 
 def predict_sample(sample, model, scaler, selected_features,
-                    dc_threshold, ac_dc_threshold,
                     window_sec=5, stride_sec=1, fs=25,
                     method="state_machine",
                     model_threshold=0.5,
@@ -2156,19 +1960,6 @@ def predict_sample(sample, model, scaler, selected_features,
     if fill_values is None:
         fill_values = {}
     ppg = load_ppg(sample)
-
-    ppg_frequency = get_sample_frequency(sample)
-    if not stage1_sample_pass(
-        ppg, dc_threshold, ac_dc_threshold, ppg_fs=ppg_frequency
-    ):
-        return {
-            "sample_name": sample["sample_name"],
-            "target": int(sample["target"]),
-            "pred": 0,
-            "stage1_pass": False,
-            "window_probs": [],
-            "window_preds": [],
-        }
 
     mode = get_sample_ppg_config(sample)
     win = window_sec * fs
@@ -2232,7 +2023,6 @@ def predict_sample(sample, model, scaler, selected_features,
         "sample_name": sample["sample_name"],
         "target": int(sample["target"]),
         "pred": int(final_pred),
-        "stage1_pass": True,
         "mode": int(mode),
         "window_probs": probs,
         "window_preds": window_preds,
@@ -2286,13 +2076,11 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     导出所有部署所需产物到 artifacts/deploy_package/。
 
     从已有的 artifacts 中读取：
-      - stage1_threshold.json
       - model_bundle.pkl
       - final_model_config.json (可选)
 
     产生：
       - deploy_config.json       总配置
-      - stage1_config.json       Stage1 参数 + 公式
       - feature_formulas.json    每个入选特征的计算公式
       - xgboost_trees.txt        所有树的文本 dump
       - xgboost_nodes.csv        所有节点的结构化 CSV
@@ -2307,13 +2095,10 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     print(f"\n导出部署产物到: {out_dir}")
 
     # --- 读取已有 artifacts ---
-    stage1_path = _os.path.join(artifact_dir, "stage1_threshold.json")
     bundle_path = _os.path.join(artifact_dir, "model_bundle.pkl")
     features_path = _os.path.join(artifact_dir, "selected_features.json")
     config_path = _os.path.join(artifact_dir, "final_model_config.json")
 
-    with open(stage1_path, "r", encoding="utf-8") as f:
-        stage1 = json.load(f)
     bundle = joblib.load(bundle_path)
     postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
     if _os.path.exists(config_path):
@@ -2339,59 +2124,6 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     model = bundle["model"]
     raw = bundle.get("raw_model", model)
     booster = raw.get_booster()
-
-    # =========================================================
-    # 1. stage1_config.json
-    # =========================================================
-    deploy_th = stage1.get("deploy_stage1_threshold", {})
-    stage1_config = OrderedDict([
-        ("pipeline_step", 1),
-        ("description", "IR DC/ACDC 阈值粗筛 — 快速排除明显非佩戴样本"),
-        ("input", "PPG 数据，IR 通道 (ch0)，100Hz 原始采样"),
-        ("preprocessing", [
-            "IR 100Hz → 5Hz 降采样 (resample_poly, gcd-based)",
-        ]),
-        ("window", {
-            "duration_sec": 1.0,
-            "points_5hz": 5,
-            "stride_sec": 1.0,
-        }),
-        ("decision", OrderedDict([
-            ("primitive_window_sec", 1.0),
-            ("consecutive_pass_required", STAGE1_GATE_K),
-            ("consecutive_fail_required", STAGE1_GATE_K),
-            ("gate_rule", "set stage1_gate after 3 consecutive pass/fail primitives; never pause or reset Stage2"),
-            ("fusion_rule", "output_state[t] = stage1_gate[t] AND stage2_state[t]"),
-            ("parallel_semantics_version", "stage1_mask_stage2_continuous_v1"),
-        ])),
-        ("features_per_window", OrderedDict([
-            ("DC", {
-                "formula": "min(neighbor_mean) where neighbor_mean[i] = (x[i] + x[i+1]) / 2.0",
-                "purpose": "邻点均值的最小值，对单点毛刺鲁棒",
-                "pseudocode": "x = ir_5hz[i:i+5]; dc = min((x[:-1] + x[1:]) / 2.0)",
-            }),
-            ("AC", {
-                "formula": "median(|diff(x)|)",
-                "purpose": "邻差的MAD，对单点抖动鲁棒",
-                "pseudocode": "ac = float(np.median(np.abs(np.diff(x))))",
-            }),
-            ("AC_DC_RATIO", {
-                "formula": "ac / (|dc| + 1e-8)",
-                "purpose": "归一化交流分量",
-            }),
-        ])),
-        ("window_pass_rule", "DC > dc_threshold AND AC_DC_RATIO < ac_dc_threshold"),
-        ("streaming_gate_rule", "Stage2 opens after 3 consecutive 1s primitive windows pass and closes after 3 consecutive failures"),
-        ("thresholds", OrderedDict([
-            ("dc_threshold", float(deploy_th.get("dc_threshold", 0))),
-            ("ac_dc_threshold", float(deploy_th.get("ac_dc_threshold", 0))),
-        ])),
-        ("search_source", deploy_th.get("search_source", "unknown")),
-    ])
-
-    with open(_os.path.join(out_dir, "stage1_config.json"), "w", encoding="utf-8") as f:
-        json.dump(stage1_config, f, indent=2, ensure_ascii=False)
-    print("  [OK] stage1_config.json")
 
     # =========================================================
     # 2. feature_formulas.json
@@ -2576,12 +2308,9 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     deploy_config = OrderedDict([
         ("title", "手表佩戴活体检测 — 部署配置"),
         ("pipeline_overview", [
-            "Stage 1: IR DC/ACDC gate (1s primitive windows @5Hz, 3s consecutive decision)",
-            f"Stage 2: {float(bundle['meta']['win_sec']):g}s feature window ({float(bundle['meta']['step_sec']):g}s stride) + XGBoost window probability",
-            "Stage 3: [reserved for window-threshold optimization]",
-            "Stage 4: WearStateMachine 时序后处理 (EMA + hysteresis)",
+            f"XGBoost: {float(bundle['meta']['win_sec']):g}s feature window ({float(bundle['meta']['step_sec']):g}s stride) + window probability",
+            "Optional postprocess: WearStateMachine (EMA + hysteresis)",
         ]),
-        ("stage1", stage1_config),
         ("stage2_features", OrderedDict([
             ("window_config", OrderedDict([
                 ("duration_sec", float(bundle["meta"]["win_sec"])),
@@ -2672,13 +2401,10 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
     if len(ends) != n:
         ends = starts + float(window_sec)
     preds = np.asarray(result.get("window_preds", []), dtype=int)
-    enabled = np.asarray(resolve_stage1_gate_flags(result, n), dtype=int)
     window_indices = np.asarray(result.get("window_indices", np.arange(n, dtype=int)), dtype=int)
     window_targets = np.asarray(result.get("window_targets", np.full(n, int(result.get("target", 0)))), dtype=int)
     if len(preds) != n:
         preds = (probs >= float(model_threshold)).astype(int)
-    if len(enabled) != n:
-        enabled = np.ones(n, dtype=int)
     if len(window_indices) != n:
         window_indices = np.arange(n, dtype=int)
     if len(window_targets) != n:
@@ -2707,9 +2433,6 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
         window_end_sec=ends,
         window_indices=window_indices.astype(np.int64),
         window_targets=window_targets.astype(np.int64),
-        stage1_gate=enabled.astype(np.int64),
-        # Compatibility alias for caches produced before the parallel-stage contract.
-        stage1_enabled=enabled.astype(np.int64),
         prob_raw=probs,
         pred_raw=preds.astype(np.int64),
         quality=quality,
@@ -2719,8 +2442,7 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
         model_threshold=np.array(float(model_threshold)),
         window_sec=np.array(float(window_sec)),
         stride_sec=np.array(float(stride_sec)),
-        cache_schema_version=np.array("window_outputs_v2"),
-        parallel_semantics_version=np.array("stage1_mask_stage2_continuous_v1"),
+        cache_schema_version=np.array("xgboost_window_outputs_v1"),
         model_fingerprint_json=np.array(json.dumps(metadata.get("model_fingerprint", {}), ensure_ascii=False)),
         feature_names_json=np.array(json.dumps(list(metadata.get("feature_names", [])), ensure_ascii=False)),
         skip_initial_windows=np.array(int(metadata.get("skip_initial_windows", 0)), dtype=np.int64),
@@ -2916,20 +2638,13 @@ def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, mo
                     f"cache output {resolved_npz} escaped target split directory {out_path}")
             produced_paths.add(resolved_npz)
             prob_arr = np.asarray(r.get("window_probs", []), dtype=float)
-            enabled_arr = np.asarray(resolve_stage1_gate_flags(r, len(prob_arr)), dtype=int)
             n_windows = int(len(prob_arr))
-            n_enabled = int(np.sum(enabled_arr > 0))
             manifest.append({
                 "sample_name": str(r.get("sample_name", "unknown")),
                 "target": int(r.get("target", 0)),
                 "npz_path": npz_path,
                 "n_windows": n_windows,
-                "n_stage1_enabled": n_enabled,
-                "stage1_enabled_ratio": float(n_enabled / max(n_windows, 1)),
-                "n_stage1_gate_open": n_enabled,
-                "stage1_gate_open_ratio": float(n_enabled / max(n_windows, 1)),
-                "cache_schema_version": "window_outputs_v2",
-                "parallel_semantics_version": "stage1_mask_stage2_continuous_v1",
+                "cache_schema_version": "xgboost_window_outputs_v1",
                 "model_fingerprint": metadata.get("model_fingerprint", {}),
                 "feature_names": list(metadata.get("feature_names", [])),
                 "skip_initial_windows": int(metadata.get("skip_initial_windows", 0)),
@@ -2959,7 +2674,7 @@ def main(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument("--split", type=str, default="test", choices=["train", "valid", "test"])
-    parser.add_argument("--method", type=str, default="state_machine",
+    parser.add_argument("--method", type=str, default="prob_mean",
                         choices=["mean_vote", "prob_mean", "state_machine"])
     parser.add_argument("--window_sec", type=int, default=5)
     parser.add_argument("--stride_sec", type=int, default=1)
@@ -3007,10 +2722,6 @@ def main(args=None):
 
     with open(os.path.join(args.artifact_dir, "splits.json"), "r", encoding="utf-8") as f:
         split = json.load(f)
-    with open(os.path.join(args.artifact_dir, "stage1_threshold.json"), "r", encoding="utf-8") as f:
-        th = json.load(f)
-
-    deploy_th = get_deploy_stage1_threshold(th)
     bundle_path = os.path.join(args.artifact_dir, "model_bundle.pkl")
 
     print("=" * 80)
@@ -3028,12 +2739,6 @@ def main(args=None):
     print(f"meta: {bundle['meta']}")
     print(f"use_stage2_ir: {use_stage2_ir}")
 
-    print("\n" + "=" * 80)
-    print("Deploy Stage1 threshold")
-    print("=" * 80)
-    print(f"dc_threshold   = {deploy_th['dc_threshold']}")
-    print(f"acdc_threshold = {deploy_th['ac_dc_threshold']}")
-
     # 参数优化
     if args.optimize:
         print("\n" + "=" * 80)
@@ -3041,8 +2746,6 @@ def main(args=None):
         print("=" * 80)
         opt = optimize_state_machine_params(
             samples=split[args.optimize_split],
-            dc_threshold=deploy_th["dc_threshold"],
-            ac_dc_threshold=deploy_th["ac_dc_threshold"],
             window_sec=args.window_sec,
             stride_sec=args.stride_sec,
             bundle_path=bundle_path,
@@ -3089,8 +2792,6 @@ def main(args=None):
     print("=" * 80)
     results = run_inference_parallel(
         samples=split[args.split],
-        dc_threshold=deploy_th["dc_threshold"],
-        ac_dc_threshold=deploy_th["ac_dc_threshold"],
         window_sec=args.window_sec,
         stride_sec=args.stride_sec,
         bundle_path=bundle_path,
@@ -3099,7 +2800,7 @@ def main(args=None):
         use_stage2_ir=use_stage2_ir,
     )
 
-    # 三套指标 + Stage1 target=1 通过率
+    # XGBoost 主指标与可选后处理参考指标
     sample_summary, details = compute_sample_metrics(
         results, args.method, postprocess_cfg, bundle["threshold"],
         stride_sec=args.stride_sec,
@@ -3110,7 +2811,6 @@ def main(args=None):
         model_threshold=bundle["threshold"],
         stride_sec=args.stride_sec,
     )
-    stage1_target1_summary = summarize_stage1_target1_pass_rate(results)
 
     # OOD 汇总：每条样本计 OOD 窗占比和触发标志
     ood_summary = _summarize_ood(results, alert_rate=args.ood_alert_rate)
@@ -3122,15 +2822,14 @@ def main(args=None):
     sample_summary["threshold_policy"] = bundle.get("threshold_policy")
 
     print("\n" + "=" * 80)
-    print("指标1: 端到端评估 (Stage1→Stage2→Stage3)")
-    print("  最终预测 vs 样本真实标签")
+    print("主指标: XGBoost-only 样本评估")
+    print("  窗口概率按所选 XGBoost-only 样本聚合方式生成预测")
     print("=" * 80)
     summary_for_print = {k: v for k, v in sample_summary.items() if k != "selected_features"}
     print(json.dumps(summary_for_print, indent=2, ensure_ascii=False))
 
     print("\n" + "=" * 80)
-    print("指标2: Stage2 模型评估 (仅通过Stage1的数据)")
-    print(f"  通过Stage1的样本: {window_model_summary.get('stage1_pass_samples', 0)}")
+    print("窗口指标: 全部合法窗口的 XGBoost 评估")
     print("  XGBoost 逐窗预测 vs 样本真实标签 (无 warmup)")
     print("=" * 80)
     wm_print = {k: v for k, v in window_model_summary.items() if k != "confusion_matrix"}
@@ -3148,12 +2847,9 @@ def main(args=None):
     print("\n" + "=" * 80)
     print("准确率对比")
     print("=" * 80)
-    print(f"  端到端 (Stage1→3):       {sample_summary['accuracy']:.4f}")
-    print(f"  Stage2 模型 (逐窗):      {window_model_summary['accuracy']:.4f}")
-    print(f"  Stage2+3 状态机 (逐窗):  {window_stream_summary['accuracy']:.4f}")
-    pass_rate = stage1_target1_summary["target1_stage1_pass_rate"]
-    pass_rate_text = "NA" if pass_rate is None else f"{pass_rate:.4f}"
-    print(f"  Stage1 target=1 通过率:  {pass_rate_text}")
+    print(f"  XGBoost-only (样本): {sample_summary['accuracy']:.4f}")
+    print(f"  XGBoost (逐窗):      {window_model_summary['accuracy']:.4f}")
+    print(f"  可选状态机 (逐窗):  {window_stream_summary['accuracy']:.4f}")
 
     # Hard negative 输出: 列出 FP 和 FN 样本
     fp_samples = [d for d in details if d["pred"] == 1 and d["target"] == 0]
@@ -3166,13 +2862,13 @@ def main(args=None):
         for d in sorted(fp_samples, key=lambda x: np.mean(x.get("window_probs", []) or [0]), reverse=True)[:10]:
             avg_p = np.mean(d.get("window_probs", []) or [0])
             print(f"    {d['sample_name']:30s} target=0 pred=1  avg_prob={avg_p:.3f}  "
-                  f"n_win={d.get('n_windows',0)}  s1_pass={d.get('stage1_pass',False)}")
+                  f"n_win={d.get('n_windows',0)}")
     if fn_samples:
         print("\n  False Negatives (佩戴判为非佩戴):")
         for d in sorted(fn_samples, key=lambda x: np.mean(x.get("window_probs", []) or [0]))[:10]:
             avg_p = np.mean(d.get("window_probs", []) or [0])
             print(f"    {d['sample_name']:30s} target=1 pred=0  avg_prob={avg_p:.3f}  "
-                  f"n_win={d.get('n_windows',0)}  s1_pass={d.get('stage1_pass',False)}")
+                  f"n_win={d.get('n_windows',0)}")
 
     # 把 OOD 信息也合并进每条 detail
     ood_map = {s["sample_name"]: s for s in ood_summary["per_sample"]}
@@ -3250,7 +2946,6 @@ def main(args=None):
             "window_summary": window_stream_summary,         # 向后兼容旧字段
             "window_model_summary": window_model_summary,    # 新增
             "window_stream_summary": window_stream_summary,  # 新增（与 window_summary 等价）
-            "stage1_target1_summary": stage1_target1_summary,
             "ood_summary": ood_summary,                      # 新增 OOD 汇总
             "threshold_sweep": threshold_sweep,               # 新增 阈值扫描（可选）
             "stratified_errors": stratified_errors,
@@ -3270,7 +2965,6 @@ def main(args=None):
         "window_summary": window_stream_summary,
         "window_model_summary": window_model_summary,
         "window_stream_summary": window_stream_summary,
-        "stage1_target1_summary": stage1_target1_summary,
         "ood_summary": ood_summary,
         "threshold_sweep": threshold_sweep,
         "stratified_errors": stratified_errors,
@@ -3855,7 +3549,7 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
                 f"{row['dimension']}={row['stratum']}",
                 f"fn={row['fn']}, fn_rate={row['fn_rate']:.4f}",
                 row["n_samples"],
-                "Check Stage1/quality gating and add matching positive low-quality/OOD data.",
+                "Review feature quality and add matching positive low-quality/OOD data.",
             )
         for row in _top_rows(
             window_strata,
