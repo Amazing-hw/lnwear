@@ -2020,17 +2020,17 @@ def main():
     )
     p.add_argument("--model_search_max_depth", default="2,3,4,5",
                    help="comma-separated s05 max_depth candidates")
-    p.add_argument("--model_search_learning_rate", default="0.025,0.03,0.04,0.05,0.06,0.08,0.10,0.15,0.20",
+    p.add_argument("--model_search_learning_rate", default="0.03,0.05,0.08,0.15",
                    help="comma-separated s05 learning_rate candidates")
-    p.add_argument("--model_search_min_child_weight", default="10,15,20,25,30,40,50",
+    p.add_argument("--model_search_min_child_weight", default="10,20,30,50",
                    help="comma-separated s05 min_child_weight candidates")
-    p.add_argument("--model_search_reg_lambda", default="5,8,10,12,16,20,30",
+    p.add_argument("--model_search_reg_lambda", default="5,10,20",
                    help="comma-separated s05 reg_lambda candidates")
-    p.add_argument("--model_search_reg_alpha", default="0,0.5,1,1.5,2,3",
+    p.add_argument("--model_search_reg_alpha", default="0,1,2",
                    help="comma-separated s05 reg_alpha candidates")
-    p.add_argument("--model_search_subsample", default="0.70,0.75,0.80,0.85,0.90",
+    p.add_argument("--model_search_subsample", default="0.75,0.85,0.90",
                    help="comma-separated s05 subsample candidates")
-    p.add_argument("--model_search_colsample_bytree", default="0.70,0.75,0.80,0.85,0.90",
+    p.add_argument("--model_search_colsample_bytree", default="0.75,0.85,0.90",
                    help="comma-separated s05 colsample_bytree candidates")
     # s06 eval / calibration params
     p.add_argument("--calibration_method", default="isotonic", choices=["none", "isotonic"])
@@ -2216,8 +2216,8 @@ def main():
     elif args.feature_selection_mode == "manual":
         skip_set.add("s04_search")
         manual_budgets = {
-            "fast": (80, 12),
-            "balanced": (120, 12),
+            "fast": (60, 6),
+            "balanced": (80, 8),
             "thorough": (360, 48),
         }
         manual_max_candidates, manual_stage2_top_k = manual_budgets[args.runtime_profile]

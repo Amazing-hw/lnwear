@@ -392,12 +392,12 @@ MODEL_SEARCH_PARAM_KEYS = [
 DEFAULT_MODEL_SEARCH_SPACE = {
     "n_estimators": list(DEFAULT_MODEL_SEARCH_N_ESTIMATORS),
     "max_depth": [2, 3, 4, 5],
-    "learning_rate": [0.025, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10, 0.15, 0.20],
-    "min_child_weight": [10, 15, 20, 25, 30, 40, 50],
-    "reg_lambda": [5, 8, 10, 12, 16, 20, 30],
-    "reg_alpha": [0, 0.5, 1, 1.5, 2, 3],
-    "subsample": [0.70, 0.75, 0.80, 0.85, 0.90],
-    "colsample_bytree": [0.70, 0.75, 0.80, 0.85, 0.90],
+    "learning_rate": [0.03, 0.05, 0.08, 0.15],
+    "min_child_weight": [10, 20, 30, 50],
+    "reg_lambda": [5, 10, 20],
+    "reg_alpha": [0, 1, 2],
+    "subsample": [0.75, 0.85, 0.90],
+    "colsample_bytree": [0.75, 0.85, 0.90],
 }
 
 

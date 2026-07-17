@@ -103,6 +103,14 @@ python s08_run_pipeline.py \
 - 最大树深可搜索到 5。
 - 树数量候选硬限制为不超过 50。
 - 特征数量在人工模式下不参与搜参。
+- 默认候选轴为：`n_estimators=20,25,30,35,40,45,50`，`max_depth=2,3,4,5`，
+  `learning_rate=0.03,0.05,0.08,0.15`，`min_child_weight=10,20,30,50`，
+  `reg_lambda=5,10,20`，`reg_alpha=0,1,2`，
+  `subsample=0.75,0.85,0.90`，`colsample_bytree=0.75,0.85,0.90`。
+- 人工模式默认 `balanced` 预算为 Stage A 80 个候选、Stage B 8 个候选；
+  `fast` 为 60/6，`thorough` 保持 360/48。显式 CLI 参数优先于档位默认值。
+- 默认使用 3 折、2 次重复的 grouped CV；人工 `balanced` 加上最终重训和
+  hard-negative 流程时，最多约 141 次 XGBoost 拟合。
 - hard-negative 候选只使用 train OOF 误报挖掘；只有 valid 指标满足接受条件才替换参考模型。
 - test 只用于冻结配置后的只读最终评估，不参与特征、阈值或超参数选择。
 

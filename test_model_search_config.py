@@ -226,9 +226,35 @@ def test_s08_manual_resume_uses_smaller_balanced_model_search_budget(tmp_path):
     output = result.stdout + result.stderr
 
     assert result.returncode == 0, output
-    assert "--model_search_max_candidates 120" in output
-    assert "--model_search_stage2_top_k 12" in output
+    assert "--model_search_max_candidates 80" in output
+    assert "--model_search_stage2_top_k 8" in output
     assert "--model_search_cache" in output
+
+
+def test_s08_manual_resume_uses_focused_non_tree_search_axes(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir()
+    manual_file = artifact_dir / "manual_feature_selection.csv"
+    manual_file.write_text("feature,selected\nGREEN_AC_RMS,1\n", encoding="utf-8")
+
+    result = _run_s08_dry_run(
+        "--artifact_dir", str(artifact_dir),
+        "--feature_selection_mode", "manual",
+        "--manual_feature_file", str(manual_file),
+        "--skip", "s01,s03,s04",
+        "--stop_after", "s05",
+    )
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 0, output
+    assert '--model_search_n_estimators "20,25,30,35,40,45,50"' in output
+    assert '--model_search_max_depth "2,3,4,5"' in output
+    assert '--model_search_learning_rate "0.03,0.05,0.08,0.15"' in output
+    assert '--model_search_min_child_weight "10,20,30,50"' in output
+    assert '--model_search_reg_lambda "5,10,20"' in output
+    assert '--model_search_reg_alpha "0,1,2"' in output
+    assert '--model_search_subsample "0.75,0.85,0.90"' in output
+    assert '--model_search_colsample_bytree "0.75,0.85,0.90"' in output
 
 
 def test_s08_manual_resume_fast_budget_and_explicit_override(tmp_path):
@@ -268,8 +294,8 @@ def test_s08_manual_resume_fast_budget_and_explicit_override(tmp_path):
     override_output = overridden.stdout + overridden.stderr
 
     assert fast.returncode == 0, fast_output
-    assert "--model_search_max_candidates 80" in fast_output
-    assert "--model_search_stage2_top_k 12" in fast_output
+    assert "--model_search_max_candidates 60" in fast_output
+    assert "--model_search_stage2_top_k 6" in fast_output
     assert thorough.returncode == 0, thorough_output
     assert "--model_search_max_candidates 360" in thorough_output
     assert "--model_search_stage2_top_k 48" in thorough_output
