@@ -1202,7 +1202,9 @@ def _run(name, cmd, dry_run=False, runtime_events=None):
         _record_runtime(runtime_events, name, 0.0, dry_run=True)
         return True
     t0 = time.time()
-    rc = subprocess.run(shlex.split(cmd), check=False).returncode
+    _env = os.environ.copy()
+    _env.update(THREAD_ENV_DEFAULTS)
+    rc = subprocess.run(shlex.split(cmd), check=False, env=_env).returncode
     dt = time.time() - t0
     _record_runtime(runtime_events, name, dt, dry_run=False)
     if rc == 0:
