@@ -3447,7 +3447,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                     acc_seg = None
             try:
                 if commercial_only:
-                    feat = _commercial_only_feature_row(window, acc_seg, mode, int(sample_frequency))
+                    feat = _commercial_only_feature_row(window, acc_seg, mode, FEATURE_FS)
                 else:
                     feat, diagnostics, _ = extract_stage2_window(
                         window,
@@ -3523,7 +3523,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                 acc_seg = align_acc_window(acc_25, len(ppg_25), start, win_25,
                                            fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
             if commercial_only:
-                feat = _commercial_only_feature_row(window, acc_seg, mode, int(sample_frequency))
+                feat = _commercial_only_feature_row(window, acc_seg, mode, FEATURE_FS)
             else:
                 feat, diagnostics, _ = extract_stage2_window(
                     window,

@@ -2269,6 +2269,7 @@ def main():
     if args.feature_selection_mode == "manual" and not manual_resume:
         if args.commercial_only:
             skip_set.add("s04_search")
+            skip_set.add("s04_embed")
             print(
                 "[commercial_only] s04 ranking complete; auto-selecting 8 commercial features "
                 "and continuing to s05 training."
