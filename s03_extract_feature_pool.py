@@ -32,7 +32,7 @@ import argparse
 import re
 import warnings as _commercial_warnings
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 import h5py
 import numpy as np
@@ -3367,14 +3367,10 @@ def _commercial_only_feature_row(window, acc_seg, mode, frequency):
     for name in stage2_model_candidate_names():
         feat[name] = 0.0
 
-    if acc_seg is not None:
-        try:
-            commercial = extract_commercial_feature_overrides(
-                ppg, acc_seg, frequency=frequency, ppg_config=mode,
-            )
-            feat.update(commercial)  # override 8 zeros with real values
-        except Exception:
-            pass
+    commercial = extract_commercial_feature_overrides(
+        ppg, acc_seg, frequency=frequency, ppg_config=mode,
+    )
+    feat.update(commercial)  # override 8 zeros with real values
 
     feat["mode"] = int(mode)
     feat["feature_pool_version"] = STAGE2_FEATURE_POOL_VERSION
@@ -3429,10 +3425,12 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
             else:
                 window = _downsample_ppg(raw_window, src_fs=100, tgt_fs=FEATURE_FS)
             acc_seg = None
+            commercial_acc = None
             if acc is not None:
                 try:
                     if is_prewindowed_signal(acc) and win_idx < acc.shape[0]:
                         raw_acc = acc[win_idx]
+                        commercial_acc = raw_acc
                         acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else resample_poly(
                             raw_acc.astype(np.float64), FEATURE_FS, 100, axis=0
                         )
@@ -3440,14 +3438,18 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                         raw_start = int(win_idx * stride_len)
                         raw_acc = acc[raw_start:raw_start + window_len]
                         if len(raw_acc) > 0:
+                            commercial_acc = raw_acc
                             acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else resample_poly(
                                 raw_acc.astype(np.float64), FEATURE_FS, 100, axis=0
                             )
                 except Exception:
                     acc_seg = None
+                    commercial_acc = None
             try:
                 if commercial_only:
-                    feat = _commercial_only_feature_row(window, acc_seg, mode, FEATURE_FS)
+                    feat = _commercial_only_feature_row(
+                        raw_window, commercial_acc, mode, ppg_src_fs
+                    )
                 else:
                     feat, diagnostics, _ = extract_stage2_window(
                         window,
@@ -3522,8 +3524,23 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
             if acc_25 is not None and len(acc_25) > 0:
                 acc_seg = align_acc_window(acc_25, len(ppg_25), start, win_25,
                                            fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
+            if native_25hz:
+                commercial_ppg = window
+                commercial_acc = acc_seg
+                commercial_frequency = FEATURE_FS
+            else:
+                commercial_stride = int(sample_frequency // FEATURE_FS)
+                commercial_start = int(start * commercial_stride)
+                commercial_len = int(125 * commercial_stride)
+                commercial_ppg = ppg[commercial_start:commercial_start + commercial_len]
+                commercial_acc = None if acc is None else acc[
+                    commercial_start:commercial_start + commercial_len
+                ]
+                commercial_frequency = sample_frequency
             if commercial_only:
-                feat = _commercial_only_feature_row(window, acc_seg, mode, FEATURE_FS)
+                feat = _commercial_only_feature_row(
+                    commercial_ppg, commercial_acc, mode, commercial_frequency
+                )
             else:
                 feat, diagnostics, _ = extract_stage2_window(
                     window,
@@ -3532,19 +3549,6 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                     acc_window=acc_seg,
                     use_stage2_ir=use_stage2_ir,
                 )
-                if native_25hz:
-                    commercial_ppg = window
-                    commercial_acc = acc_seg
-                    commercial_frequency = FEATURE_FS
-                else:
-                    commercial_stride = int(sample_frequency // FEATURE_FS)
-                    commercial_start = int(start * commercial_stride)
-                    commercial_len = int(125 * commercial_stride)
-                    commercial_ppg = ppg[commercial_start:commercial_start + commercial_len]
-                    commercial_acc = None if acc is None else acc[
-                        commercial_start:commercial_start + commercial_len
-                    ]
-                    commercial_frequency = sample_frequency
                 if commercial_acc is not None and len(commercial_ppg) == 125 * (commercial_frequency // FEATURE_FS):
                     feat.update(extract_commercial_feature_overrides(
                         commercial_ppg, commercial_acc, commercial_frequency, mode
@@ -3625,22 +3629,37 @@ def extract_features_for_split(samples,
         mp_ctx = multiprocessing_context_from_env()
         if mp_ctx is not None:
             pool_kwargs["mp_context"] = mp_ctx
+        _WORKER_TIMEOUT = 300  # 5 min per sample; guards against hung workers
         rows_by_sample = [[] for _ in args_list]
+        completed = 0
+        total = len(args_list)
         with ProcessPoolExecutor(**pool_kwargs) as ex:
-            futures = {ex.submit(_worker_extract, a): i for i, a in enumerate(args_list)}
-            total = len(futures)
+            future_to_idx = {ex.submit(_worker_extract, a): i for i, a in enumerate(args_list)}
+            pending = set(future_to_idx.keys())
             print(f"  s03 parallel extraction: {total} samples, workers={n_workers}", flush=True)
-            for done_count, fut in enumerate(as_completed(futures), 1):
-                sample_idx = futures[fut]
-                try:
-                    rows = fut.result()
-                except Exception as e:
-                    sample_name = samples[sample_idx].get("sample_name", f"idx={sample_idx}")
-                    print(f"  [WARN] s03 worker failed sample={sample_name}: {e}", flush=True)
-                    rows = []
-                rows_by_sample[sample_idx] = rows
-                if done_count % max(1, total // 10) == 0 or done_count == total:
-                    print(f"  s03 progress: {done_count}/{total} samples", flush=True)
+            while pending:
+                done, pending = wait(
+                    pending, timeout=_WORKER_TIMEOUT,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    print(f"  [WARN] s03 {len(pending)} samples still pending after {_WORKER_TIMEOUT}s timeout; "
+                          f"cancelling remaining workers", flush=True)
+                    for fut in pending:
+                        fut.cancel()
+                    break
+                for fut in done:
+                    sample_idx = future_to_idx[fut]
+                    try:
+                        rows = fut.result(timeout=10)
+                    except Exception as e:
+                        sample_name = samples[sample_idx].get("sample_name", f"idx={sample_idx}")
+                        print(f"  [WARN] s03 worker failed sample={sample_name}: {e}", flush=True)
+                        rows = []
+                    rows_by_sample[sample_idx] = rows
+                    completed += 1
+                    if completed % max(1, total // 10) == 0 or completed == total:
+                        print(f"  s03 progress: {completed}/{total} samples", flush=True)
         for rows in rows_by_sample:
             all_rows.extend(rows)
 
