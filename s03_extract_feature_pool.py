@@ -3611,11 +3611,26 @@ def extract_features_for_split(samples,
 
     n_workers = resolve_n_workers(n_workers, n_items=len(samples))
 
+    # Sort heaviest first: reduces tail latency when last few workers are left
+    # waiting on a single large continuous-signal sample.
+    def _sample_weight(s):
+        shape = s.get("ppg_shape")
+        if shape and len(shape) >= 1 and isinstance(shape[0], (int, float)):
+            return int(shape[0])
+        return 0  # conservative: unknown size goes last
+
+    ordered_samples = sorted(samples, key=_sample_weight, reverse=True)
+    samples = ordered_samples  # use sorted order for index-based error reporting
+    if n_workers > 1 and len(ordered_samples) >= n_workers * 2:
+        print(f"  s03 sample order: heaviest-first "
+              f"(max_windows={_sample_weight(ordered_samples[0])}, "
+              f"min_windows={_sample_weight(ordered_samples[-1])})", flush=True)
+
     args_list = [
         (s, window_len, stride_len, fs,
          target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
          use_stage2_ir, commercial_only)
-        for s in samples
+        for s in ordered_samples
     ]
 
     all_rows = []
