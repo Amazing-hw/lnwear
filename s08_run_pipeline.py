@@ -622,6 +622,12 @@ def _standalone_feature_engine_source():
     s03_path = os.path.join(SCRIPTS_DIR, "s03_extract_feature_pool.py")
     with open(s03_path, "r", encoding="utf-8") as f:
         source = f.read()
+    commercial_path = os.path.join(SCRIPTS_DIR, "commercial_liveness_features.py")
+    with open(commercial_path, "r", encoding="utf-8") as f:
+        commercial_source = f.read().strip()
+    commercial_source = commercial_source.split(
+        '\n\nif __name__ == "__main__":', 1
+    )[0].rstrip()
     engine_start = source.index("def apply_stage2_ir_policy")
     try:
         engine_end = source.index("def _downsample_ppg", engine_start)
@@ -651,6 +657,12 @@ def _standalone_feature_engine_source():
     return f'''EPS = 1e-12
 MIN_ZONE_RELATIVE_AC_RMS = 1e-8
 MIN_ZONE_ABSOLUTE_AC_RMS = 1e-9
+{commercial_source}
+
+COMMERCIAL_STAGE2_FIELDS = {repr(("GREEN_CORR", "COMM_GREEN_AC", "COMM_AMB_AC", "ACC_MAG_MEAN", "GREEN_DC_MEDIAN", "AMBX_DC_MEDIAN", "GREEN_AUTO_CORR_PEAK", "GREEN_FFT_PEAK_MEDIAN_RATIO"))}
+_commercial_port_main = main
+import warnings as _commercial_warnings
+
 DEFAULT_USE_STAGE2_IR = False
 FEATURE_FS = 25
 STAGE2_FEATURE_POOL_VERSION = {FEATURE_POOL_VERSION!r}
@@ -2341,6 +2353,7 @@ def main():
 
     # s03
     if "s03" not in skip_set:
+        _commercial_only_flag = " --commercial_only" if args.commercial_only else ""
         commands["s03"] = (
             f'"{PYTHON}" "{_script_path("s03_extract_feature_pool")}" '
             f'--artifact_dir "{args.artifact_dir}" '
@@ -2349,6 +2362,7 @@ def main():
             f'--skip_initial_windows {args.skip_initial_windows} '
             f'{stage2_ir_flag} '
             f'--n_workers {args.n_workers}'
+            f'{_commercial_only_flag}'
         )
 
     # s04

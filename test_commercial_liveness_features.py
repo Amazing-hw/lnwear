@@ -112,6 +112,29 @@ def test_commercial_adapter_native_25hz_does_not_resample(monkeypatch):
     np.testing.assert_array_equal(captured["acc"], acc)
 
 
+def test_commercial_adapter_truncates_after_combining_fractional_green_zones(monkeypatch):
+    ppg = np.zeros((125, 12), dtype=np.int32)
+    acc = np.zeros((125, 3), dtype=np.int16)
+    ppg[:, 1] = 100
+    ppg[:, 3] = 0
+    ppg[:, 9] = 1
+    ppg[:, 4] = 0
+    ppg[:, 10] = 1
+    ppg[:, 5] = 2
+    ppg[:, 11] = 3
+    captured = {}
+
+    def fake_main(port_ppg, _port_acc):
+        captured["ppg"] = port_ppg.copy()
+        return np.zeros(8, dtype=np.float32)
+
+    monkeypatch.setattr(s03, "_commercial_port_main", fake_main)
+    s03.extract_commercial_feature_overrides(ppg, acc, frequency=25, ppg_config=1)
+
+    # Physical zones are 0.5, 0.5, and 2.5. C receives int32(mean(...)) == 1.
+    np.testing.assert_array_equal(captured["ppg"][:, 0], np.ones(125, dtype=np.int32))
+
+
 @pytest.mark.parametrize(
     ("frequency", "length"),
     [(25, 124), (25, 126), (100, 499), (100, 501)],
@@ -161,3 +184,41 @@ def test_stage2_existing_commercial_fields_are_overridden(monkeypatch):
 
     assert tuple(s03.COMMERCIAL_STAGE2_FIELDS) == EXPECTED_STAGE2_FIELDS
     assert [features[name] for name in EXPECTED_STAGE2_FIELDS] == pytest.approx(expected)
+
+
+def test_batch_extraction_overrides_commercial_fields_from_raw_100hz_windows(monkeypatch):
+    ppg, acc = _raw_window(1500)
+    observed = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
+    monkeypatch.setattr(
+        s03,
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: ({"GREEN_CORR": -1.0}, {}, {}),
+    )
+
+    def fake_overrides(raw_ppg, raw_acc, frequency, ppg_config):
+        observed.append((raw_ppg.shape, raw_acc.shape, frequency, ppg_config))
+        return OrderedDict((("GREEN_CORR", 10.0),))
+
+    monkeypatch.setattr(s03, "extract_commercial_feature_overrides", fake_overrides)
+    rows = s03._extract_rows_for_sample(
+        {
+            "sample_name": "sample",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_len=500,
+        stride_len=100,
+        fs=100,
+        target_aware_stride=False,
+        stride_neg=100,
+        stride_pos=100,
+    )
+
+    assert rows
+    assert all(row["GREEN_CORR"] == 10.0 for row in rows)
+    assert observed

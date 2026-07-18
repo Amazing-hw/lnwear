@@ -3250,9 +3250,9 @@ def extract_commercial_feature_overrides(ppg_window, acc_window, frequency, ppg_
     strided_acc = acc[::stride].astype(np.int16)
 
     _, ambient, g1, g2, g3 = get_channels_from_window(strided_ppg, ppg_config)
-    green = ((np.asarray(g1, dtype=np.int64)
-              + np.asarray(g2, dtype=np.int64)
-              + np.asarray(g3, dtype=np.int64)) / 3.0).astype(np.int32)
+    green = ((np.asarray(g1, dtype=np.float64)
+              + np.asarray(g2, dtype=np.float64)
+              + np.asarray(g3, dtype=np.float64)) / 3.0).astype(np.int32)
 
     port_ppg = np.zeros((125, 4), dtype=np.int32)
     port_ppg[:, 0] = green
@@ -3350,16 +3350,53 @@ def _downsample_ppg(ppg, src_fs=100, tgt_fs=25):
     return np.concatenate(out_parts, axis=1)
 
 
+def _commercial_only_feature_row(window, acc_seg, mode, frequency):
+    """Return a minimal feature dict with only the 8 commercial features + diagnostics.
+
+    This is the fast path used by --commercial_only. It skips the full 126-feature
+    Stage2 pipeline and only computes the 8 features from the commercial float32 port.
+    """
+    import commercial_liveness_features as _comm
+
+    ppg = np.asarray(window, dtype=np.float64)
+    if ppg.ndim == 1:
+        ppg = ppg.reshape(-1, 1)
+
+    feat = OrderedDict()
+    if acc_seg is not None:
+        try:
+            commercial = extract_commercial_feature_overrides(
+                ppg, acc_seg, frequency=frequency, ppg_config=mode,
+            )
+            feat.update(commercial)
+        except Exception:
+            for name in COMMERCIAL_STAGE2_FIELDS:
+                feat[name] = 0.0
+    else:
+        for name in COMMERCIAL_STAGE2_FIELDS:
+            feat[name] = 0.0
+    feat["mode"] = int(mode)
+    feat["feature_pool_version"] = STAGE2_FEATURE_POOL_VERSION
+    feat["TOTAL_INVALID_COUNT"] = 0.0
+    feat["PPG_INVALID_COUNT"] = 0.0
+    feat["GREEN_INVALID_COUNT"] = 0.0
+    feat["ACC_AVAILABLE"] = float(acc_seg is not None)
+    return feat
+
+
 def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                               target_aware_stride, stride_neg, stride_pos,
                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
-                              use_stage2_ir=DEFAULT_USE_STAGE2_IR):
+                              use_stage2_ir=DEFAULT_USE_STAGE2_IR,
+                              commercial_only=False):
     """
     单样本全量抽窗特征。返回 rows list（失败时返回 []）。
 
     所有合法窗口直接进入 XGBoost 特征提取。3D 预切窗样本直接使用
     已有窗口；连续时序样本降采样到 25Hz 后滑窗。
     fs 参数为降采样后目标采样率 (25Hz)。
+
+    commercial_only=True 时只提取 8 个商用特征 + 诊断字段，大幅加速。
     """
     FEATURE_FS = 25  # 特征提取统一采样率
 
@@ -3408,14 +3445,17 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                 except Exception:
                     acc_seg = None
             try:
-                feat, diagnostics, _ = extract_stage2_window(
-                    window,
-                    mode=mode,
-                    fs=FEATURE_FS,
-                    acc_window=acc_seg,
-                    use_stage2_ir=use_stage2_ir,
-                )
-                feat.update(diagnostics)
+                if commercial_only:
+                    feat = _commercial_only_feature_row(window, acc_seg, mode, int(sample_frequency))
+                else:
+                    feat, diagnostics, _ = extract_stage2_window(
+                        window,
+                        mode=mode,
+                        fs=FEATURE_FS,
+                        acc_window=acc_seg,
+                        use_stage2_ir=use_stage2_ir,
+                    )
+                    feat.update(diagnostics)
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
                 feat["target"] = int(window_target)
@@ -3481,14 +3521,34 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
             if acc_25 is not None and len(acc_25) > 0:
                 acc_seg = align_acc_window(acc_25, len(ppg_25), start, win_25,
                                            fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
-            feat, diagnostics, _ = extract_stage2_window(
-                window,
-                mode=mode,
-                fs=FEATURE_FS,
-                acc_window=acc_seg,
-                use_stage2_ir=use_stage2_ir,
-            )
-            feat.update(diagnostics)
+            if commercial_only:
+                feat = _commercial_only_feature_row(window, acc_seg, mode, int(sample_frequency))
+            else:
+                feat, diagnostics, _ = extract_stage2_window(
+                    window,
+                    mode=mode,
+                    fs=FEATURE_FS,
+                    acc_window=acc_seg,
+                    use_stage2_ir=use_stage2_ir,
+                )
+                if native_25hz:
+                    commercial_ppg = window
+                    commercial_acc = acc_seg
+                    commercial_frequency = FEATURE_FS
+                else:
+                    commercial_stride = int(sample_frequency // FEATURE_FS)
+                    commercial_start = int(start * commercial_stride)
+                    commercial_len = int(125 * commercial_stride)
+                    commercial_ppg = ppg[commercial_start:commercial_start + commercial_len]
+                    commercial_acc = None if acc is None else acc[
+                        commercial_start:commercial_start + commercial_len
+                    ]
+                    commercial_frequency = sample_frequency
+                if commercial_acc is not None and len(commercial_ppg) == 125 * (commercial_frequency // FEATURE_FS):
+                    feat.update(extract_commercial_feature_overrides(
+                        commercial_ppg, commercial_acc, commercial_frequency, mode
+                    ))
+                feat.update(diagnostics)
             feat["sample_name"] = sample["sample_name"]
             feat["h5_file"] = sample["h5_file"]
             feat["target"] = int(sample["target"])
@@ -3507,11 +3567,12 @@ def _worker_extract(args_tuple):
     """子进程入口。"""
     (sample, window_len, stride_len, fs,
      target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
-     use_stage2_ir) = args_tuple
+     use_stage2_ir, commercial_only) = args_tuple
     return _extract_rows_for_sample(
         sample, window_len, stride_len, fs,
         target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
+        commercial_only=commercial_only,
     )
 
 
@@ -3523,7 +3584,8 @@ def extract_features_for_split(samples,
                                target_ratio=5.0,
                                skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                use_stage2_ir=DEFAULT_USE_STAGE2_IR,
-                               n_workers=None):
+                               n_workers=None,
+                               commercial_only=False):
     """
     提取特征池（样本级并行）。
 
@@ -3535,6 +3597,7 @@ def extract_features_for_split(samples,
         target_aware_stride: 是否启用target感知stride
         target_ratio: 目标正负样本比例 (neg/pos)
         n_workers: 并行 worker 数；None=自动(cpu_count-1)，1=单进程
+        commercial_only: 仅提取商用 8 特征（跳过 126 项 Stage2 全量池）
     """
     window_len = int(window_sec * fs)
     stride_len = int(stride_sec * fs)
@@ -3546,7 +3609,7 @@ def extract_features_for_split(samples,
     args_list = [
         (s, window_len, stride_len, fs,
          target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
-         use_stage2_ir)
+         use_stage2_ir, commercial_only)
         for s in samples
     ]
 
@@ -3614,6 +3677,8 @@ def main(args=None):
     parser.add_argument("--n_workers", type=int,
                         default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                         help="并行 worker 数")
+    parser.add_argument("--commercial_only", action="store_true",
+                        help="仅提取商用 8 特征，跳过 126 项 Stage2 全量池")
 
     if args is None:
         args = parser.parse_args()
@@ -3647,6 +3712,7 @@ def main(args=None):
             skip_initial_windows=args.skip_initial_windows,
             use_stage2_ir=args.use_stage2_ir,
             n_workers=args.n_workers,
+            commercial_only=args.commercial_only,
         )
 
         out_path = os.path.join(args.artifact_dir, f"feature_pool_{part}.csv")
