@@ -3246,7 +3246,7 @@ def extract_commercial_feature_overrides(ppg_window, acc_window, frequency, ppg_
             f"at {frequency} Hz, got {acc.shape[0]}"
         )
 
-    strided_ppg = ppg[::stride]
+    strided_ppg = np.nan_to_num(ppg[::stride], nan=0.0, posinf=0.0, neginf=0.0)
     strided_acc = np.nan_to_num(acc[::stride], nan=0.0, posinf=0.0, neginf=0.0).astype(np.int16)
 
     _, ambient, g1, g2, g3 = get_channels_from_window(strided_ppg, ppg_config)
