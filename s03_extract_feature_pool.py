@@ -3351,30 +3351,31 @@ def _downsample_ppg(ppg, src_fs=100, tgt_fs=25):
 
 
 def _commercial_only_feature_row(window, acc_seg, mode, frequency):
-    """Return a minimal feature dict with only the 8 commercial features + diagnostics.
+    """Return a feature dict with 8 commercial features + zero-filled model candidates.
 
     This is the fast path used by --commercial_only. It skips the full 126-feature
     Stage2 pipeline and only computes the 8 features from the commercial float32 port.
+    The remaining 118 model-candidate columns are filled with 0.0 so the output CSV
+    keeps the complete column set expected by s04/s05/s06.
     """
-    import commercial_liveness_features as _comm
-
     ppg = np.asarray(window, dtype=np.float64)
     if ppg.ndim == 1:
         ppg = ppg.reshape(-1, 1)
 
     feat = OrderedDict()
+    # Start with zeros for ALL model candidates (ensures 126 columns always present)
+    for name in stage2_model_candidate_names():
+        feat[name] = 0.0
+
     if acc_seg is not None:
         try:
             commercial = extract_commercial_feature_overrides(
                 ppg, acc_seg, frequency=frequency, ppg_config=mode,
             )
-            feat.update(commercial)
+            feat.update(commercial)  # override 8 zeros with real values
         except Exception:
-            for name in COMMERCIAL_STAGE2_FIELDS:
-                feat[name] = 0.0
-    else:
-        for name in COMMERCIAL_STAGE2_FIELDS:
-            feat[name] = 0.0
+            pass
+
     feat["mode"] = int(mode)
     feat["feature_pool_version"] = STAGE2_FEATURE_POOL_VERSION
     feat["TOTAL_INVALID_COUNT"] = 0.0
