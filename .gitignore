@@ -4,3 +4,8 @@ __pycache__/
 .claude/
 *.pyc
 *.pyo
+*.npz
+artifacts/
+artifacts_*/
+dataset/
+model_search_cache/

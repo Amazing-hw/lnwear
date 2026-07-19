@@ -1,5 +1,6 @@
 import numpy as np
 import h5py
+import pytest
 
 import s01_data_split as s01
 import s03_extract_feature_pool as s03
@@ -58,6 +59,7 @@ def test_s03_parallel_extraction_schedules_heaviest_first_and_preserves_input_or
             self.args = args
 
         def result(self, timeout=None):
+            assert timeout is None
             sample = self.args[0]
             return [{"sample_name": sample["sample_name"], "target": sample["target"]}]
 
@@ -77,14 +79,14 @@ def test_s03_parallel_extraction_schedules_heaviest_first_and_preserves_input_or
 
     monkeypatch.setattr(s03, "ProcessPoolExecutor", FakeExecutor)
 
-    def complete_last_sample_first(pending, **_kwargs):
-        completed = max(
-            pending,
+    def complete_last_sample_first(futures):
+        return sorted(
+            futures,
             key=lambda future: future.args[0]["sample_name"],
+            reverse=True,
         )
-        return {completed}, set(pending) - {completed}
 
-    monkeypatch.setattr(s03, "wait", complete_last_sample_first)
+    monkeypatch.setattr(s03, "as_completed", complete_last_sample_first)
     samples = [
         {"sample_name": "sample_a", "h5_file": "a.h5", "target": 0, "ppg_shape": (100, 40)},
         {"sample_name": "sample_b", "h5_file": "b.h5", "target": 1, "ppg_shape": (1000, 40)},
@@ -98,6 +100,48 @@ def test_s03_parallel_extraction_schedules_heaviest_first_and_preserves_input_or
 
     assert submitted == ["sample_b", "sample_c", "sample_a"]
     assert result["sample_name"].tolist() == ["sample_a", "sample_b", "sample_c"]
+
+
+def test_s03_parallel_extraction_attempts_every_sample_before_reporting_failures(monkeypatch):
+    completed = []
+
+    class FakeFuture:
+        def __init__(self, args):
+            self.args = args
+
+        def result(self, timeout=None):
+            assert timeout is None
+            sample = self.args[0]
+            completed.append(sample["sample_name"])
+            if sample["sample_name"] == "sample_bad":
+                raise ValueError("synthetic extraction failure")
+            return [{"sample_name": sample["sample_name"], "target": sample["target"]}]
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, _fn, args):
+            return FakeFuture(args)
+
+    monkeypatch.setattr(s03, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(s03, "as_completed", lambda futures: list(futures))
+    samples = [
+        {"sample_name": "sample_bad", "h5_file": "bad.h5", "target": 0},
+        {"sample_name": "sample_good", "h5_file": "good.h5", "target": 1},
+        {"sample_name": "sample_good_2", "h5_file": "good_2.h5", "target": 0},
+    ]
+
+    with pytest.raises(RuntimeError, match="all samples were attempted.*sample_bad"):
+        s03.extract_features_for_split(samples, n_workers=2)
+
+    assert sorted(completed) == ["sample_bad", "sample_good", "sample_good_2"]
 
 
 def test_s01_accepts_prewindowed_ppg_shape():

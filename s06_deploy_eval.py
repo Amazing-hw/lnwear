@@ -119,8 +119,8 @@ def resolve_postprocess_thresholds(cfg, model_threshold=0.5):
 
 
 def resolve_use_stage2_ir(bundle, requested=None):
-    # Legacy CLI compatibility only. Stage2 model features are always
-    # Model candidates use ambient/green/ACC; IR-derived features remain excluded.
+    # Legacy CLI compatibility only. The model uses ambient/green/ACC features;
+    # IR-derived features remain excluded from Stage2 candidates.
     return DEFAULT_USE_STAGE2_IR
 
 
@@ -173,7 +173,7 @@ def load_bundle(path):
 
 def assert_bundle_ok(bundle):
     """校验模型包完整性"""
-    needed = ["feature_names", "fill_values", "scaler", "model", "threshold", "meta"]
+    needed = ["feature_names", "fill_values", "model", "threshold", "meta"]
     for k in needed:
         if k not in bundle:
             raise ValueError(f"model_bundle missing key: {k}")

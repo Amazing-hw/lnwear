@@ -252,9 +252,11 @@ def export_pipeline_scientific_overview(artifact_dir):
     ax_hero.set_title("Frozen pipeline evidence", loc="left", weight="bold")
     ax_hero.axis("off")
 
+    _safe_float = lambda v, d=0.0: float(d) if v is None or (isinstance(v, float) and np.isnan(v)) else float(v or d)
+
     pool_values = [
-        float(completeness.get("catalog_count", 0) or 0),
-        float(completeness.get("ranked_count", 0) or 0),
+        _safe_float(completeness.get("catalog_count", 0)),
+        _safe_float(completeness.get("ranked_count", 0)),
         float(len(selection.get("selected_features", [])) if selection else 0),
     ]
     ax_pool.bar(["catalog", "ranked", "selected"], pool_values, color=[PALETTE["negative"], PALETTE["positive"], PALETTE["selected"]])
@@ -263,9 +265,9 @@ def export_pipeline_scientific_overview(artifact_dir):
     ax_pool.tick_params(axis="x", rotation=20)
 
     model_values = [
-        float(selected_model.get("valid_accuracy", 0.0) or 0.0),
-        float(selected_model.get("valid_fp_rate", 0.0) or 0.0),
-        float(hard_negative.get("valid_accuracy_delta", 0.0) or 0.0),
+        _safe_float(selected_model.get("valid_accuracy", 0.0)),
+        _safe_float(selected_model.get("valid_fp_rate", 0.0)),
+        _safe_float(hard_negative.get("valid_accuracy_delta", 0.0)),
     ]
     ax_model.bar(["accuracy", "FPR", "HN Δacc"], model_values, color=[PALETTE["selected"], PALETTE["warning"], PALETTE["negative"]])
     ax_model.axhline(0.01, color=PALETTE["danger"], linestyle="--", linewidth=1, label="FPR target")
@@ -275,9 +277,9 @@ def export_pipeline_scientific_overview(artifact_dir):
 
     post_labels = ["window accuracy", "window FPR", "added latency / 3 s"]
     post_values = [
-        float(post_metrics.get("window_accuracy", 0.0) or 0.0),
-        float(post_metrics.get("window_fp_rate", 0.0) or 0.0),
-        float(post_metrics.get("first_worn_output_p95_sec", 0.0) or 0.0) / 3.0,
+        _safe_float(post_metrics.get("window_accuracy", 0.0)),
+        _safe_float(post_metrics.get("window_fp_rate", 0.0)),
+        _safe_float(post_metrics.get("first_worn_output_p95_sec", 0.0)) / 3.0,
     ]
     ax_post.barh(post_labels, post_values, color=[PALETTE["selected"], PALETTE["warning"], PALETTE["negative"]])
     ax_post.axvline(1.0, color=PALETTE["neutral"], linestyle=":", linewidth=1)

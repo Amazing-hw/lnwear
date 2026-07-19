@@ -262,7 +262,7 @@ for _name, _source, _formula, _fft in [
         preprocessing="pulse_detrended",
         formula=_formula,
         c_operators=_ops("hamming", "rfft", "sum_squares", "argmax") if _fft else _ops("autocorrelation", "argmax"),
-        unit="Hz" if _name.endswith(("DOM_FREQ", "width_Hz")) else "ratio",
+        unit="Hz" if _name.endswith("DOM_FREQ") else "ratio",
         signal_source=_source,
         fft=_fft,
         accumulator="float64",

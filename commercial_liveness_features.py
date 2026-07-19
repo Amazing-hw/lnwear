@@ -7,7 +7,6 @@ import numpy as np
 
 F32 = np.float32
 HALF = 125
-LD_BUF = 125
 MAX_PEAK = 16
 FFTLEN = 256
 PI_FFT = F32(3.141592653589793)
@@ -208,7 +207,7 @@ def _find_peak_valley(buf):
         vv[vn - 1] = buf[k]
 
     for k in range(1, n - 1):
-        kk = max(k, 1)
+        kk = max(k, 1)  # redundant (k >= 1); preserved for C-reference fidelity
         cont = False
         if buf[kk] > buf[kk - 1] and buf[kk] >= buf[kk + 1]:
             if pretime == 0:
@@ -575,6 +574,7 @@ def compute_g_acc(acc_xyz):
         st.u[0] = y
         ys50 = F32(st.ySum / F32(50.0))
         isStill = 1 if ys50 < F32(0.005) else 0
+        # isStill is only ever 0 or 1; the <=1 guard matches the C reference.
         if st.isStill <= 1:
             g_acc = ys50
         st.isStill = isStill

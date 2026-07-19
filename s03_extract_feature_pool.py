@@ -32,7 +32,7 @@ import argparse
 import re
 import warnings as _commercial_warnings
 from collections import OrderedDict
-from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
 import numpy as np
@@ -4044,10 +4044,21 @@ def extract_features_for_split(samples,
     ]
 
     rows_by_sample = [[] for _ in original_samples]
+    failures = []
     if n_workers == 1:
         for i, a in enumerate(args_list, 1):
             original_idx = ordered_original_indices[i - 1]
-            rows_by_sample[original_idx] = _worker_extract(a)
+            try:
+                rows_by_sample[original_idx] = _worker_extract(a)
+            except Exception as exc:
+                sample_name = original_samples[original_idx].get(
+                    "sample_name", f"idx={original_idx}")
+                failures.append((sample_name, exc))
+                print(
+                    f"  [ERROR] s03 worker failed sample={sample_name}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
             if len(args_list) >= 10 and (i % max(1, len(args_list) // 10) == 0 or i == len(args_list)):
                 print(f"  s03 progress: {i}/{len(args_list)} samples", flush=True)
     else:
@@ -4055,7 +4066,6 @@ def extract_features_for_split(samples,
         mp_ctx = multiprocessing_context_from_env()
         if mp_ctx is not None:
             pool_kwargs["mp_context"] = mp_ctx
-        _WORKER_TIMEOUT = 300  # 5 min per sample; guards against hung workers
         completed = 0
         total = len(args_list)
         with ProcessPoolExecutor(**pool_kwargs) as ex:
@@ -4063,32 +4073,39 @@ def extract_features_for_split(samples,
                 ex.submit(_worker_extract, a): ordered_original_indices[i]
                 for i, a in enumerate(args_list)
             }
-            pending = set(future_to_idx.keys())
             print(f"  s03 parallel extraction: {total} samples, workers={n_workers}", flush=True)
-            while pending:
-                done, pending = wait(
-                    pending, timeout=_WORKER_TIMEOUT,
-                    return_when=FIRST_COMPLETED,
-                )
-                if not done:
-                    print(f"  [WARN] s03 {len(pending)} samples still pending after {_WORKER_TIMEOUT}s timeout; "
-                          f"cancelling remaining workers", flush=True)
-                    for fut in pending:
-                        fut.cancel()
-                    break
-                for fut in done:
-                    sample_idx = future_to_idx[fut]
-                    try:
-                        rows = fut.result(timeout=10)
-                    except Exception as e:
-                        sample_name = original_samples[sample_idx].get(
-                            "sample_name", f"idx={sample_idx}")
-                        print(f"  [WARN] s03 worker failed sample={sample_name}: {e}", flush=True)
-                        rows = []
-                    rows_by_sample[sample_idx] = rows
-                    completed += 1
-                    if completed % max(1, total // 10) == 0 or completed == total:
-                        print(f"  s03 progress: {completed}/{total} samples", flush=True)
+            # Intentionally no timeout: every submitted sample must finish or
+            # raise an explicit error. Slow samples are never cancelled or
+            # converted into silent empty results.
+            for fut in as_completed(future_to_idx):
+                sample_idx = future_to_idx[fut]
+                try:
+                    rows = fut.result()
+                except Exception as exc:
+                    sample_name = original_samples[sample_idx].get(
+                        "sample_name", f"idx={sample_idx}")
+                    failures.append((sample_name, exc))
+                    print(
+                        f"  [ERROR] s03 worker failed sample={sample_name}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                    rows = []
+                rows_by_sample[sample_idx] = rows
+                completed += 1
+                if completed % max(1, total // 10) == 0 or completed == total:
+                    print(f"  s03 progress: {completed}/{total} samples", flush=True)
+
+    if failures:
+        examples = "; ".join(
+            f"{name}: {type(exc).__name__}: {exc}"
+            for name, exc in failures[:5]
+        )
+        raise RuntimeError(
+            f"s03 feature extraction failed for {len(failures)}/"
+            f"{len(original_samples)} samples after all samples were attempted; "
+            f"examples: {examples}"
+        )
     all_rows = []
     for rows in rows_by_sample:
         all_rows.extend(rows)

@@ -1,7 +1,7 @@
 # Interpretable Stage2 Feature Pool Design
 
-> Historical design record. The active implementation is v8 with 126 governed
-> candidates, CSV-only manual selection and fixed-position three-zone features.
+> Historical design record. Originally written for v8 (126 governed candidates).
+> Current implementation is stage2_interpretable_v9 (commercial formulas ported).
 > The commercial comparison runtime was removed; its eight-feature mapping remains.
 
 Date: 2026-07-10

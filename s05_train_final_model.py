@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-# from sklearn.preprocessing import StandardScaler  # 去掉归一化
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, confusion_matrix
@@ -894,15 +893,15 @@ def search_threshold_by_valid(model, X_valid, y_valid, objective="f1",
     在 valid 上搜窗口阈值。
 
     objective:
-      - "accuracy"           : 默认，最大化窗口准确率
-      - "f1"                 : F1
+      - "f1"                 : 默认，最大化 F1
+      - "accuracy"           : 最大化窗口准确率
       - "precision"          : 仅 precision
       - "recall"             : 仅 recall
       - "fbeta"              : F-beta (beta=0.5 偏 precision)
       - "precision_constrained" : 在 precision >= min_precision 约束下最大化 recall
 
-    默认优先单窗口 accuracy；FP 风险专项优化时再显式切到
-    fbeta(beta=0.5) 或 precision_constrained。
+    默认优先 F1；FP 风险专项优化时再显式切到
+    fbeta(beta=0.5)、precision_constrained 或 accuracy。
     """
     probs = model.predict_proba(X_valid)[:, 1]
     if objective == "accuracy":
@@ -2722,7 +2721,7 @@ def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
     try:
         import subprocess
         r = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                           text=True, timeout=2)
+                           text=True)
         if r.returncode == 0:
             info["git_sha"] = r.stdout.strip()
     except Exception:

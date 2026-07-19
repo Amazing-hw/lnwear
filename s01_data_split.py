@@ -6,9 +6,8 @@
 
 主要改进：
 1. H5 扫描按文件并行（IO bound）
-2. 删除 line 99 的不可达死代码
-3. 严格读取 frequency 与 ppg_config；缺失、非法或分组内不一致时跳过并统计原因。
-4. 支持 grouped-window H5：一个 record 下多个 *_w20_1 窗口 group，
+2. 严格读取 frequency 与 ppg_config；缺失、非法或分组内不一致时跳过并统计原因。
+3. 支持 grouped-window H5：一个 record 下多个 *_w20_1 窗口 group，
    按 w 编号排序并保留窗口 label 序列。
 5. 切分逻辑、输出 schema 向后兼容
 
@@ -214,13 +213,19 @@ def _scan_one_h5(h5_file):
     try:
         with h5py.File(h5_file, "r") as f:
             for sample_name in f.keys():
+                if re.search(r"(0003|0103)\d{4}", sample_name):
+                    continue
+
+                if re.search(r"(0104|0002)\d{4}", sample_name):
+                    continue
+
                 grp = f[sample_name]
                 if "ppg" not in grp:
                     grouped = _scan_grouped_window_sample(h5_file, sample_name, grp, filtered)
                     if grouped is not None:
                         samples.append(grouped)
                     continue
-                if "ppg" not in grp or "target" not in grp:
+                if "target" not in grp:
                     continue
                 try:
                     label = int(grp["target"][()])

@@ -75,7 +75,7 @@ def _row_for_feature(item: dict, ranking_sha256: str) -> dict:
         "buffer_samples": int(record["buffer_samples"]),
         "accumulator": str(record["accumulator"]),
         "c_operators": ", ".join(map(str, record["c_operators"])),
-        "risk_flags": ", ".join(map(str, item.get("risk_flags") or record.get("risk_flags") or [])),
+        "risk_flags": ", ".join(map(str, item.get("risk_flags") if item.get("risk_flags") is not None else record.get("risk_flags", []))),
         "ineligible_reasons": ", ".join(map(str, item.get("ineligible_reasons") or [])),
     }
 

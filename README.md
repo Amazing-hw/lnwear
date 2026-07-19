@@ -264,7 +264,7 @@ python s07_postprocess_optimize.py \
 `--n_workers` 会由 `s08` 传递到支持并行的各步骤：
 
 - `s01`：按 H5 文件扫描。
-- `s03`：按样本提取特征。
+- `s03`：按样本提取特征；不设置等待超时，不会因单个样本处理较慢而取消剩余任务。所有样本都会被尝试，真实提取失败会在全部任务结束后整体报错，不会静默写成空结果。
 - `s04`：按 seed × group-fold 计算稳定性和排序诊断。
 - `s05`：模型候选并行，候选内部 XGBoost 线程限制为 1，避免嵌套过度并行。
 - `s06`：按样本推理。
@@ -292,7 +292,7 @@ python s07_postprocess_optimize.py \
 语法检查：
 
 ```bash
-python -m py_compile direct_feature_selection.py s01_data_split.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py
+python -m py_compile direct_feature_selection.py manual_feature_selection.py model_search_limits.py pipeline_acceptance.py s01_data_split.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py scientific_figures.py stage2_feature_catalog.py commercial_liveness_features.py
 ```
 
 全量测试：

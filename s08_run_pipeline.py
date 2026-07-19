@@ -1125,9 +1125,6 @@ def validate_deploy_artifact_consistency(artifact_dir):
     }
     print("[OK] deploy artifacts are consistent with model_bundle.pkl")
     return report
-import sys
-import time
-from datetime import timedelta
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PYTHON = sys.executable
