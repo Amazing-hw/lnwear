@@ -170,6 +170,21 @@ def test_commercial_adapter_rejects_missing_or_misaligned_acc():
         )
 
 
+def test_commercial_only_row_requires_acc_and_propagates_port_errors(monkeypatch):
+    ppg, acc = _raw_window(125)
+
+    with pytest.raises(ValueError, match="commercial ACC window"):
+        s03._commercial_only_feature_row(ppg, None, mode=0, frequency=25)
+
+    monkeypatch.setattr(
+        s03,
+        "extract_commercial_feature_overrides",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("port failed")),
+    )
+    with pytest.raises(RuntimeError, match="port failed"):
+        s03._commercial_only_feature_row(ppg, acc, mode=0, frequency=25)
+
+
 def test_stage2_existing_commercial_fields_are_overridden(monkeypatch):
     ppg, acc = _raw_window(125)
     expected = np.arange(8, dtype=np.float32) + np.float32(10)
@@ -222,3 +237,80 @@ def test_batch_extraction_overrides_commercial_fields_from_raw_100hz_windows(mon
     assert rows
     assert all(row["GREEN_CORR"] == 10.0 for row in rows)
     assert observed
+
+
+def test_commercial_only_continuous_100hz_uses_raw_windows(monkeypatch):
+    ppg, acc = _raw_window(1500)
+    observed = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
+
+    def fake_overrides(raw_ppg, raw_acc, frequency, ppg_config):
+        observed.append((raw_ppg.copy(), raw_acc.copy(), frequency, ppg_config))
+        return OrderedDict((name, float(i)) for i, name in enumerate(EXPECTED_STAGE2_FIELDS))
+
+    monkeypatch.setattr(s03, "extract_commercial_feature_overrides", fake_overrides)
+    rows = s03._extract_rows_for_sample(
+        {
+            "sample_name": "sample",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_len=500,
+        stride_len=100,
+        fs=100,
+        target_aware_stride=False,
+        stride_neg=100,
+        stride_pos=100,
+        commercial_only=True,
+    )
+
+    assert rows
+    first_ppg, first_acc, frequency, ppg_config = observed[0]
+    assert frequency == 100
+    assert ppg_config == 0
+    np.testing.assert_array_equal(first_ppg, ppg[300:800])
+    np.testing.assert_array_equal(first_acc, acc[300:800])
+
+
+def test_commercial_only_prewindowed_100hz_uses_raw_windows(monkeypatch):
+    first_ppg, first_acc = _raw_window(500)
+    ppg = np.stack([first_ppg, first_ppg + 1000], axis=0)
+    acc = np.stack([first_acc, first_acc + 10], axis=0)
+    observed = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
+
+    def fake_overrides(raw_ppg, raw_acc, frequency, ppg_config):
+        observed.append((raw_ppg.copy(), raw_acc.copy(), frequency, ppg_config))
+        return OrderedDict((name, float(i)) for i, name in enumerate(EXPECTED_STAGE2_FIELDS))
+
+    monkeypatch.setattr(s03, "extract_commercial_feature_overrides", fake_overrides)
+    rows = s03._extract_rows_for_sample(
+        {
+            "sample_name": "sample",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_len=500,
+        stride_len=100,
+        fs=100,
+        target_aware_stride=False,
+        stride_neg=100,
+        stride_pos=100,
+        commercial_only=True,
+    )
+
+    assert len(rows) == 2
+    assert len(observed) == 2
+    for index, (raw_ppg, raw_acc, frequency, ppg_config) in enumerate(observed):
+        assert frequency == 100
+        assert ppg_config == 0
+        np.testing.assert_array_equal(raw_ppg, ppg[index])
+        np.testing.assert_array_equal(raw_acc, acc[index])

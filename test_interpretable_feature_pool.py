@@ -37,7 +37,7 @@ def test_catalog_exactly_matches_generated_window_candidates():
     expected = catalog.model_candidate_names()
 
     assert s03.STAGE2_FEATURE_POOL_VERSION == catalog.FEATURE_POOL_VERSION
-    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v8"
+    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v9"
     assert len(expected) == 126
     assert "mode" in expected
     assert list(features) == expected
@@ -222,7 +222,7 @@ def test_three_zone_robust_expansion_is_governed():
         "G_PAIR_SPECTRAL_CONSENSUS",
     }
 
-    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v8"
+    assert catalog.FEATURE_POOL_VERSION == "stage2_interpretable_v9"
     assert len(catalog.model_candidate_names()) == 126
     assert expected <= set(catalog.model_candidate_names())
     for name in expected:

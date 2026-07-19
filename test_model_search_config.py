@@ -51,7 +51,7 @@ def _literal_accuracy_first_threshold(probs, y):
         ([0.01, 0.10, 0.49, 0.50, 0.90, 0.99], [0, 0, 1, 0, 1, 1]),
         ([0.50, 0.50, 0.50, 0.50], [0, 1, 0, 1]),
         ([np.nan, -np.inf, 0.50, np.inf], [0, 1, 0, 1]),
-        (np.random.RandomState(42).rand(257), np.random.RandomState(7).randint(0, 2, 257)),
+        (np.random.default_rng(42).random(257), np.random.default_rng(7).integers(0, 2, 257)),
     ],
 )
 def test_vectorized_accuracy_threshold_matches_literal_reference(probs, y):
@@ -490,7 +490,7 @@ def test_single_split_model_search_uses_outer_candidate_workers(monkeypatch):
 
     assert calls == [(2, 2)]
     assert len(records) == 2
-    assert model.params["candidate_id"] == 2
+    assert getattr(model, "params")["candidate_id"] == 2
 
 
 def test_staged_group_cv_model_search_uses_outer_candidate_workers(monkeypatch):
@@ -551,7 +551,7 @@ def test_staged_group_cv_model_search_uses_outer_candidate_workers(monkeypatch):
         (2, 2),  # Stage B full-data node-count fits
     ]
     assert len(records) == 2
-    assert model.params["candidate_id"] == 2
+    assert getattr(model, "params")["candidate_id"] == 2
 
 
 def test_staged_group_cv_keeps_default_baseline_inside_stage2_top_k(monkeypatch):

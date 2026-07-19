@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import s06_deploy_eval as s06
 import s08_run_pipeline as s08
 
 
@@ -117,3 +118,48 @@ def test_generate_eval_csv_rejects_summary_mismatch(tmp_path):
 
     with pytest.raises(AssertionError, match="per_sample_xgboost_windows"):
         s08.generate_eval_csv(tmp_path)
+
+
+def test_prob_mean_exports_the_independent_stream_trace_used_by_csv(tmp_path, monkeypatch):
+    """The XGBoost sample method must not erase the parallel stream trace."""
+    monkeypatch.setattr(s06, "_BUNDLE", None)
+    cfg = dict(s06.DEFAULT_POSTPROCESS_CONFIG)
+    results = [{
+        "sample_name": "prob-mean-sample",
+        "target": 1,
+        "mode": 0,
+        "fallback": False,
+        "window_probs": [0.1, 0.9, 0.9],
+        "window_preds": [0, 1, 1],
+        "window_targets": [0, 1, 1],
+        "quality_metas": [None, None, None],
+    }]
+
+    sample_summary, details = s06.compute_sample_metrics(
+        results,
+        method="prob_mean",
+        cfg=cfg,
+        model_threshold=0.5,
+    )
+    assert details[0]["window_states"] == []
+
+    stream_summary = s06.compute_window_stream_metrics(
+        details,
+        cfg,
+        warmup_frames=0,
+        model_threshold=0.5,
+    )
+    assert len(details[0]["stage2_states"]) == 3
+
+    payload = {
+        "summary": sample_summary,
+        "window_model_summary": s06.compute_window_model_metrics(results),
+        "window_stream_summary": stream_summary,
+        "details": details,
+    }
+    _write_eval_payload(tmp_path, payload)
+
+    s08.generate_eval_csv(tmp_path)
+
+    stream_csv = pd.read_csv(tmp_path / "per_sample_statemachine_windows.csv")
+    assert stream_csv["total_windows"].sum() == stream_summary["total_windows"]

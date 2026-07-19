@@ -2,6 +2,8 @@ import json
 
 import pandas as pd
 
+from stage2_feature_catalog import FEATURE_POOL_VERSION
+
 
 def _write_figure_quartet(png_path):
     png_path.parent.mkdir(parents=True, exist_ok=True)
@@ -23,7 +25,7 @@ def test_pipeline_acceptance_reports_sections_without_hiding_failures(tmp_path):
         "missing_from_ranking": [], "extra_in_ranking": [],
     }), encoding="utf-8")
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v8",
+        "feature_pool_version": FEATURE_POOL_VERSION,
         "selected_features": ["COMM_GREEN_AC"],
     }), encoding="utf-8")
     (tmp_path / "model_candidate_leaderboard.json").write_text(json.dumps({
@@ -120,7 +122,7 @@ def test_pipeline_acceptance_rejects_selection_without_frozen_provenance(tmp_pat
     from pipeline_acceptance import build_pipeline_acceptance_report
 
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v8",
+        "feature_pool_version": FEATURE_POOL_VERSION,
         "selected_features": ["COMM_GREEN_AC"],
     }), encoding="utf-8")
 
@@ -133,7 +135,7 @@ def test_pipeline_acceptance_rejects_non_csv_selection_provenance(tmp_path):
     from pipeline_acceptance import build_pipeline_acceptance_report
 
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v8",
+        "feature_pool_version": FEATURE_POOL_VERSION,
         "selected_features": ["COMM_GREEN_AC"],
         "selection_provenance": {
             "selection_source_type": "xlsx",
@@ -152,7 +154,7 @@ def test_pipeline_acceptance_requires_complete_c_metadata(tmp_path):
     from pipeline_acceptance import build_pipeline_acceptance_report
 
     (tmp_path / "manual_selected_features.json").write_text(json.dumps({
-        "feature_pool_version": "stage2_interpretable_v8",
+        "feature_pool_version": FEATURE_POOL_VERSION,
         "selected_features": ["COMM_GREEN_AC"],
     }), encoding="utf-8")
     (tmp_path / "stage2_c_contract.json").write_text(json.dumps({

@@ -41,6 +41,7 @@ import pandas as pd
 from scipy.signal import resample_poly  # only for polyphase downsampling (C has equivalent)
 
 import commercial_liveness_features
+from direct_feature_selection import load_direct_feature_csv
 
 from stage2_feature_catalog import (
     FEATURE_CATALOG,
@@ -2827,8 +2828,16 @@ def _green_spatial_candidates(g_raw, g_pulse, fs):
     ]), imbalance, channel_ac
 
 
-def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs):
-    names = [name for name in stage2_model_candidate_names() if name.startswith("ACC_")]
+def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs,
+                            selected_features=None):
+    governed_names = [name for name in stage2_model_candidate_names() if name.startswith("ACC_")]
+    names = (
+        governed_names
+        if selected_features is None
+        else [name for name in selected_features if name in governed_names]
+    )
+    if not names:
+        return OrderedDict()
     if acc_window is None or len(acc_window) < 4:
         return OrderedDict((name, 0.0) for name in names)
     acc = np.asarray(acc_window, dtype=np.float64)
@@ -2856,22 +2865,35 @@ def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs):
         if jerk_tail_count else 0.0
     )
     relative_motion = guarded_ratio(motion_rms, mean_mag, scale=magnitude)
-    n = min(len(motion), len(green_top2_pulse))
-    acc_green_corr = (
-        abs(guarded_corr(motion[:n], green_top2_pulse[:n])) if n >= 8 else 0.0
-    )
-    acc_green_max_lag_corr = (
-        max_norm_xcorr(motion[:n], green_top2_pulse[:n], max(1, int(round(0.4 * fs))))
-        if n >= 8 else 0.0
-    )
-    acc_green_psd_similarity = (
-        spectral_power_cosine(motion[:n], green_top2_pulse[:n], fs) if n >= 16 else 0.0
-    )
-    green_ratio = guarded_ratio(
-        float(np.sqrt(np.mean(green_top2_pulse ** 2))),
-        abs(float(np.median(green_top2_raw))),
-        scale=green_top2_raw,
-    )
+    green_names = {
+        "ACC_GREEN_BP_CORR", "ACC_GREEN_REL_MOTION_GAP",
+        "ACC_GREEN_MAX_LAG_CORR", "ACC_GREEN_PSD_SIMILARITY",
+    }
+    needs_green = bool(set(names) & green_names)
+    if needs_green:
+        green_top2_pulse = finite_signal(green_top2_pulse)
+        green_top2_raw = finite_signal(green_top2_raw)
+        n = min(len(motion), len(green_top2_pulse))
+        acc_green_corr = (
+            abs(guarded_corr(motion[:n], green_top2_pulse[:n])) if n >= 8 else 0.0
+        )
+        acc_green_max_lag_corr = (
+            max_norm_xcorr(motion[:n], green_top2_pulse[:n], max(1, int(round(0.4 * fs))))
+            if n >= 8 else 0.0
+        )
+        acc_green_psd_similarity = (
+            spectral_power_cosine(motion[:n], green_top2_pulse[:n], fs) if n >= 16 else 0.0
+        )
+        green_ratio = guarded_ratio(
+            float(np.sqrt(np.mean(green_top2_pulse ** 2))),
+            abs(float(np.median(green_top2_raw))),
+            scale=green_top2_raw,
+        )
+    else:
+        acc_green_corr = 0.0
+        acc_green_max_lag_corr = 0.0
+        acc_green_psd_similarity = 0.0
+        green_ratio = 0.0
     values = {
         "ACC_MAG_MEAN": mean_mag,
         "ACC_MAG_STD": float(np.std(magnitude)),
@@ -2901,11 +2923,331 @@ def _acc_candidate_features(acc_window, green_top2_pulse, green_top2_raw, fs):
     return OrderedDict((name, float(values.get(name, 0.0))) for name in names)
 
 
-def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, return_preprocessed=False):
+def _extract_selected_optical_features(ir, ambient, g1, g2, g3, fs, selected_features):
+    """Compute only the optical calculation families required by ``selected_features``."""
+    requested_order = [
+        str(name) for name in selected_features
+        if str(name) != "mode" and not str(name).startswith("ACC_")
+    ]
+    requested = set(requested_order)
+    unknown = [name for name in requested_order if not is_stage2_model_candidate(name)]
+    if unknown:
+        raise ValueError("unknown Stage2 model candidates: " + ", ".join(unknown))
+
+    inputs = [finite_signal(x) for x in (ir, ambient, g1, g2, g3)]
+    n = min(len(x) for x in inputs)
+    if n < int(float(fs)):
+        raise ValueError(f"window too short: n={n}, required>={int(float(fs))}")
+    _, ambient_input, g1_input, g2_input, g3_input = [x[:n] for x in inputs]
+    green_input = (g1_input + g2_input + g3_input) / 3.0
+    features = OrderedDict()
+
+    def keep(values):
+        features.update((name, value) for name, value in values.items() if name in requested)
+
+    quality_names = {"GREEN_FLAT_RATIO", "GREEN_SPIKE_RATIO", "AMB_FLAT_RATIO", "AMB_SPIKE_RATIO"}
+    if requested & quality_names:
+        keep(_quality_features(ambient_input, green_input))
+
+    ambient_raw = _contact_raw_signal(ambient_input)
+    g1_raw = _contact_raw_signal(g1_input)
+    g2_raw = _contact_raw_signal(g2_input)
+    g3_raw = _contact_raw_signal(g3_input)
+    green_raw = (g1_raw + g2_raw + g3_raw) / 3.0
+    g1_pulse = _pulse_signal(g1_raw, fs)
+    g2_pulse = _pulse_signal(g2_raw, fs)
+    g3_pulse = _pulse_signal(g3_raw, fs)
+    green_pulse = (g1_pulse + g2_pulse + g3_pulse) / 3.0
+    ambient_pulse = _pulse_signal(ambient_raw, fs)
+    raw_stack = np.vstack([g1_raw, g2_raw, g3_raw])
+    pulse_stack = np.vstack([g1_pulse, g2_pulse, g3_pulse])
+    green_median_raw = np.median(raw_stack, axis=0)
+    green_median_pulse = np.median(pulse_stack, axis=0)
+    channel_ac = np.sqrt(np.mean(pulse_stack ** 2, axis=1))
+    green_top2_raw, green_top2_pulse, _ = _tie_aware_top2_composite(
+        raw_stack, pulse_stack, channel_ac
+    )
+
+    if "COMM_GREEN_AC" in requested:
+        features["COMM_GREEN_AC"] = float(
+            0.5 * np.sqrt(np.mean(green_pulse ** 2))
+            + 0.5 * 1.4826 * robust_mad(green_pulse)
+        )
+    if "COMM_AMB_AC" in requested:
+        features["COMM_AMB_AC"] = float(
+            0.5 * np.sqrt(np.mean(ambient_pulse ** 2))
+            + 0.5 * 1.4826 * robust_mad(ambient_pulse)
+        )
+
+    channel_sources = (
+        ("GREEN", green_raw, green_pulse, {"GREEN_ROBUST_RANGE_RATIO", "GREEN_SEG_ACDC_CV"}),
+        ("AMBX", ambient_raw, ambient_pulse, {"AMB_ROBUST_RANGE_RATIO", "AMB_SEG_ACDC_CV"}),
+        (
+            "GTOP2",
+            green_top2_raw,
+            green_top2_pulse,
+            {
+                "GTOP2_ROBUST_RANGE_RATIO", "GTOP2_SEG_ACDC_CV",
+                "GTOP2_HALF_ACDC_DELTA", "GTOP2_SEG_ACDC_RANGE",
+            },
+        ),
+    )
+    fft_caches = {}
+    for prefix, raw, pulse, extra_names in channel_sources:
+        band_name = "AMB_BAND_ENERGY_RATIO" if prefix == "AMBX" else f"{prefix}_BAND_ENERGY_RATIO"
+        channel_names = {
+            f"{prefix}_DC_MEDIAN", f"{prefix}_DC_IQR", f"{prefix}_AC_RMS",
+            f"{prefix}_AC_MAD", f"{prefix}_AC_DC_RATIO", f"{prefix}_DERIV_MAD",
+            f"{prefix}_FFT_PEAK_MEDIAN_RATIO", f"{prefix}_DOM_FREQ",
+            f"{prefix}_AUTO_CORR_PEAK", f"{prefix}_BAND_ENERGY_RATIO",
+        }
+        if not requested & (channel_names | extra_names | {band_name}):
+            continue
+        cache = compute_fft_cache(pulse, fs, fmin=0.5, fmax=5.0)
+        fft_caches[prefix] = cache
+        if prefix == "GREEN":
+            values = {
+                "GREEN_ROBUST_RANGE_RATIO": robust_range_ratio(raw),
+                "GREEN_SEG_ACDC_CV": segment_acdc_cv(raw),
+            }
+        elif prefix == "AMBX":
+            values = {
+                "AMB_ROBUST_RANGE_RATIO": robust_range_ratio(raw),
+                "AMB_SEG_ACDC_CV": segment_acdc_cv(raw),
+            }
+        else:
+            values = {
+                "GTOP2_ROBUST_RANGE_RATIO": robust_range_ratio(raw),
+                "GTOP2_SEG_ACDC_CV": segment_acdc_cv(raw),
+            }
+            values.update(segment_stability_features(raw, "GTOP2"))
+        keep(values)
+        keep(_channel_candidate_features(raw, pulse, prefix, fs, cache))
+        if band_name in requested:
+            features[band_name] = band_energy_ratio_from_fft_cache(cache)
+
+    if "GREEN_CORR" in requested:
+        features["GREEN_CORR"] = guarded_corr(
+            green_pulse,
+            moving_average_filter(green_pulse, max(2, int(round(0.15 * float(fs))))),
+        )
+    if "GTOP2_zero_cross_rate" in requested:
+        features["GTOP2_zero_cross_rate"] = zero_cross_rate(green_top2_pulse)
+    if "GTOP2_abs_diff_ratio" in requested:
+        features["GTOP2_abs_diff_ratio"] = guarded_ratio(
+            float(np.mean(np.abs(np.diff(green_top2_pulse)))) if len(green_top2_pulse) > 1 else 0.0,
+            float(np.mean(np.abs(green_top2_pulse - np.median(green_top2_pulse)))),
+            scale=green_top2_pulse,
+        )
+
+    spatial_names = {
+        "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
+        "G_rangeNorm_mean", "G_rangeNorm_p90", "G_ch_dc_cv",
+        "G_ch_dc_max_min_ratio", "GCH_AC_RANGE_RATIO", "G_bp_corr_mean",
+        "G_bp_corr_min", "G_bp_corr_std", "G_2OF3_AC_SUPPORT",
+        "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN", "G_WEAK_CHANNEL_GAP",
+        "G_TOP1_TO_TOP2_AC_RATIO", "G_TOP2_RANK_STABILITY",
+        "G_2OF3_PERIODICITY", "G_ZONE_LAG_RMS_SEC",
+    }
+    imbalance = None
+    if requested & (spatial_names | {"corr_Gmean_G_imbalance"}):
+        spatial, imbalance, _ = _green_spatial_candidates(
+            [g1_raw, g2_raw, g3_raw], [g1_pulse, g2_pulse, g3_pulse], fs
+        )
+        keep(spatial)
+
+    cross_values = {}
+    if "corr_Ambient_Gmean" in requested:
+        cross_values["corr_Ambient_Gmean"] = guarded_corr(ambient_raw, green_raw)
+    if "GREEN_AMB_BP_CORR" in requested:
+        cross_values["GREEN_AMB_BP_CORR"] = guarded_corr(green_pulse, ambient_pulse)
+    if "GREEN_AMB_ENV_CORR" in requested:
+        cross_values["GREEN_AMB_ENV_CORR"] = guarded_corr(
+            smooth_envelope(green_pulse, fs), smooth_envelope(ambient_pulse, fs)
+        )
+    if "AMB_AC_TO_GREEN_AC" in requested:
+        cross_values["AMB_AC_TO_GREEN_AC"] = guarded_ratio(
+            float(np.sqrt(np.mean(ambient_pulse ** 2))),
+            float(np.sqrt(np.mean(green_pulse ** 2))),
+            scale=green_pulse,
+        )
+    if "AMB_DC_TO_GREEN_DC" in requested:
+        cross_values["AMB_DC_TO_GREEN_DC"] = guarded_ratio(
+            float(np.median(ambient_raw)), abs(float(np.median(green_raw))), scale=green_raw
+        )
+    if "GREEN_AMB_LEAK_STABILITY" in requested:
+        cross_values["GREEN_AMB_LEAK_STABILITY"] = ambient_green_leak_stability(
+            ambient_raw, green_top2_raw
+        )
+    if "GREEN_AMB_SEG_CORR_RANGE" in requested:
+        cross_values["GREEN_AMB_SEG_CORR_RANGE"] = segment_corr_range(
+            ambient_raw, green_top2_raw
+        )
+    if "corr_Gmean_G_imbalance" in requested:
+        cross_values["corr_Gmean_G_imbalance"] = guarded_corr(green_raw, imbalance)
+    keep(cross_values)
+
+    if "GTOP2_ROBUST_SKEWNESS" in requested:
+        features["GTOP2_ROBUST_SKEWNESS"] = robust_quantile_skewness(green_top2_pulse)
+    if "GTOP2_SPECTRAL_ENTROPY" in requested:
+        top2_fft = fft_caches.get("GTOP2") or compute_fft_cache(
+            green_top2_pulse, fs, fmin=0.5, fmax=5.0
+        )
+        features["GTOP2_SPECTRAL_ENTROPY"] = normalized_spectral_entropy(top2_fft)
+
+    smooth_window = max(2, int(round(0.15 * float(fs))))
+    median_names = {
+        "GMEDIAN_AC_DC_RATIO", "GMEDIAN_CORR", "GMEDIAN_AUTO_CORR_PEAK",
+        "GMEDIAN_FFT_PEAK_MEDIAN_RATIO",
+    }
+    if requested & median_names:
+        if "GMEDIAN_AC_DC_RATIO" in requested:
+            features["GMEDIAN_AC_DC_RATIO"] = guarded_ratio(
+                float(np.sqrt(np.mean(green_median_pulse ** 2))),
+                abs(float(np.median(green_median_raw))),
+                scale=green_median_raw,
+            )
+        if "GMEDIAN_CORR" in requested:
+            features["GMEDIAN_CORR"] = guarded_corr(
+                green_median_pulse, moving_average_filter(green_median_pulse, smooth_window)
+            )
+        if "GMEDIAN_AUTO_CORR_PEAK" in requested:
+            features["GMEDIAN_AUTO_CORR_PEAK"] = autocorr_periodicity_features(
+                green_median_pulse, fs
+            )[0]
+        if "GMEDIAN_FFT_PEAK_MEDIAN_RATIO" in requested:
+            features["GMEDIAN_FFT_PEAK_MEDIAN_RATIO"] = float(
+                compute_fft_cache(green_median_pulse, fs, fmin=0.5, fmax=5.0)["peak_ratio"]
+            )
+
+    if "GTOP2_CORR" in requested:
+        features["GTOP2_CORR"] = guarded_corr(
+            green_top2_pulse, moving_average_filter(green_top2_pulse, smooth_window)
+        )
+    if "G_TOP2_ALL_CORR" in requested:
+        features["G_TOP2_ALL_CORR"] = guarded_corr(green_top2_pulse, green_pulse)
+    if "G_WEAK_TO_TOP2_CORR" in requested:
+        weakest_ac = float(np.min(channel_ac))
+        tolerance = max(abs(weakest_ac) * 1e-9, 1e-12)
+        indices = np.flatnonzero(channel_ac - weakest_ac <= tolerance)
+        features["G_WEAK_TO_TOP2_CORR"] = float(np.median([
+            guarded_corr(pulse_stack[int(index)], green_top2_pulse) for index in indices
+        ]))
+
+    zone_frequency_names = {
+        "G_ZONE_DOM_FREQ_MAD_HZ", "G_ZONE_HR_SUPPORT_RATIO",
+        "G_PAIR_FREQ_GAP_MIN_HZ", "G_PAIR_FREQ_GAP_MEDIAN_HZ",
+        "G_ZONE_PHASE_CONCENTRATION", "G_PAIR_SPECTRAL_CONSENSUS",
+    }
+    zone_ffts = None
+    valid_spectrum = None
+    zone_dom_freqs = None
+    reference_hz = 0.0
+    if requested & zone_frequency_names:
+        zone_ffts = [compute_fft_cache(zone, fs, fmin=0.5, fmax=5.0) for zone in pulse_stack]
+        zone_dom_freqs = np.asarray([float(cache["dom_freq"]) for cache in zone_ffts])
+        valid_spectrum = np.asarray([
+            _frequency_evidence_valid(raw_stack[index], pulse_stack[index], cache, fs)
+            for index, cache in enumerate(zone_ffts)
+        ], dtype=bool)
+        valid_dom_freqs = zone_dom_freqs[valid_spectrum]
+        reference_hz = float(np.median(valid_dom_freqs)) if len(valid_dom_freqs) else 0.0
+        if "G_ZONE_DOM_FREQ_MAD_HZ" in requested:
+            features["G_ZONE_DOM_FREQ_MAD_HZ"] = (
+                float(np.mean(np.abs(valid_dom_freqs - reference_hz))) if len(valid_dom_freqs) else 0.0
+            )
+        if "G_ZONE_HR_SUPPORT_RATIO" in requested:
+            features["G_ZONE_HR_SUPPORT_RATIO"] = (
+                float(np.mean(valid_spectrum & (np.abs(zone_dom_freqs - reference_hz) <= 0.20)))
+                if reference_hz > 0.0 else 0.0
+            )
+
+    pair_names = {
+        "G_PAIR_PERIODICITY_MAX", "G_PAIR_PERIODICITY_MEDIAN",
+        "G_PAIR_FREQ_GAP_MIN_HZ", "G_PAIR_FREQ_GAP_MEDIAN_HZ",
+        "G_PAIR_ACDC_MEDIAN", "G_PAIR_AMB_ABS_CORR_MIN",
+        "G_PAIR_AMB_ABS_CORR_MEDIAN", "G_PAIR_SPECTRAL_CONSENSUS",
+    }
+    pair_indices = ((0, 1), (1, 2), (2, 0))
+    if requested & pair_names:
+        periodicity, frequency_gaps, acdc, ambient_corr, spectral = [], [], [], [], []
+        for left, right in pair_indices:
+            pair_raw = 0.5 * (raw_stack[left] + raw_stack[right])
+            pair_pulse = 0.5 * (pulse_stack[left] + pulse_stack[right])
+            periodicity.append(autocorr_periodicity_features(pair_pulse, fs)[0])
+            acdc.append(guarded_ratio(
+                float(np.sqrt(np.mean(pair_pulse ** 2))),
+                abs(float(np.median(pair_raw))),
+                scale=pair_raw,
+            ))
+            ambient_corr.append(abs(guarded_corr(pair_pulse, ambient_pulse)))
+            if zone_ffts is not None and valid_spectrum[left] and valid_spectrum[right]:
+                frequency_gaps.append(abs(zone_dom_freqs[left] - zone_dom_freqs[right]))
+                spectral.append(_spectral_power_cosine_from_cache(zone_ffts[left], zone_ffts[right]))
+        pair_values = {
+            "G_PAIR_PERIODICITY_MAX": float(np.max(periodicity)),
+            "G_PAIR_PERIODICITY_MEDIAN": float(np.median(periodicity)),
+            "G_PAIR_FREQ_GAP_MIN_HZ": float(np.min(frequency_gaps)) if frequency_gaps else 0.0,
+            "G_PAIR_FREQ_GAP_MEDIAN_HZ": float(np.median(frequency_gaps)) if frequency_gaps else 0.0,
+            "G_PAIR_ACDC_MEDIAN": float(np.median(acdc)),
+            "G_PAIR_AMB_ABS_CORR_MIN": float(np.min(ambient_corr)),
+            "G_PAIR_AMB_ABS_CORR_MEDIAN": float(np.median(ambient_corr)),
+            "G_PAIR_SPECTRAL_CONSENSUS": float(np.median(spectral)) if spectral else 0.0,
+        }
+        keep(pair_values)
+
+    residual_names = {"G_AMB_RESIDUAL_2OF3_PERIODICITY", "G_AMB_RESIDUAL_PAIR_CORR_MAX"}
+    if requested & residual_names:
+        residuals = [_ambient_projection_residual(zone, ambient_pulse) for zone in pulse_stack]
+        keep({
+            "G_AMB_RESIDUAL_2OF3_PERIODICITY": float(np.median([
+                autocorr_periodicity_features(residual, fs)[0] for residual in residuals
+            ])),
+            "G_AMB_RESIDUAL_PAIR_CORR_MAX": float(np.max([
+                guarded_corr(residuals[left], residuals[right]) for left, right in pair_indices
+            ])),
+        })
+    if "G_ZONE_PHASE_CONCENTRATION" in requested:
+        valid_zone_ffts = [cache for cache, valid in zip(zone_ffts, valid_spectrum) if valid]
+        features["G_ZONE_PHASE_CONCENTRATION"] = (
+            _phase_concentration(valid_zone_ffts, reference_hz) if len(valid_zone_ffts) >= 2 else 0.0
+        )
+
+    fixed_names = {name for name in requested if name.startswith("GZONE")}
+    if fixed_names:
+        keep(_fixed_position_zone_candidates(
+            [g1_raw, g2_raw, g3_raw], [g1_pulse, g2_pulse, g3_pulse], ambient_pulse, fs
+        ))
+
+    missing = [name for name in requested_order if name not in features]
+    if missing:
+        raise RuntimeError("selective optical extractor missing: " + ", ".join(missing))
+    ordered = OrderedDict()
+    for name in requested_order:
+        value = features[name]
+        ordered[name] = float(value) if value is not None and np.isfinite(value) else 0.0
+    preprocessed = {
+        "g1_bp": g1_pulse, "g2_bp": g2_pulse, "g3_bp": g3_pulse,
+        "g_top2_bp": green_top2_pulse, "g_top2_raw": green_top2_raw,
+        "g_median_bp": green_median_pulse, "g_median_raw": green_median_raw,
+        "amb_bp": ambient_pulse, "g_mean_bp": green_pulse,
+        "g_mean_raw": green_raw, "amb_raw": ambient_raw,
+    }
+    return ordered, preprocessed
+
+
+def extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25,
+                                     return_preprocessed=False, selected_features=None):
     """Extract the governed optical Stage2 candidate pool.
 
     ACC candidates are assembled by :func:`assemble_stage2_feature_candidates`.
     """
+    if selected_features is not None:
+        ordered, preprocessed = _extract_selected_optical_features(
+            ir, ambient, g1, g2, g3, fs, selected_features
+        )
+        return (ordered, preprocessed) if return_preprocessed else ordered
+
     inputs = [finite_signal(x) for x in (ir, ambient, g1, g2, g3)]
     n = min(len(x) for x in inputs)
     if n < int(float(fs)):
@@ -3175,26 +3517,58 @@ def assemble_stage2_feature_candidates(
     mode,
     fs=25.0,
     acc_window=None,
+    selected_features=None,
 ):
-    optical, preprocessed = extract_feature_pool_from_window(
-        ir=ir,
-        ambient=ambient,
-        g1=g1,
-        g2=g2,
-        g3=g3,
-        fs=fs,
-        return_preprocessed=True,
+    if selected_features is not None:
+        selected_features = [str(name) for name in selected_features]
+        unknown = [name for name in selected_features if not is_stage2_model_candidate(name)]
+        duplicates = [
+            name for index, name in enumerate(selected_features)
+            if name in selected_features[:index]
+        ]
+        if unknown:
+            raise ValueError("unknown Stage2 model candidates: " + ", ".join(unknown))
+        if duplicates:
+            raise ValueError("duplicate Stage2 model candidates: " + ", ".join(duplicates))
+        if selected_features == ["mode"]:
+            return OrderedDict([("mode", float(mode))]), {}
+
+    green_acc_names = {
+        "ACC_GREEN_BP_CORR", "ACC_GREEN_REL_MOTION_GAP",
+        "ACC_GREEN_MAX_LAG_CORR", "ACC_GREEN_PSD_SIMILARITY",
+    }
+    needs_optical = (
+        selected_features is None
+        or any(name != "mode" and not name.startswith("ACC_") for name in selected_features)
+        or bool(set(selected_features or []) & green_acc_names)
     )
+    if needs_optical:
+        optical, preprocessed = extract_feature_pool_from_window(
+            ir=ir,
+            ambient=ambient,
+            g1=g1,
+            g2=g2,
+            g3=g3,
+            fs=fs,
+            return_preprocessed=True,
+            selected_features=selected_features,
+        )
+    else:
+        optical, preprocessed = OrderedDict(), {}
     combined = OrderedDict([("mode", float(mode))])
     combined.update(optical)
-    combined.update(_acc_candidate_features(
-        acc_window,
-        preprocessed["g_top2_bp"],
-        preprocessed["g_top2_raw"],
-        fs,
-    ))
-    ordered = OrderedDict((name, float(combined.get(name, 0.0))) for name in stage2_model_candidate_names())
-    validate_stage2_candidate_names(ordered.keys())
+    if selected_features is None or any(name.startswith("ACC_") for name in selected_features):
+        combined.update(_acc_candidate_features(
+            acc_window,
+            preprocessed.get("g_top2_bp", np.zeros(0, dtype=np.float64)),
+            preprocessed.get("g_top2_raw", np.zeros(0, dtype=np.float64)),
+            fs,
+            selected_features=selected_features,
+        ))
+    ordered_names = stage2_model_candidate_names() if selected_features is None else selected_features
+    ordered = OrderedDict((name, float(combined.get(name, 0.0))) for name in ordered_names)
+    if selected_features is None:
+        validate_stage2_candidate_names(ordered.keys())
     return ordered, preprocessed
 
 
@@ -3272,6 +3646,7 @@ def extract_stage2_window(
     fs=25.0,
     acc_window=None,
     use_stage2_ir=DEFAULT_USE_STAGE2_IR,
+    selected_features=None,
 ):
     '''Return governed candidates, diagnostics, and shared intermediates.'''
     ppg = np.asarray(ppg_window, dtype=np.float64)
@@ -3291,6 +3666,7 @@ def extract_stage2_window(
         mode=mode,
         fs=fs,
         acc_window=acc_window,
+        selected_features=selected_features,
     )
     diagnostics = stage2_diagnostic_fields(
         raw_ir, ambient, g1, g2, g3, acc_window=acc_window
@@ -3301,7 +3677,7 @@ def extract_stage2_window(
 
 def extract_window_features(ppg_window, fs=25.0, acc_window=None,
                             use_stage2_ir=DEFAULT_USE_STAGE2_IR, mode=None,
-                            ppg_config=None):
+                            ppg_config=None, selected_features=None):
     if ppg_config is None:
         ppg_config = mode
     elif mode is not None and int(mode) != int(ppg_config):
@@ -3315,15 +3691,24 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None,
         fs=fs,
         acc_window=acc_window,
         use_stage2_ir=use_stage2_ir,
+        selected_features=selected_features,
     )
-    if acc_window is not None:
+    if acc_window is not None and (
+        selected_features is None
+        or any(name in COMMERCIAL_STAGE2_FIELDS for name in selected_features)
+    ):
         try:
             with _commercial_warnings.catch_warnings():
                 _commercial_warnings.simplefilter("ignore", RuntimeWarning)
                 commercial = extract_commercial_feature_overrides(
                     ppg_window, acc_window, frequency=int(fs), ppg_config=resolved_mode,
                 )
-            features.update(commercial)
+            if selected_features is None:
+                features.update(commercial)
+            else:
+                for name in selected_features:
+                    if name in commercial:
+                        features[name] = commercial[name]
         except Exception:
             pass
     return features
@@ -3385,7 +3770,8 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                               target_aware_stride, stride_neg, stride_pos,
                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                               use_stage2_ir=DEFAULT_USE_STAGE2_IR,
-                              commercial_only=False):
+                              commercial_only=False,
+                              selected_features=None):
     """
     单样本全量抽窗特征。返回 rows list（失败时返回 []）。
 
@@ -3451,12 +3837,17 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                         raw_window, commercial_acc, mode, ppg_src_fs
                     )
                 else:
+                    selective_kwargs = (
+                        {"selected_features": selected_features}
+                        if selected_features is not None else {}
+                    )
                     feat, diagnostics, _ = extract_stage2_window(
                         window,
                         mode=mode,
                         fs=FEATURE_FS,
                         acc_window=acc_seg,
                         use_stage2_ir=use_stage2_ir,
+                        **selective_kwargs,
                     )
                     feat.update(diagnostics)
                 feat["sample_name"] = sample["sample_name"]
@@ -3542,17 +3933,28 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                     commercial_ppg, commercial_acc, mode, commercial_frequency
                 )
             else:
+                selective_kwargs = (
+                    {"selected_features": selected_features}
+                    if selected_features is not None else {}
+                )
                 feat, diagnostics, _ = extract_stage2_window(
                     window,
                     mode=mode,
                     fs=FEATURE_FS,
                     acc_window=acc_seg,
                     use_stage2_ir=use_stage2_ir,
+                    **selective_kwargs,
                 )
                 if commercial_acc is not None and len(commercial_ppg) == 125 * (commercial_frequency // FEATURE_FS):
-                    feat.update(extract_commercial_feature_overrides(
+                    commercial_overrides = extract_commercial_feature_overrides(
                         commercial_ppg, commercial_acc, commercial_frequency, mode
-                    ))
+                    )
+                    if selected_features is None:
+                        feat.update(commercial_overrides)
+                    else:
+                        for name in selected_features:
+                            if name in commercial_overrides:
+                                feat[name] = commercial_overrides[name]
                 feat.update(diagnostics)
             feat["sample_name"] = sample["sample_name"]
             feat["h5_file"] = sample["h5_file"]
@@ -3572,12 +3974,13 @@ def _worker_extract(args_tuple):
     """子进程入口。"""
     (sample, window_len, stride_len, fs,
      target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
-     use_stage2_ir, commercial_only) = args_tuple
+     use_stage2_ir, commercial_only, selected_features) = args_tuple
     return _extract_rows_for_sample(
         sample, window_len, stride_len, fs,
         target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
         commercial_only=commercial_only,
+        selected_features=selected_features,
     )
 
 
@@ -3590,7 +3993,8 @@ def extract_features_for_split(samples,
                                skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                use_stage2_ir=DEFAULT_USE_STAGE2_IR,
                                n_workers=None,
-                               commercial_only=False):
+                               commercial_only=False,
+                               selected_features=None):
     """
     提取特征池（样本级并行）。
 
@@ -3609,7 +4013,8 @@ def extract_features_for_split(samples,
     stride_neg = int(1 * fs)
     stride_pos = int(3 * fs)
 
-    n_workers = resolve_n_workers(n_workers, n_items=len(samples))
+    original_samples = list(samples)
+    n_workers = resolve_n_workers(n_workers, n_items=len(original_samples))
 
     # Sort heaviest first: reduces tail latency when last few workers are left
     # waiting on a single large continuous-signal sample.
@@ -3619,8 +4024,13 @@ def extract_features_for_split(samples,
             return int(shape[0])
         return 0  # conservative: unknown size goes last
 
-    ordered_samples = sorted(samples, key=_sample_weight, reverse=True)
-    samples = ordered_samples  # use sorted order for index-based error reporting
+    ordered_sample_items = sorted(
+        enumerate(original_samples),
+        key=lambda item: _sample_weight(item[1]),
+        reverse=True,
+    )
+    ordered_original_indices = [index for index, _sample in ordered_sample_items]
+    ordered_samples = [sample for _index, sample in ordered_sample_items]
     if n_workers > 1 and len(ordered_samples) >= n_workers * 2:
         print(f"  s03 sample order: heaviest-first "
               f"(max_windows={_sample_weight(ordered_samples[0])}, "
@@ -3629,14 +4039,15 @@ def extract_features_for_split(samples,
     args_list = [
         (s, window_len, stride_len, fs,
          target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
-         use_stage2_ir, commercial_only)
+         use_stage2_ir, commercial_only, selected_features)
         for s in ordered_samples
     ]
 
-    all_rows = []
+    rows_by_sample = [[] for _ in original_samples]
     if n_workers == 1:
         for i, a in enumerate(args_list, 1):
-            all_rows.extend(_worker_extract(a))
+            original_idx = ordered_original_indices[i - 1]
+            rows_by_sample[original_idx] = _worker_extract(a)
             if len(args_list) >= 10 and (i % max(1, len(args_list) // 10) == 0 or i == len(args_list)):
                 print(f"  s03 progress: {i}/{len(args_list)} samples", flush=True)
     else:
@@ -3645,11 +4056,13 @@ def extract_features_for_split(samples,
         if mp_ctx is not None:
             pool_kwargs["mp_context"] = mp_ctx
         _WORKER_TIMEOUT = 300  # 5 min per sample; guards against hung workers
-        rows_by_sample = [[] for _ in args_list]
         completed = 0
         total = len(args_list)
         with ProcessPoolExecutor(**pool_kwargs) as ex:
-            future_to_idx = {ex.submit(_worker_extract, a): i for i, a in enumerate(args_list)}
+            future_to_idx = {
+                ex.submit(_worker_extract, a): ordered_original_indices[i]
+                for i, a in enumerate(args_list)
+            }
             pending = set(future_to_idx.keys())
             print(f"  s03 parallel extraction: {total} samples, workers={n_workers}", flush=True)
             while pending:
@@ -3668,15 +4081,17 @@ def extract_features_for_split(samples,
                     try:
                         rows = fut.result(timeout=10)
                     except Exception as e:
-                        sample_name = samples[sample_idx].get("sample_name", f"idx={sample_idx}")
+                        sample_name = original_samples[sample_idx].get(
+                            "sample_name", f"idx={sample_idx}")
                         print(f"  [WARN] s03 worker failed sample={sample_name}: {e}", flush=True)
                         rows = []
                     rows_by_sample[sample_idx] = rows
                     completed += 1
                     if completed % max(1, total // 10) == 0 or completed == total:
                         print(f"  s03 progress: {completed}/{total} samples", flush=True)
-        for rows in rows_by_sample:
-            all_rows.extend(rows)
+    all_rows = []
+    for rows in rows_by_sample:
+        all_rows.extend(rows)
 
     return pd.DataFrame(all_rows)
 
@@ -3712,11 +4127,27 @@ def main(args=None):
     parser.add_argument("--n_workers", type=int,
                         default=max(1, min(4, (os.cpu_count() or 4) // 2)),
                         help="并行 worker 数")
+    parser.add_argument(
+        "--selected_feature_file",
+        type=str,
+        default=None,
+        help="CSV with one 'feature' column; compute only these features in row order",
+    )
     parser.add_argument("--commercial_only", action="store_true",
                         help="仅提取商用 8 特征，跳过 126 项 Stage2 全量池")
 
     if args is None:
         args = parser.parse_args()
+
+    if args.commercial_only and args.selected_feature_file:
+        parser.error("--commercial_only conflicts with --selected_feature_file")
+    selected_features = None
+    if args.selected_feature_file:
+        selected_features = load_direct_feature_csv(args.selected_feature_file)
+        print(
+            f"[direct] selective extraction enabled: {len(selected_features)} features; "
+            "unselected calculation families will be skipped"
+        )
 
     split_path = os.path.join(args.artifact_dir, "splits.json")
     with open(split_path, "r", encoding="utf-8") as f:
@@ -3748,6 +4179,7 @@ def main(args=None):
             use_stage2_ir=args.use_stage2_ir,
             n_workers=args.n_workers,
             commercial_only=args.commercial_only,
+            selected_features=selected_features,
         )
 
         out_path = os.path.join(args.artifact_dir, f"feature_pool_{part}.csv")

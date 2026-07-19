@@ -1,6 +1,6 @@
 # PPG/ACC 佩戴活体检测全特征生理意义与可解释性手册
 
-适用特征池：`stage2_interpretable_v8`（126 项）  
+适用特征池：`stage2_interpretable_v9`（126 项）
 人工选择文件：`artifacts/manual_feature_selection.csv`
 
 ## 1. 使用边界

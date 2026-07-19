@@ -50,12 +50,14 @@ def test_s03_prewindowed_sample_trims_both_ends_when_read(monkeypatch, tmp_path)
     assert [row["window_index"] for row in rows] == [0, 1, 2, 3]
 
 
-def test_s03_parallel_extraction_preserves_input_sample_order(monkeypatch):
+def test_s03_parallel_extraction_schedules_heaviest_first_and_preserves_input_order(monkeypatch):
+    submitted = []
+
     class FakeFuture:
         def __init__(self, args):
             self.args = args
 
-        def result(self):
+        def result(self, timeout=None):
             sample = self.args[0]
             return [{"sample_name": sample["sample_name"], "target": sample["target"]}]
 
@@ -70,14 +72,23 @@ def test_s03_parallel_extraction_preserves_input_sample_order(monkeypatch):
             return False
 
         def submit(self, _fn, args):
+            submitted.append(args[0]["sample_name"])
             return FakeFuture(args)
 
     monkeypatch.setattr(s03, "ProcessPoolExecutor", FakeExecutor)
-    monkeypatch.setattr(s03, "as_completed", lambda futures: list(reversed(list(futures))))
+
+    def complete_last_sample_first(pending, **_kwargs):
+        completed = max(
+            pending,
+            key=lambda future: future.args[0]["sample_name"],
+        )
+        return {completed}, set(pending) - {completed}
+
+    monkeypatch.setattr(s03, "wait", complete_last_sample_first)
     samples = [
-        {"sample_name": "sample_a", "h5_file": "a.h5", "target": 0},
-        {"sample_name": "sample_b", "h5_file": "b.h5", "target": 1},
-        {"sample_name": "sample_c", "h5_file": "c.h5", "target": 0},
+        {"sample_name": "sample_a", "h5_file": "a.h5", "target": 0, "ppg_shape": (100, 40)},
+        {"sample_name": "sample_b", "h5_file": "b.h5", "target": 1, "ppg_shape": (1000, 40)},
+        {"sample_name": "sample_c", "h5_file": "c.h5", "target": 0, "ppg_shape": (500, 40)},
     ]
 
     result = s03.extract_features_for_split(
@@ -85,6 +96,7 @@ def test_s03_parallel_extraction_preserves_input_sample_order(monkeypatch):
         n_workers=2,
     )
 
+    assert submitted == ["sample_b", "sample_c", "sample_a"]
     assert result["sample_name"].tolist() == ["sample_a", "sample_b", "sample_c"]
 
 

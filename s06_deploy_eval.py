@@ -594,8 +594,10 @@ def _infer_prewindowed_sample(base, ppg, acc,
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
             feat, preprocessed = extract_feature_pool_from_window(
                 ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
-                fs=FEATURE_FS, return_preprocessed=True
+                fs=FEATURE_FS, return_preprocessed=True,
+                selected_features=bundle.get("feature_names"),
             )
+            feat["mode"] = float(mode)
 
             acc_seg = None
             if acc is not None and is_prewindowed_signal(acc) and step < acc.shape[0]:
@@ -739,8 +741,10 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
                 ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
                 feat, preprocessed = extract_feature_pool_from_window(
                     ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
-                    fs=FEATURE_FS, return_preprocessed=True
+                    fs=FEATURE_FS, return_preprocessed=True,
+                    selected_features=bundle.get("feature_names"),
                 )
+                feat["mode"] = float(mode)
                 if acc_25 is not None and len(acc_25) > 0:
                     acc_seg = align_acc_window(acc_25, len(ppg_25), s2_start, win_25,
                                                fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
@@ -975,6 +979,7 @@ def compute_sample_metrics(results, method, cfg, model_threshold, stride_sec=1.0
             ),
             "window_probs": probs,
             "window_preds": list(window_preds),
+            "window_targets": list(r.get("window_targets", []) or []),
             "window_states": list(states),
             "window_scores": list(scores) if not fallback else [],
             "window_start_sec": r.get("window_start_sec", []),
@@ -1549,7 +1554,12 @@ def export_window_error_analysis(report, artifact_dir, split, method):
 
 def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold=None,
                                   stride_sec=1.0):
-    """Window-level streaming state metrics: state[i] vs target after warmup."""
+    """Compute streaming metrics and attach the exact state trace to each row.
+
+    ``stage2_states`` and ``stage2_scores`` are written to every mutable result
+    row so downstream CSV/report generation uses the same trace as this summary.
+    The sample-level ``pred`` remains governed by the explicitly selected method.
+    """
     y_true, y_pred = [], []
     samples_with_no_windows = 0
     skipped_windows = 0
@@ -1563,6 +1573,8 @@ def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold
         probs = r.get("window_probs", [])
         qm = r.get("quality_metas", [])
         if r.get("fallback", False) or len(probs) == 0:
+            r["stage2_states"] = []
+            r["stage2_scores"] = []
             samples_with_no_windows += 1
             continue
 
@@ -1572,6 +1584,7 @@ def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold
 
         # 全程运行状态机，使其积累 EMA 和 on/off count
         sample_states = []
+        sample_scores = []
         sample_targets = []
         probs_for_state = causal_median_filter_1d(probs, cfg.get("median_k", DEFAULT_POSTPROCESS_CONFIG["median_k"]))
         sm = WearStateMachine(
@@ -1585,9 +1598,13 @@ def compute_window_stream_metrics(results, cfg, warmup_frames=0, model_threshold
         for i, p in enumerate(probs_for_state):
             meta_i = qm[i] if i < len(qm) else None
             q = compute_quality(meta_i, thresholds=qt) if meta_i else 1.0
-            state, _ = sm.update(p, quality=q, stride_sec=stride_sec)
+            state, score = sm.update(p, quality=q, stride_sec=stride_sec)
             sample_states.append(int(state))
+            sample_scores.append(float(score))
             sample_targets.append(int(_safe_list_get(window_targets, i, sample_target)))
+
+        r["stage2_states"] = sample_states
+        r["stage2_scores"] = sample_scores
 
         # Warmup windows are excluded from this state-machine metric.
         start = min(max(0, int(warmup_frames)), len(sample_states))
@@ -1983,7 +2000,11 @@ def predict_sample(sample, model, scaler, selected_features,
         window = ppg[start:start + win, :]
         try:
             ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-            feat = extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=fs)
+            feat = extract_feature_pool_from_window(
+                ir, ambient, g1, g2, g3, fs=fs,
+                selected_features=selected_features,
+            )
+            feat["mode"] = float(mode)
             x = []
             for f in selected_features:
                 v = feat.get(f, fill_values.get(f, 0.0))
@@ -2807,7 +2828,7 @@ def main(args=None):
     )
     window_model_summary = compute_window_model_metrics(results)
     window_stream_summary = compute_window_stream_metrics(
-        results, postprocess_cfg, warmup_frames=args.warmup_frames,
+        details, postprocess_cfg, warmup_frames=args.warmup_frames,
         model_threshold=bundle["threshold"],
         stride_sec=args.stride_sec,
     )

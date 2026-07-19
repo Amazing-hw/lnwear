@@ -19,15 +19,17 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --comm
 ```text
 H5 数据
   → s01 数据扫描、元数据校验、train/valid/test 分组切分
-  → s03 全量合法窗口特征提取（含商用 8 特征精确端口）
+  → s03 全量合法窗口特征提取（5 秒窗口且 ACC 可用时，商用 8 特征由精确端口覆盖）
   → s04 完整特征排序与 manual_feature_selection.csv
-  → 人工只修改 selected 列（或 --commercial_only 自动选商用 8 特征）
+  → 人工只修改 selected 列（也可用 direct 清单或 --commercial_only）
   → s05 固定所选特征，充分搜索 XGBoost 超参数并进行 hard-negative 候选训练
   → s06 纯 XGBoost 评估、错误分析与部署产物导出
   → s07 可选：独立的 EMA/状态机后处理搜索
 ```
 
 默认不运行后处理搜参。主评估使用模型包内冻结的窗口阈值，样本级默认采用 `prob_mean`，即窗口 XGBoost 概率均值与模型阈值比较。`mean_vote` 和 `state_machine` 只在显式指定时作为独立实验口径，不改变默认主结果。
+
+项目内所有数据分析、训练评估和错误样本绘图均直接保存为 PNG，不生成 HTML，也不依赖浏览器展示。
 
 ## 2. H5 数据约定
 
@@ -59,9 +61,9 @@ H5 数据
 
 top2 的选择依据是去趋势脉动分量的 AC-RMS 能量；RMS 只用于衡量脉动能量，不直接等同于信号质量。选择后对两个区的原始信号逐点等权平均，再统一预处理和提取特征。相关性、周期性和频谱支持共同约束 top2 的解释，避免只依赖幅值把运动伪影误认为高质量信号。
 
-商用八特征仍保留在受治理特征池中。原有绿光平均类公式按三个固定光区的统一表示计算，另有三光区专用的 top2、中位、pair 和固定位置候选，最终是否使用由完整排序和人工 CSV 决定。
+商用八特征仍保留在受治理特征池中。原有绿光平均类公式按三个固定光区的统一表示计算，另有三光区专用的 top2、中位、pair 和固定位置候选，最终是否使用由完整排序与人工 CSV，或 direct 特征清单决定。
 
-完整 126 项候选的公式、生理/物理意义、预期方向、鲁棒性、泛化风险和工程成本见 [FEATURE_INTERPRETABILITY_GUIDE.md](FEATURE_INTERPRETABILITY_GUIDE.md)。
+当前受治理特征池版本为 `stage2_interpretable_v9`。完整 126 项候选的公式、生理/物理意义、预期方向、鲁棒性、泛化风险和工程成本见 [FEATURE_INTERPRETABILITY_GUIDE.md](FEATURE_INTERPRETABILITY_GUIDE.md)。
 
 ## 4. 人工选择特征
 
@@ -101,13 +103,63 @@ python s08_run_pipeline.py \
 
 加载时会校验 CSV schema、完整排序 SHA256、特征池版本和所有不可变字段。训练、模型 JSON、独立部署特征提取脚本、公式文件和 C 契约严格使用 CSV 中选中特征的名称、顺序和数量。
 
-### 4.1 商用 8 特征快速模式
+### 4.1 直接指定特征并加速提取
+
+如果已经确定训练特征，不需要先提取 126 项完整特征池，也不需要运行 s04。可在命令中直接写出特征名：
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts_direct \
+  --direct_features "mode,GTOP2_CORR,G_2OF3_PERIODICITY,ACC_MAG_MEAN" \
+  --stop_after s06_cb
+```
+
+特征较多时，推荐使用便于编辑的 CSV。CSV 必须只有一列 `feature`，行顺序就是 XGBoost 和部署产物的特征顺序：
+
+```csv
+feature
+mode
+GTOP2_CORR
+G_2OF3_PERIODICITY
+ACC_MAG_MEAN
+```
+
+```bash
+python s08_run_pipeline.py \
+  --dataset_dir dataset \
+  --artifact_dir artifacts_direct \
+  --direct_feature_file my_selected_features.csv \
+  --stop_after s06_cb
+```
+
+直接特征模式的行为：
+
+1. 启动时校验空清单、重复名和未知特征名，并在产物目录冻结为 `direct_feature_selection.csv`。
+2. s03 只执行所选特征依赖的计算族，输出的特征池 CSV 只包含所选模型特征、诊断字段和窗口元数据；不会先算完全部特征再删列。
+3. 自动跳过 s04 排序、子集搜索和特征嵌入报告。
+4. s05 严格使用 CSV 的名称、数量和顺序，关闭特征数量搜索和局部换特征，但保留 XGBoost 超参数搜索、校准和 train-only hard-negative 优化。
+5. s06 评估以及导出的独立 `deploy_feature_extractor.py` 同样按模型特征清单做选择式提取。
+
+加速幅度取决于清单覆盖的计算族。相同信号源的多个特征会共享去趋势、FFT、自相关等中间量；如果清单覆盖了几乎所有计算族，速度会接近完整特征池。复用已有选择式特征池时，必须使用同一 CSV：
+
+```bash
+python s08_run_pipeline.py \
+  --artifact_dir artifacts_direct \
+  --direct_feature_file artifacts_direct/direct_feature_selection.csv \
+  --skip s01,s03 \
+  --stop_after s06_cb
+```
+
+### 4.2 商用 8 特征快速模式
 
 `--commercial_only` 一键使用商用 8 特征提取并训练：
 
 ```bash
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_only
 ```
+
+该模式要求使用 5 秒 PPG 窗口，并提供长度对齐的 ACC；缺失或错位数据会按窗口提取失败处理并记录原因。
 
 内部流程：
 
@@ -133,19 +185,19 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --comm
 
 ## 5. 模型训练与搜参
 
-`s05_train_final_model.py` 固定人工特征后执行 staged group-CV 搜参：
+`s05_train_final_model.py` 固定人工、direct 或 auto 流程确定的特征后执行 staged group-CV 搜参：
 
 - Stage A 快速筛选大量候选；Stage B 对前若干候选执行完整 grouped CV。
 - 最大树深可搜索到 5。
 - 树数量候选硬限制为不超过 50。
-- 特征数量在人工模式下不参与搜参。
+- 特征数量在人工模式和直接特征模式下都不参与搜参。
 - 默认候选轴为：`n_estimators=20,25,30,35,40,45,50`，`max_depth=2,3,4,5`，
   `learning_rate=0.03,0.05,0.08,0.15`，`min_child_weight=10,20,30,50`，
   `reg_lambda=5,10,20`，`reg_alpha=0,1,2`，
   `subsample=0.75,0.85,0.90`，`colsample_bytree=0.75,0.85,0.90`。
-- 人工模式默认 `balanced` 预算为 Stage A 80 个候选、Stage B 8 个候选；
+- 人工模式和 direct 模式默认 `balanced` 预算为 Stage A 80 个候选、Stage B 8 个候选；
   `fast` 为 60/6，`thorough` 保持 360/48。显式 CLI 参数优先于档位默认值。
-- 默认使用 3 折、2 次重复的 grouped CV；人工 `balanced` 加上最终重训和
+- 默认使用 3 折、2 次重复的 grouped CV；人工/direct `balanced` 加上最终重训和
   hard-negative 流程时，最多约 141 次 XGBoost 拟合。
 - hard-negative 候选只使用 train OOF 误报挖掘；只有 valid 指标满足接受条件才替换参考模型。
 - test 只用于冻结配置后的只读最终评估，不参与特征、阈值或超参数选择。
@@ -240,7 +292,7 @@ python s07_postprocess_optimize.py \
 语法检查：
 
 ```bash
-python -m py_compile s01_data_split.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py
+python -m py_compile direct_feature_selection.py s01_data_split.py s03_extract_feature_pool.py s04_feature_selection.py s05_train_final_model.py s06_deploy_eval.py s07_postprocess_optimize.py s08_run_pipeline.py
 ```
 
 全量测试：

@@ -45,6 +45,10 @@ from stage2_feature_catalog import (
     FEATURE_POOL_VERSION,
 )
 from manual_feature_selection import load_manual_selection_csv
+from direct_feature_selection import (
+    direct_selection_provenance,
+    load_direct_feature_csv,
+)
 from model_search_limits import (
     DEFAULT_MODEL_SEARCH_N_ESTIMATORS,
     MAX_MODEL_SEARCH_N_ESTIMATORS,
@@ -117,6 +121,35 @@ def load_manual_feature_selection(manual_path, ranking_path, df_train, df_valid)
     os.replace(tmp_path, frozen_path)
     provenance["frozen_manual_feature_file"] = str(frozen_path.resolve())
     provenance["frozen_manual_feature_file_sha256"] = _sha256_file(frozen_path)
+    return selected, provenance
+
+
+def load_direct_feature_selection(direct_path, df_train, df_valid):
+    """Validate a pre-extraction feature list without requiring s04 ranking artifacts."""
+    direct_path = Path(direct_path).resolve()
+    validate_feature_pool_frames(df_train, df_valid)
+    selected = load_direct_feature_csv(direct_path)
+    missing_train = [name for name in selected if name not in df_train.columns]
+    missing_valid = [name for name in selected if name not in df_valid.columns]
+    if missing_train or missing_valid:
+        raise ValueError(
+            "direct selected features are missing from selective feature pools: "
+            f"train={missing_train}, valid={missing_valid}; rerun s03 with the same CSV"
+        )
+    provenance = direct_selection_provenance(direct_path, selected)
+    frozen_path = direct_path.parent / "direct_selected_features.json"
+    frozen_payload = {
+        "schema_version": 1,
+        "feature_pool_version": FEATURE_POOL_VERSION,
+        "selected_features": selected,
+        "selection_provenance": provenance,
+    }
+    tmp_path = frozen_path.with_suffix(frozen_path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(frozen_payload, handle, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, frozen_path)
+    provenance["frozen_direct_feature_file"] = str(frozen_path.resolve())
+    provenance["frozen_direct_feature_file_sha256"] = _sha256_file(frozen_path)
     return selected, provenance
 
 
@@ -2971,10 +3004,16 @@ def main(args=None):
     parser.add_argument("--artifact_dir", type=str, default="artifacts")
     parser.add_argument(
         "--feature_selection_mode",
-        choices=["manual", "auto"],
+        choices=["manual", "auto", "direct"],
         default="manual",
     )
     parser.add_argument("--manual_feature_file", type=str, default=None)
+    parser.add_argument(
+        "--direct_feature_file",
+        type=str,
+        default=None,
+        help="one-column feature CSV used by direct mode; exact row order is frozen",
+    )
     parser.add_argument("--max_features", type=int, default=None,
                         help="从 ranked_features.json 取 top-k 特征；默认 None 时回退到 selected_features.json")
     parser.add_argument("--model_search_feature_counts", type=str, default="8,10,12,15,18",
@@ -3106,7 +3145,21 @@ def main(args=None):
         "feature_selection_mode": str(args.feature_selection_mode),
         "feature_pool_version": FEATURE_POOL_VERSION,
     }
-    if args.feature_selection_mode == "manual":
+    if args.feature_selection_mode == "direct":
+        if not args.direct_feature_file:
+            raise ValueError("direct mode requires --direct_feature_file")
+        selected_features, selection_provenance = load_direct_feature_selection(
+            args.direct_feature_file,
+            df_train_raw,
+            df_valid_raw,
+        )
+        if args.feature_search_local_swap:
+            raise ValueError(
+                "direct feature selection conflicts with --feature_search_local_swap; "
+                "use --no-feature_search_local_swap."
+            )
+        args.model_search_feature_counts = ""
+    elif args.feature_selection_mode == "manual":
         manual_feature_file = (
             args.manual_feature_file
             or os.path.join(args.artifact_dir, "manual_feature_selection.csv")
@@ -3776,10 +3829,12 @@ def main(args=None):
             "threshold_selection_data": "valid_threshold_split",
             "test_used": False,
             "feature_selection_data": (
-                "manual_file"
+                "direct_file"
+                if args.feature_selection_mode == "direct"
+                else ("manual_file"
                 if args.feature_selection_mode == "manual"
                 else (fs.get("selection_policy", {}).get("selection_data", "unknown")
-                      if "fs" in dir() else "multi_k_ranked")
+                      if "fs" in dir() else "multi_k_ranked"))
             ),
         },
 
