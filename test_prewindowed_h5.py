@@ -169,6 +169,147 @@ def test_s03_sample_read_failure_is_not_silently_converted_to_empty_rows(monkeyp
         )
 
 
+def test_s03_grouped_sample_with_no_windows_after_edge_trim_is_reported_and_skipped(
+    tmp_path, capsys
+):
+    h5_path = tmp_path / "short_grouped.h5"
+    sample_name = "short_grouped"
+    with h5py.File(h5_path, "w") as f:
+        sample_group = f.create_group(sample_name)
+        for window_index in range(6):
+            window_group = sample_group.create_group(f"record_w{window_index}_1")
+            window_group.create_dataset("ppg", data=np.zeros((40, 500), dtype=float))
+
+    result = s03.extract_features_for_split(
+        [{
+            "sample_name": sample_name,
+            "h5_file": str(h5_path),
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+            "window_layout": "grouped_windows",
+            "ppg_shape": [6, 40, 500],
+        }],
+        n_workers=1,
+    )
+
+    output = capsys.readouterr().out
+    assert result.empty
+    assert "reason=no_windows_after_edge_trim" in output
+    assert "original_windows=6" in output
+    assert "no_windows_after_edge_trim=1" in output
+
+
+def test_s03_parallel_workers_preserve_grouped_edge_trim_skip_reason(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv("WL_FORCE_SERIAL", raising=False)
+    h5_path = tmp_path / "short_grouped_parallel.h5"
+    # Three items are required because resolve_n_workers intentionally uses the
+    # serial path for n_items <= 2.
+    sample_names = ["short_grouped_a", "short_grouped_b", "short_grouped_c"]
+    assert s03.resolve_n_workers(2, n_items=len(sample_names)) == 2
+    with h5py.File(h5_path, "w") as f:
+        for sample_name in sample_names:
+            sample_group = f.create_group(sample_name)
+            for window_index in range(6):
+                window_group = sample_group.create_group(f"record_w{window_index}_1")
+                window_group.create_dataset(
+                    "ppg", data=np.zeros((40, 500), dtype=float)
+                )
+
+    result = s03.extract_features_for_split(
+        [{
+            "sample_name": sample_name,
+            "h5_file": str(h5_path),
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+            "window_layout": "grouped_windows",
+            "ppg_shape": [6, 40, 500],
+        } for sample_name in sample_names],
+        n_workers=2,
+    )
+
+    output = capsys.readouterr().out
+    assert result.empty
+    assert "no_windows_after_edge_trim=3" in output
+    assert "[ERROR]" not in output
+
+
+def test_s03_grouped_sample_with_no_recognized_ppg_windows_remains_fatal(tmp_path):
+    h5_path = tmp_path / "broken_grouped.h5"
+    with h5py.File(h5_path, "w") as f:
+        f.create_group("broken_grouped")
+
+    with pytest.raises(RuntimeError, match="has no grouped PPG windows"):
+        s03.extract_features_for_split(
+            [{
+                "sample_name": "broken_grouped",
+                "h5_file": str(h5_path),
+                "target": 1,
+                "frequency": 100,
+                "ppg_config": 0,
+                "window_layout": "grouped_windows",
+                "ppg_shape": [1, 40, 500],
+            }],
+            n_workers=1,
+        )
+
+
+def test_s03_array_prewindowed_sample_reports_empty_after_edge_trim(tmp_path, capsys):
+    h5_path = tmp_path / "short_array_prewindowed.h5"
+    sample_name = "short_array_prewindowed"
+    with h5py.File(h5_path, "w") as f:
+        sample_group = f.create_group(sample_name)
+        sample_group.create_dataset("ppg", data=np.zeros((6, 40, 500), dtype=float))
+
+    result = s03.extract_features_for_split(
+        [{
+            "sample_name": sample_name,
+            "h5_file": str(h5_path),
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+            "ppg_shape": [6, 40, 500],
+        }],
+        n_workers=1,
+    )
+
+    output = capsys.readouterr().out
+    assert result.empty
+    assert "reason=no_windows_after_edge_trim" in output
+    assert "original_windows=6" in output
+    assert "no_windows_after_edge_trim=1" in output
+
+
+def test_s03_continuous_sample_reports_empty_after_edge_trim(tmp_path, capsys):
+    h5_path = tmp_path / "short_continuous.h5"
+    sample_name = "short_continuous"
+    # 1000 points at 100 Hz produce exactly six 5 s windows with a 1 s stride.
+    with h5py.File(h5_path, "w") as f:
+        sample_group = f.create_group(sample_name)
+        sample_group.create_dataset("ppg", data=np.zeros((40, 1000), dtype=float))
+
+    result = s03.extract_features_for_split(
+        [{
+            "sample_name": sample_name,
+            "h5_file": str(h5_path),
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+            "ppg_shape": [40, 1000],
+        }],
+        n_workers=1,
+    )
+
+    output = capsys.readouterr().out
+    assert result.empty
+    assert "reason=no_windows_after_edge_trim" in output
+    assert "original_windows=6" in output
+    assert "no_windows_after_edge_trim=1" in output
+
+
 def test_s03_attempts_all_sample_windows_then_reports_feature_failures(monkeypatch):
     ppg = np.zeros((3, 500, 40), dtype=float)
     ppg[:, :, 0] = 4.0e6

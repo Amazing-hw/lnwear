@@ -15,7 +15,8 @@
 功能：
 1. 读取 artifacts/splits.json
 2. 对全部合法样本/窗口提取 5s/25Hz XGBoost 特征
-3. 读入并排序后固定删除每条数据的前三个和后三个窗口。
+3. 读入并排序后固定删除每条数据的前三个和后三个窗口；裁剪后为空的
+   短样本记录原因并跳过，不中断其余样本。
 4. 复用原始 H5 读取方式。
 5. 只按 H5 `ppg_config` 构建三个固定物理光区，不做信号方差判断。
 6. 模型候选使用与部署一致的短窗预处理：有限值替换、孤立毛刺修复、
@@ -88,6 +89,19 @@ COMMERCIAL_STAGE2_FIELDS = (
 )
 
 WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
+
+
+class NoUsableWindowsAfterEdgeTrim(RuntimeError):
+    """A valid sample has no windows left after the required 3+3 trim."""
+
+
+def _no_usable_windows_after_edge_trim(sample_name, original_windows):
+    return NoUsableWindowsAfterEdgeTrim(
+        f"sample={sample_name}, "
+        f"reason=no_windows_after_edge_trim, "
+        f"original_windows={int(original_windows)}, "
+        f"edge_trim={EDGE_WINDOW_TRIM}+{EDGE_WINDOW_TRIM}"
+    )
 
 
 def trim_ordered_windows(items):
@@ -326,7 +340,8 @@ def parse_grouped_window_name(name):
     return int(match.group("index")), int(match.group("label"))
 
 
-def _sorted_grouped_window_items(group):
+def _raw_sorted_grouped_window_items(group):
+    """Return recognized grouped PPG windows before the required edge trim."""
     items = []
     for child_name in group.keys():
         parsed = parse_grouped_window_name(child_name)
@@ -337,7 +352,11 @@ def _sorted_grouped_window_items(group):
             continue
         window_index, label = parsed
         items.append((window_index, label, child_name, child))
-    return trim_ordered_windows(sorted(items, key=lambda item: item[0]))
+    return sorted(items, key=lambda item: item[0])
+
+
+def _sorted_grouped_window_items(group):
+    return trim_ordered_windows(_raw_sorted_grouped_window_items(group))
 
 
 def load_grouped_window_metadata(sample):
@@ -370,8 +389,14 @@ def load_ppg(sample):
     with h5py.File(sample["h5_file"], "r") as f:
         grp = f[sample["sample_name"]]
         if sample.get("window_layout") == "grouped_windows" or "ppg" not in grp:
+            raw_items = _raw_sorted_grouped_window_items(grp)
+            grouped_items = trim_ordered_windows(raw_items)
+            if not grouped_items and raw_items:
+                raise _no_usable_windows_after_edge_trim(
+                    sample["sample_name"], len(raw_items)
+                )
             windows = []
-            for _idx, _label, _name, child in _sorted_grouped_window_items(grp):
+            for _idx, _label, _name, child in grouped_items:
                 windows.append(normalize_ppg_array(child["ppg"][:]))
             if not windows:
                 raise KeyError(f"sample {sample['sample_name']} has no grouped PPG windows")
@@ -379,7 +404,12 @@ def load_ppg(sample):
         else:
             ppg = normalize_ppg_array(grp["ppg"][:])
             if is_prewindowed_signal(ppg):
+                original_windows = int(ppg.shape[0])
                 ppg = trim_ordered_windows(ppg)
+                if original_windows and ppg.shape[0] == 0:
+                    raise _no_usable_windows_after_edge_trim(
+                        sample["sample_name"], original_windows
+                    )
     return ppg
 
 
@@ -3802,6 +3832,8 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         acc = load_acc(sample)
         sample_frequency = get_sample_frequency(sample)
         mode = get_sample_ppg_config(sample)
+    except NoUsableWindowsAfterEdgeTrim:
+        raise
     except Exception as e:
         sample_name = sample.get("sample_name", "unknown")
         raise RuntimeError(
@@ -3952,9 +3984,12 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
 
     rows = []
     window_failures = []
-    starts = trim_ordered_windows(
-        list(range(0, len(ppg_25) - win_25 + 1, stride_25))
-    )
+    candidate_starts = list(range(0, len(ppg_25) - win_25 + 1, stride_25))
+    starts = trim_ordered_windows(candidate_starts)
+    if candidate_starts and not starts:
+        raise _no_usable_windows_after_edge_trim(
+            sample.get("sample_name", "unknown"), len(candidate_starts)
+        )
     if skip_initial_windows:
         starts = starts[max(0, int(skip_initial_windows)):]
     for start in starts:
@@ -4105,11 +4140,17 @@ def extract_features_for_split(samples,
 
     rows_by_sample = [[] for _ in original_samples]
     failures = []
+    skipped_after_edge_trim = []
     if n_workers == 1:
         for i, a in enumerate(args_list, 1):
             original_idx = ordered_original_indices[i - 1]
             try:
                 rows_by_sample[original_idx] = _worker_extract(a)
+            except NoUsableWindowsAfterEdgeTrim as exc:
+                sample_name = original_samples[original_idx].get(
+                    "sample_name", f"idx={original_idx}")
+                skipped_after_edge_trim.append((sample_name, exc))
+                print(f"  [SKIP] {exc}", flush=True)
             except Exception as exc:
                 sample_name = original_samples[original_idx].get(
                     "sample_name", f"idx={original_idx}")
@@ -4141,6 +4182,12 @@ def extract_features_for_split(samples,
                 sample_idx = future_to_idx[fut]
                 try:
                     rows = fut.result()
+                except NoUsableWindowsAfterEdgeTrim as exc:
+                    sample_name = original_samples[sample_idx].get(
+                        "sample_name", f"idx={sample_idx}")
+                    skipped_after_edge_trim.append((sample_name, exc))
+                    print(f"  [SKIP] {exc}", flush=True)
+                    rows = []
                 except Exception as exc:
                     sample_name = original_samples[sample_idx].get(
                         "sample_name", f"idx={sample_idx}")
@@ -4155,6 +4202,13 @@ def extract_features_for_split(samples,
                 completed += 1
                 if completed % max(1, total // 10) == 0 or completed == total:
                     print(f"  s03 progress: {completed}/{total} samples", flush=True)
+
+    if skipped_after_edge_trim:
+        print(
+            "  s03 skipped samples: "
+            f"no_windows_after_edge_trim={len(skipped_after_edge_trim)}",
+            flush=True,
+        )
 
     if failures:
         examples = "; ".join(

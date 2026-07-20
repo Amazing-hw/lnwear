@@ -45,3 +45,23 @@ def test_active_docs_describe_two_file_python_deployment_without_scipy():
     )
     assert "NumPy 和 XGBoost 属于 Python 运行环境依赖" in plan
     assert "NumPy、SciPy" not in plan
+
+
+def test_training_environment_has_a_documented_dependency_contract():
+    from pathlib import Path
+
+    requirements_path = Path("requirements.txt")
+    assert requirements_path.exists()
+    requirements = requirements_path.read_text(encoding="utf-8")
+    for package in (
+        "numpy", "pandas", "h5py", "scipy", "scikit-learn", "xgboost",
+        "joblib", "matplotlib", "Pillow", "shap", "umap-learn",
+    ):
+        assert any(
+            line.strip().lower().startswith(package.lower() + "==")
+            for line in requirements.splitlines()
+        ), package
+
+    readme = Path("README.md").read_text(encoding="utf-8")
+    assert "pip install -r requirements.txt" in readme
+    assert "Python 3.13.5" in readme

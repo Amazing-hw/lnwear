@@ -14,6 +14,16 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_only
 ```
 
+## 运行环境
+
+完整训练、分析和部署导出环境已在 Python 3.13.5 下验证。建议在独立虚拟环境中安装项目锁定依赖：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` 包含完整流水线和全部分析图所需版本，包括 SHAP 与可选 UMAP 图。已经导出的独立 `deploy_feature_extractor.py` 不依赖项目源码；仅执行 Python 端部署推理时只需要与部署环境兼容的 NumPy 和 XGBoost。
+
 ## 1. 当前流程
 
 ```text
@@ -47,7 +57,7 @@ H5 数据
 | 1 | 6 通道 | `g1=(ch3+ch9)/2`，`g2=(ch4+ch10)/2`，`g3=(ch5+ch11)/2` |
 | 2 | 9 通道 | `g1=(ch6+ch9+ch12)/3`，`g2=(ch7+ch10+ch13)/3`，`g3=(ch8+ch11+ch14)/3` |
 
-读取并按窗口编号排序后，每条数据固定删除前三个和后三个窗口。窗口不足七个时，该记录不会产生可用窗口。元数据缺失、取值非法或通道数不足的记录会被跳过，并输出统计与原因。
+读取并按窗口编号排序后，每条数据固定删除前三个和后三个窗口。窗口不足七个时，s03 会以 `no_windows_after_edge_trim` 记录并跳过该样本，同时输出原窗口数和跳过总数；这不是致命错误。H5 读取损坏、无法识别任何 PPG 窗口或特征计算失败仍会在处理完其他样本后汇总报错。元数据缺失、取值非法或通道数不足的记录会被跳过，并输出统计与原因。
 
 ## 3. 三光区绿光处理
 
