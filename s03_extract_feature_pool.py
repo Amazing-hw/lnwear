@@ -3657,9 +3657,9 @@ def extract_commercial_feature_overrides(ppg_window, acc_window, frequency, ppg_
     strided_acc = np.nan_to_num(acc[::stride], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     _, ambient, g1, g2, g3 = get_channels_from_window(strided_ppg, ppg_config)
-    green = (np.asarray(g1, dtype=np.float64)
-             + np.asarray(g2, dtype=np.float64)
-             + np.asarray(g3, dtype=np.float64)).astype(np.float32) / np.float32(3.0)
+    green = ((np.asarray(g1, dtype=np.float64)
+              + np.asarray(g2, dtype=np.float64)
+              + np.asarray(g3, dtype=np.float64)) / np.float64(3.0)).astype(np.float32)
 
     port_ppg = np.zeros((125, 4), dtype=np.float32)
     port_ppg[:, 0] = green
