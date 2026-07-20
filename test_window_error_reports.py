@@ -9,6 +9,7 @@ import pytest
 
 import s06_deploy_eval as s06
 import s07_postprocess_optimize as s07
+from stage2_feature_catalog import FEATURE_POOL_VERSION
 
 
 ROOT = Path(__file__).resolve().parent
@@ -412,6 +413,7 @@ def test_export_deploy_artifacts_writes_selected_stage2_contracts(
         tmp_path, monkeypatch):
     feature_names = ["GREEN_AC_RMS"]
     bundle = {
+        "feature_pool_version": FEATURE_POOL_VERSION,
         "feature_names": feature_names,
         "fill_values": {"GREEN_AC_RMS": 0.0},
         "model": _DeployTestModel(),

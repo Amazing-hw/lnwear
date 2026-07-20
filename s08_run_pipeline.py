@@ -477,7 +477,6 @@ import re
 from collections import OrderedDict
 
 import numpy as np
-from scipy.signal import resample_poly
 
 
 FEATURE_ORDER = {order_json}
@@ -598,9 +597,10 @@ def extract_features_from_ppg(ppg, acc=None, *, frequency, ppg_config):
 
     raw_acc = None if acc is None else np.asarray(acc, dtype=float)
     if frequency == 100:
-        raw_ppg = resample_poly(raw_ppg, 1, 4, axis=0)
+        # Fixed phase: retain source indices 0, 4, 8, ... exactly.
+        raw_ppg = raw_ppg[::4]
         if raw_acc is not None and raw_acc.size:
-            raw_acc = resample_poly(raw_acc, 1, 4, axis=0)
+            raw_acc = raw_acc[::4]
     ir, ambient, g1, g2, g3 = get_channels_from_window(raw_ppg, ppg_config)
     return extract_features(
         ir, ambient, g1, g2, g3,
@@ -720,6 +720,16 @@ def _render_selected_feature_extractor(selected_features, fill_values, clip_boun
     )
 
 
+def _assert_current_feature_pool_bundle(bundle, action="deployment export"):
+    """Reject unversioned or stale bundles before producing v10 artifacts."""
+    version = bundle.get("feature_pool_version")
+    if version != FEATURE_POOL_VERSION:
+        raise ValueError(
+            f"model_bundle feature_pool_version={version!r} does not match "
+            f"{FEATURE_POOL_VERSION}; rerun s03-s05 before {action}."
+        )
+
+
 def export_feature_extractor_script(artifact_dir):
     """Export a compact extractor for the actual selected deployment features."""
     bp = os.path.join(artifact_dir, "model_bundle.pkl")
@@ -728,6 +738,7 @@ def export_feature_extractor_script(artifact_dir):
         return None
 
     bundle = joblib.load(bp)
+    _assert_current_feature_pool_bundle(bundle)
     selected = list(bundle["feature_names"])
     meta = bundle.get("meta", {}) or {}
     ir_features = _stage2_ir_selected_features(selected)
@@ -776,12 +787,7 @@ def export_stage2_feature_contracts(artifact_dir):
         raise ValueError(f"model_bundle.pkl missing: {bundle_path}")
     bundle = joblib.load(bundle_path)
     selected = list(bundle["feature_names"])
-    version = bundle.get("feature_pool_version", FEATURE_POOL_VERSION)
-    if version != FEATURE_POOL_VERSION:
-        raise ValueError(
-            f"model_bundle feature_pool_version={version!r} does not match "
-            f"{FEATURE_POOL_VERSION}; rerun s03-s05 before deployment export."
-        )
+    _assert_current_feature_pool_bundle(bundle)
     meta = bundle.get("meta", {}) or {}
     fs = float(meta.get("fs_ppg", 25.0))
     win_sec = float(meta.get("win_sec", 5.0))
@@ -884,6 +890,7 @@ def export_golden_vectors(artifact_dir, n_vectors=1):
         return None
 
     bundle = joblib.load(bundle_path)
+    _assert_current_feature_pool_bundle(bundle, action="golden-vector export")
     selected = list(bundle["feature_names"])
     threshold = float(bundle.get("threshold", 0.5))
     spec = importlib.util.spec_from_file_location("_lnwear_deploy_feature_extractor", script_path)
@@ -969,6 +976,7 @@ def validate_deploy_artifact_consistency(artifact_dir):
         raise ValueError(f"model_bundle.pkl missing: {bundle_path}")
 
     bundle = joblib.load(bundle_path)
+    _assert_current_feature_pool_bundle(bundle, action="deployment consistency validation")
     selected = list(bundle["feature_names"])
     threshold = float(bundle.get("threshold", 0.5))
     expected_fill = _json_float_map(bundle.get("fill_values", {}), selected)
@@ -1413,6 +1421,7 @@ def export_deploy_cookbook(artifact_dir):
         return
 
     bundle = _joblib.load(bundle_path)
+    _assert_current_feature_pool_bundle(bundle, action="deployment cookbook export")
     selected = bundle["feature_names"]
     fill_values = bundle["fill_values"]
     clip_bounds = bundle.get("clip_bounds", {})
@@ -1434,7 +1443,7 @@ def export_deploy_cookbook(artifact_dir):
     cookbook = {
         "_title": "手表佩戴活体检测 — 部署配方 (Deployment Cookbook)",
         "_for": "嵌入式/工程化部署工程师。本文件自包含，无需查任何其他文件。",
-        "_input": "PPG/ACC窗口 + frequency in {25,100} + ppg_config in {0,1,2}; 100Hz先降到25Hz",
+        "_input": "PPG/ACC窗口 + frequency in {25,100} + ppg_config in {0,1,2}; 100Hz按x[::4]降到25Hz",
         "A_deployment_operator_budget": {
             "feature_set": "deployment_friendly",
             "selected_feature_cost_summary": feature_cost_summary,
@@ -1453,7 +1462,7 @@ def export_deploy_cookbook(artifact_dir):
         # ---- Section A: 公共计算（所有特征共用） ----
         "A_channel_extraction": {
             "_note": "从 PPG 窗口提取 ir/ambient/g1/g2/g3",
-            "frequency_rule": "frequency==25: direct; frequency==100: polyphase downsample to 25Hz",
+            "frequency_rule": "frequency==25: direct; frequency==100: retain indices 0,4,8,... (x[::4])",
             "ppg_config_source": config_source,
             "channels": ch_extract,
         },

@@ -8,7 +8,8 @@
 1. 单趟推理 + ProcessPoolExecutor 并行；推理结果在主进程统一计算窗口与样本指标。
 2. 删除每窗对绿光/IR 的重复 preprocess_signal 调用：
    直接走 extract_feature_pool_from_window(..., return_preprocessed=True)，
-   从返回的 preprocessed dict 复用三光区聚合信号给交叉特征使用。
+   从返回的 preprocessed dict 复用三光区聚合信号给交叉特征使用；5 秒且
+   ACC 可用时，与训练/独立部署一致地应用精确商用字段覆盖。
 3. 主结果仅使用 XGBoost 窗口概率和冻结阈值；后处理仅作可选独立分析。
 4. 状态机网格搜索并行化（probs 缓存复用）。
 5. 预切窗和 grouped-window H5 直接按窗口编号推理；窗口缓存保留
@@ -45,6 +46,8 @@ from s03_extract_feature_pool import (
     get_channels_from_window,
     is_stage2_ir_feature,
     extract_feature_pool_from_window,
+    extract_commercial_feature_overrides,
+    COMMERCIAL_STAGE2_FIELDS,
     align_acc_window,
     extract_acc_features,
     extract_acc_ppg_cross_features,
@@ -493,6 +496,30 @@ def _window_error_record(position, exc):
     }
 
 
+def _apply_selected_commercial_overrides(
+    feat, raw_ppg, raw_acc, frequency, ppg_config, selected_features
+):
+    """Apply the exact 5-second commercial port to selected mapped fields."""
+    if raw_acc is None:
+        return feat
+    selected = None if selected_features is None else set(selected_features)
+    if selected is not None and not selected.intersection(COMMERCIAL_STAGE2_FIELDS):
+        return feat
+    overrides = extract_commercial_feature_overrides(
+        raw_ppg,
+        raw_acc,
+        frequency=int(frequency),
+        ppg_config=int(ppg_config),
+    )
+    if selected is None:
+        feat.update(overrides)
+    else:
+        for name in selected:
+            if name in overrides:
+                feat[name] = overrides[name]
+    return feat
+
+
 def _finalize_window_inference(
     base,
     feats_list,
@@ -600,6 +627,7 @@ def _infer_prewindowed_sample(base, ppg, acc,
             feat["mode"] = float(mode)
 
             acc_seg = None
+            raw_acc = None
             if acc is not None and is_prewindowed_signal(acc) and step < acc.shape[0]:
                 try:
                     raw_acc = acc[step]
@@ -616,6 +644,15 @@ def _infer_prewindowed_sample(base, ppg, acc,
                     green_raw = preprocessed.get("g_top2_raw")
                     if green_raw is not None:
                         feat.update(extract_acc_green_coupling_features(acc_seg, green_raw, green_bp))
+            if int(round(float(window_sec) * FEATURE_FS)) == 125:
+                _apply_selected_commercial_overrides(
+                    feat,
+                    raw_window,
+                    raw_acc,
+                    25 if native_25hz else 100,
+                    mode,
+                    bundle.get("feature_names"),
+                )
 
             feats_list.append(feat)
             quality_metas.append({
@@ -650,8 +687,6 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
     """
     对全部合法窗口提取特征并执行 XGBoost 预测。
     """
-    from scipy.signal import resample_poly as _rp
-
     FEATURE_FS = 25
 
     sample_name = sample.get("sample_name", "unknown")
@@ -697,7 +732,7 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
             skip_initial_windows,
         )
 
-    # 3. 信号降采样 (25Hz 原生数据跳过)
+    # 3. 100Hz 信号固定按 x[::4] 取为 25Hz（原生 25Hz 跳过）。
     try:
         mode = get_sample_ppg_config(sample)
         base["mode"] = int(mode)
@@ -708,11 +743,11 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
             ppg_25 = ppg.astype(np.float64)
             acc_25 = acc.astype(np.float64) if (acc is not None and len(acc) > 0) else None
         else:
-            ppg_25 = _rp(ppg.astype(np.float32, copy=False), 1, 4, axis=0).astype(np.float64)
+            ppg_25 = _downsample_ppg(ppg, src_fs=100, tgt_fs=FEATURE_FS)
             acc_25 = None
             if acc is not None and len(acc) > 0:
                 try:
-                    acc_25 = _rp(acc.astype(np.float32, copy=False), 1, 4, axis=0).astype(np.float64)
+                    acc_25 = _downsample_ppg(acc, src_fs=100, tgt_fs=FEATURE_FS)
                 except Exception:
                     pass
 
@@ -757,6 +792,22 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
                         if green_raw is not None:
                             feat.update(extract_acc_green_coupling_features(
                                 acc_seg, green_raw, green_bp))
+                if win_25 == 125:
+                    source_stride = int(frequency // FEATURE_FS)
+                    source_start = int(s2_start * source_stride)
+                    source_len = int(125 * source_stride)
+                    raw_ppg = ppg[source_start:source_start + source_len]
+                    raw_acc = None if acc is None else acc[
+                        source_start:source_start + source_len
+                    ]
+                    _apply_selected_commercial_overrides(
+                        feat,
+                        raw_ppg,
+                        raw_acc,
+                        frequency,
+                        mode,
+                        bundle.get("feature_names"),
+                    )
                 feats_list.append(feat)
                 quality_metas.append({
                     "Ambient_std": feat.get("Ambient_std"),
@@ -2111,16 +2162,18 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
     import os as _os
     import shutil
 
-    out_dir = _os.path.join(artifact_dir, "deploy_package")
-    _os.makedirs(out_dir, exist_ok=True)
-    print(f"\n导出部署产物到: {out_dir}")
-
     # --- 读取已有 artifacts ---
     bundle_path = _os.path.join(artifact_dir, "model_bundle.pkl")
     features_path = _os.path.join(artifact_dir, "selected_features.json")
     config_path = _os.path.join(artifact_dir, "final_model_config.json")
 
     bundle = joblib.load(bundle_path)
+    assert_bundle_ok(bundle)
+
+    out_dir = _os.path.join(artifact_dir, "deploy_package")
+    _os.makedirs(out_dir, exist_ok=True)
+    print(f"\n导出部署产物到: {out_dir}")
+
     postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
     if _os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -2488,6 +2541,7 @@ def export_tree_feature_usage_plot(artifact_dir):
         return None
 
     bundle = joblib.load(bundle_path)
+    assert_bundle_ok(bundle)
     raw_model = bundle.get("raw_model")
     if raw_model is None:
         print("[WARN] raw_model not in bundle, skip tree viz")
@@ -4044,4 +4098,3 @@ def export_audit_heatmap(strata_df, out_dir, min_support=10):
 
 if __name__ == "__main__":
     main()
-

@@ -35,7 +35,7 @@ H5 数据
 
 每条记录必须提供：
 
-- `frequency`：只能是 `25` 或 `100`。25 Hz 数据直接提取特征；100 Hz 数据先用多相降采样到 25 Hz。
+- `frequency`：只能是 `25` 或 `100`。25 Hz 数据直接提取特征；100 Hz 数据固定保留索引 `0,4,8,...`（即 `x[::4]`）降到 25 Hz，不做滤波、平均或插值。PPG 与 ACC 使用同一规则。
 - `ppg_config`：只能是 `0`、`1` 或 `2`，用于生成顺序稳定的三个固定物理光区。
 - PPG 与可选 ACC 数据。
 
@@ -63,7 +63,7 @@ top2 的选择依据是去趋势脉动分量的 AC-RMS 能量；RMS 只用于衡
 
 商用八特征仍保留在受治理特征池中。原有绿光平均类公式按三个固定光区的统一表示计算，另有三光区专用的 top2、中位、pair 和固定位置候选，最终是否使用由完整排序与人工 CSV，或 direct 特征清单决定。
 
-当前受治理特征池版本为 `stage2_interpretable_v9`。完整 126 项候选的公式、生理/物理意义、预期方向、鲁棒性、泛化风险和工程成本见 [FEATURE_INTERPRETABILITY_GUIDE.md](FEATURE_INTERPRETABILITY_GUIDE.md)。
+当前受治理特征池版本为 `stage2_interpretable_v10`。v10 将 100 Hz→25 Hz 统一为固定相位 `x[::4]`；旧版本特征池、排序 CSV 和模型不得与 v10 部署产物混用。完整 126 项候选的公式、生理/物理意义、预期方向、鲁棒性、泛化风险和工程成本见 [FEATURE_INTERPRETABILITY_GUIDE.md](FEATURE_INTERPRETABILITY_GUIDE.md)。
 
 ## 4. 人工选择特征
 
@@ -285,7 +285,7 @@ python s07_postprocess_optimize.py \
 - `deploy_package/model_params.json`：阈值、fill、clip、特征顺序和模型元数据。
 - `deploy_cookbook.json`：通道映射、预处理、特征和 XGBoost 推理配方。
 
-部署最小组合为独立的 `deploy_feature_extractor.py`、XGBoost 模型 JSON，以及包含特征顺序、fill/clip 和阈值的模型元数据。部署判决不需要任何 IR 阈值配置文件。
+部署最小组合为独立的 `deploy_feature_extractor.py` 和 XGBoost 模型 JSON。特征脚本已内嵌特征顺序、fill/clip 和窗口阈值；其他模型元数据仅用于审计和非 Python 端移植。部署判决不需要任何 IR 阈值配置文件。
 
 ## 10. 验证
 

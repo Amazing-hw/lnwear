@@ -6,7 +6,7 @@ from collections import OrderedDict
 from typing import Iterable, Mapping
 
 
-FEATURE_POOL_VERSION = "stage2_interpretable_v9"
+FEATURE_POOL_VERSION = "stage2_interpretable_v10"
 
 COMMERCIAL_8_FEATURE_MAPPING = OrderedDict([
     ("GREEN_CORR", "GREEN_CORR"),

@@ -1,7 +1,8 @@
 # Interpretable Stage2 Feature Pool Design
 
 > Historical design record. Originally written for v8 (126 governed candidates).
-> Current implementation is stage2_interpretable_v9 (commercial formulas ported).
+> Current implementation is `stage2_interpretable_v10` (commercial formulas ported;
+> 100 Hz input uses fixed-phase `x[::4]`).
 > The commercial comparison runtime was removed; its eight-feature mapping remains.
 
 Date: 2026-07-10

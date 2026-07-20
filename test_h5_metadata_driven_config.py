@@ -121,6 +121,14 @@ def test_window_feature_extraction_requires_explicit_ppg_config():
         s03.extract_window_features(window, fs=25)
 
 
+def test_100hz_to_25hz_downsampling_selects_every_fourth_sample():
+    signal = np.arange(80, dtype=np.float64).reshape(20, 4)
+
+    actual = s03._downsample_ppg(signal, src_fs=100, tgt_fs=25)
+
+    np.testing.assert_array_equal(actual, signal[::4])
+
+
 @pytest.mark.parametrize(
     ("frequency", "sample_count", "expected_downsample_calls"),
     [(25, 275, []), (100, 1100, [(100, 25)])],

@@ -174,6 +174,7 @@ def test_deploy_extractor_is_self_contained_without_profile_meta(tmp_path):
     artifact_dir.mkdir()
     selected = ["GREEN_AC_RMS", "G_TOP2_CORR_MIN", "GTOP2_BAND_ENERGY_RATIO"]
     bundle = {
+        "feature_pool_version": catalog.FEATURE_POOL_VERSION,
         "feature_names": selected,
         "fill_values": {name: 0.0 for name in selected},
         "clip_bounds": {name: [-10.0, 10.0] for name in selected},
@@ -201,7 +202,9 @@ def test_deploy_extractor_is_self_contained_without_profile_meta(tmp_path):
     assert "from s03_extract_feature_pool" not in text
     assert "S03_SOURCE_DIR" not in text
     assert "sys.path.insert" not in text
-    assert "from scipy.signal import resample_poly" in text
+    assert "from scipy.signal import resample_poly" not in text
+    assert "raw_ppg = raw_ppg[::4]" in text
+    assert "raw_acc = raw_acc[::4]" in text
     assert "FEATURE_ORDER" in text
 
 
@@ -251,6 +254,7 @@ def test_export_deploy_cookbook_writes_performance_profile(tmp_path):
     model.fit(np.asarray([[0.0] * len(selected), [1.0] * len(selected)], dtype=float), np.asarray([0, 1]))
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "clip_bounds": {name: [-1.0, 1.0] for name in selected},
@@ -436,6 +440,7 @@ def test_deploy_extractor_import_and_feature_vector_are_finite(tmp_path):
     artifact_dir.mkdir()
     selected = ["GREEN_AC_RMS", "G_TOP2_CORR_MIN", "GTOP2_BAND_ENERGY_RATIO", "ACC_MAG_MEAN"]
     bundle = {
+        "feature_pool_version": catalog.FEATURE_POOL_VERSION,
         "feature_names": selected,
         "fill_values": {name: 0.0 for name in selected},
         "clip_bounds": {name: [-1e6, 1e6] for name in selected},

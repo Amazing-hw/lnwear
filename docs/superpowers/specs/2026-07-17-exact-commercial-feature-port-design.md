@@ -1,5 +1,9 @@
 # Exact Commercial Feature Port Design
 
+> Historical design record, superseded by `stage2_interpretable_v10`.
+> References below to the former `resample_poly` path describe the implementation
+> at the time of this design; active 100 Hz input now uses fixed-phase `x[::4]`.
+
 ## Goal
 
 Replace the calculation of the eight existing commercial Stage2 candidates with

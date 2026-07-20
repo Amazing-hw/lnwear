@@ -144,6 +144,73 @@ def test_s03_parallel_extraction_attempts_every_sample_before_reporting_failures
     assert sorted(completed) == ["sample_bad", "sample_good", "sample_good_2"]
 
 
+def test_s03_sample_read_failure_is_not_silently_converted_to_empty_rows(monkeypatch):
+    monkeypatch.setattr(
+        s03,
+        "load_ppg",
+        lambda _sample: (_ for _ in ()).throw(OSError("synthetic read failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="sample_read.*synthetic read failure"):
+        s03._extract_rows_for_sample(
+            {
+                "sample_name": "sample_read",
+                "h5_file": "unreadable.h5",
+                "target": 1,
+                "frequency": 100,
+                "ppg_config": 0,
+            },
+            window_len=500,
+            stride_len=100,
+            fs=100,
+            target_aware_stride=False,
+            stride_neg=100,
+            stride_pos=100,
+        )
+
+
+def test_s03_attempts_all_sample_windows_then_reports_feature_failures(monkeypatch):
+    ppg = np.zeros((3, 500, 40), dtype=float)
+    ppg[:, :, 0] = 4.0e6
+    ppg[:, :, 1] = 1.0e5
+    ppg[:, :, 3:6] = 2.0e6
+    calls = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: None)
+
+    def extract_with_one_failure(*_args, **_kwargs):
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise ValueError("synthetic window failure")
+        return (
+            {"GREEN_CORR": 1.0},
+            {"feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION},
+            {},
+        )
+
+    monkeypatch.setattr(s03, "extract_stage2_window", extract_with_one_failure)
+
+    with pytest.raises(RuntimeError, match="1/3 windows.*synthetic window failure"):
+        s03._extract_rows_for_sample(
+            {
+                "sample_name": "sample_windows",
+                "h5_file": "unused.h5",
+                "target": 1,
+                "frequency": 100,
+                "ppg_config": 0,
+            },
+            window_len=500,
+            stride_len=100,
+            fs=100,
+            target_aware_stride=False,
+            stride_neg=100,
+            stride_pos=100,
+        )
+
+    assert len(calls) == 3
+
+
 def test_s01_accepts_prewindowed_ppg_shape():
     assert s01.is_supported_ppg_shape((40, 300))
     assert s01.is_supported_ppg_shape((5, 40, 300))

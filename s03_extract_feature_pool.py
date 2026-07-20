@@ -6,7 +6,8 @@
 
 输入支持两种形态：
 - 3D 预切窗 PPG：直接逐个使用 H5 中已有窗口，不再二次滑窗。
-- 连续时序 PPG：按 H5 `frequency` 判断；100Hz 降到 25Hz，25Hz 直接使用，
+- 连续时序 PPG：按 H5 `frequency` 判断；100Hz 固定每 4 点取 1 点降到
+  25Hz（保留索引 0,4,8,...），25Hz 直接使用，
   再按 5s/1s 滑窗（可显式切到 3s）。
 - grouped-window H5：一个 record 下多个窗口 group，窗口名末尾为 *_w20_1；
   读取时按 w 后数字排序，label 来自最后一段。
@@ -14,8 +15,8 @@
 功能：
 1. 读取 artifacts/splits.json
 2. 对全部合法样本/窗口提取 5s/25Hz XGBoost 特征
-   读入并排序后固定删除每条数据的前三个和后三个窗口。
-4. 复用原始 H5 读取方式
+3. 读入并排序后固定删除每条数据的前三个和后三个窗口。
+4. 复用原始 H5 读取方式。
 5. 只按 H5 `ppg_config` 构建三个固定物理光区，不做信号方差判断。
 6. 模型候选使用与部署一致的短窗预处理：有限值替换、孤立毛刺修复、
    0.8s 滚动中位数去趋势；仅当 round(0.04*fs)>=2 时做短窗均值平滑。
@@ -38,7 +39,6 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from scipy.signal import resample_poly  # only for polyphase downsampling (C has equivalent)
 
 import commercial_liveness_features
 from direct_feature_selection import load_direct_feature_csv
@@ -3718,21 +3718,19 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None,
 # =========================================================
 
 def _downsample_ppg(ppg, src_fs=100, tgt_fs=25):
-    """将整个 ppg 从 src_fs 降采样到 tgt_fs。分批处理以控制内存。"""
+    """Use fixed-phase 4-to-1 selection for 100 Hz to 25 Hz conversion.
+
+    The retained samples are at source indices 0, 4, 8, ... .  No filtering,
+    averaging, or interpolation is applied, matching the watch-side contract.
+    """
     if src_fs == tgt_fs:
         return ppg
-    gcd = np.gcd(src_fs, tgt_fs)
-    up = tgt_fs // gcd
-    down = src_fs // gcd
-    ppg = ppg.astype(np.float32, copy=False)  # float32 省一半内存
-    n_cols = ppg.shape[1]
-    batch_size = 8  # 每次处理 8 个通道，控制峰值内存
-    out_parts = []
-    for c in range(0, n_cols, batch_size):
-        batch = ppg[:, c:c + batch_size]
-        part = resample_poly(batch, up, down, axis=0)
-        out_parts.append(part.astype(np.float64))
-    return np.concatenate(out_parts, axis=1)
+    if int(src_fs) != 100 or int(tgt_fs) != 25:
+        raise ValueError(
+            f"fixed-phase downsampling only supports 100 Hz to 25 Hz, "
+            f"got {src_fs} Hz to {tgt_fs} Hz"
+        )
+    return np.asarray(ppg)[::4].astype(np.float64, copy=False)
 
 
 def _commercial_only_feature_row(window, acc_seg, mode, frequency):
@@ -3766,6 +3764,21 @@ def _commercial_only_feature_row(window, acc_seg, mode, frequency):
     return feat
 
 
+def _raise_sample_window_failures(sample_name, failures, attempted_windows):
+    """Raise after every candidate window in one sample has been attempted."""
+    if not failures:
+        return
+    examples = "; ".join(
+        f"{position}: {type(exc).__name__}: {exc}"
+        for position, exc in failures[:5]
+    )
+    raise RuntimeError(
+        f"sample={sample_name}: feature extraction failed for "
+        f"{len(failures)}/{attempted_windows} windows after all sample windows "
+        f"were attempted; examples: {examples}"
+    )
+
+
 def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                               target_aware_stride, stride_neg, stride_pos,
                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
@@ -3773,10 +3786,11 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                               commercial_only=False,
                               selected_features=None):
     """
-    单样本全量抽窗特征。返回 rows list（失败时返回 []）。
+    单样本全量抽窗特征。无合法窗口时返回空列表；读取或特征计算失败时，
+    先尝试该样本的其余候选窗口，再抛出汇总异常。
 
     所有合法窗口直接进入 XGBoost 特征提取。3D 预切窗样本直接使用
-    已有窗口；连续时序样本降采样到 25Hz 后滑窗。
+    已有窗口；连续 100Hz 时序样本固定按 x[::4] 取为 25Hz 后滑窗。
     fs 参数为降采样后目标采样率 (25Hz)。
 
     commercial_only=True 时只提取 8 个商用特征 + 诊断字段，大幅加速。
@@ -3789,8 +3803,15 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         sample_frequency = get_sample_frequency(sample)
         mode = get_sample_ppg_config(sample)
     except Exception as e:
-        print(f"读取失败 {sample.get('sample_name')}: {e}")
-        return []
+        sample_name = sample.get("sample_name", "unknown")
+        raise RuntimeError(
+            f"sample={sample_name}: input loading or metadata validation failed: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+    commercial_overrides_requested = (
+        selected_features is None
+        or any(name in COMMERCIAL_STAGE2_FIELDS for name in selected_features)
+    )
 
     if is_prewindowed_signal(ppg):
         window_meta = load_grouped_window_metadata(sample)
@@ -3799,12 +3820,17 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         native_25hz = sample_frequency == FEATURE_FS
         ppg_src_fs = 25 if native_25hz else 100
         rows = []
+        window_failures = []
         first_idx = max(0, int(skip_initial_windows))
         for win_idx in range(first_idx, ppg.shape[0]):
             window_number = int(window_indices[win_idx]) if window_indices and win_idx < len(window_indices) else int(win_idx)
             window_target = int(window_labels[win_idx]) if window_labels and win_idx < len(window_labels) else int(sample["target"])
             raw_window = ppg[win_idx]
             if raw_window.shape[0] < 2:
+                window_failures.append((
+                    f"window_idx={win_idx}",
+                    ValueError(f"window has only {raw_window.shape[0]} samples"),
+                ))
                 continue
             if native_25hz:
                 window = raw_window.astype(np.float64, copy=False)
@@ -3817,20 +3843,22 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                     if is_prewindowed_signal(acc) and win_idx < acc.shape[0]:
                         raw_acc = acc[win_idx]
                         commercial_acc = raw_acc
-                        acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else resample_poly(
-                            raw_acc.astype(np.float64), FEATURE_FS, 100, axis=0
+                        acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
+                            raw_acc, src_fs=100, tgt_fs=FEATURE_FS
                         )
                     elif not is_prewindowed_signal(acc) and len(acc) > 0:
                         raw_start = int(win_idx * stride_len)
                         raw_acc = acc[raw_start:raw_start + window_len]
                         if len(raw_acc) > 0:
                             commercial_acc = raw_acc
-                            acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else resample_poly(
-                                raw_acc.astype(np.float64), FEATURE_FS, 100, axis=0
+                            acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
+                                raw_acc, src_fs=100, tgt_fs=FEATURE_FS
                             )
-                except Exception:
-                    acc_seg = None
-                    commercial_acc = None
+                except Exception as e:
+                    window_failures.append((f"window_idx={win_idx}:acc", e))
+                    print(f"ACC 处理失败: sample={sample.get('sample_name')}, "
+                          f"window_idx={win_idx}, error={e}")
+                    continue
             try:
                 if commercial_only:
                     feat = _commercial_only_feature_row(
@@ -3849,6 +3877,24 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                         use_stage2_ir=use_stage2_ir,
                         **selective_kwargs,
                     )
+                    expected_commercial_len = 125 * (ppg_src_fs // FEATURE_FS)
+                    if (
+                        commercial_overrides_requested
+                        and commercial_acc is not None
+                        and len(raw_window) == expected_commercial_len
+                    ):
+                        commercial_overrides = extract_commercial_feature_overrides(
+                            raw_window,
+                            commercial_acc,
+                            ppg_src_fs,
+                            mode,
+                        )
+                        if selected_features is None:
+                            feat.update(commercial_overrides)
+                        else:
+                            for name in selected_features:
+                                if name in commercial_overrides:
+                                    feat[name] = commercial_overrides[name]
                     feat.update(diagnostics)
                 feat["sample_name"] = sample["sample_name"]
                 feat["h5_file"] = sample["h5_file"]
@@ -3858,9 +3904,15 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                 feat["window_index"] = int(window_number)
                 rows.append(feat)
             except Exception as e:
+                window_failures.append((f"window_idx={win_idx}", e))
                 print(f"特征提取失败: sample={sample.get('sample_name')}, "
                       f"window_idx={win_idx}, error={e}")
                 continue
+        _raise_sample_window_failures(
+            sample.get("sample_name", "unknown"),
+            window_failures,
+            max(0, int(ppg.shape[0]) - first_idx),
+        )
         return rows
 
     source_window_len = int(round((window_len / max(fs, 1)) * sample_frequency))
@@ -3873,18 +3925,14 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
 
     sample_target = int(sample.get("target", 0))
 
-    # 降采样至 25Hz（原生 25Hz 直接使用）
+    # 100Hz 固定保留索引 0,4,8,...；原生 25Hz 直接使用。
     if native_25hz:
         ppg_25 = ppg
         acc_25 = acc if (acc is not None and len(acc) > 0) else None
     else:
         ppg_25 = _downsample_ppg(ppg, src_fs=100, tgt_fs=FEATURE_FS)
         if acc is not None and len(acc) > 0:
-            acc_25 = np.zeros((0, 3), dtype=np.float64)
-            try:
-                acc_25 = resample_poly(acc.astype(np.float64), FEATURE_FS, 100, axis=0)
-            except Exception:
-                acc_25 = None
+            acc_25 = _downsample_ppg(acc, src_fs=100, tgt_fs=FEATURE_FS)
         else:
             acc_25 = None
 
@@ -3903,6 +3951,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         return []
 
     rows = []
+    window_failures = []
     starts = trim_ordered_windows(
         list(range(0, len(ppg_25) - win_25 + 1, stride_25))
     )
@@ -3945,7 +3994,12 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                     use_stage2_ir=use_stage2_ir,
                     **selective_kwargs,
                 )
-                if commercial_acc is not None and len(commercial_ppg) == 125 * (commercial_frequency // FEATURE_FS):
+                if (
+                    win_25 == 125
+                    and commercial_overrides_requested
+                    and commercial_acc is not None
+                    and len(commercial_ppg) == 125 * (commercial_frequency // FEATURE_FS)
+                ):
                     commercial_overrides = extract_commercial_feature_overrides(
                         commercial_ppg, commercial_acc, commercial_frequency, mode
                     )
@@ -3964,9 +4018,15 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
             feat["window_index"] = int(start // max(stride_25, 1))
             rows.append(feat)
         except Exception as e:
+            window_failures.append((f"start={start}", e))
             print(f"特征提取失败: sample={sample.get('sample_name')}, "
                   f"start={start}, error={e}")
             continue
+    _raise_sample_window_failures(
+        sample.get("sample_name", "unknown"),
+        window_failures,
+        len(starts),
+    )
     return rows
 
 

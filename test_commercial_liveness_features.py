@@ -5,6 +5,7 @@ import pytest
 
 import commercial_liveness_features as commercial
 import s03_extract_feature_pool as s03
+import s06_deploy_eval as s06
 
 
 EXPECTED_STAGE2_FIELDS = (
@@ -44,6 +45,16 @@ def test_exact_port_zero_inputs_return_eight_float32_zeros():
     assert actual.shape == (8,)
     assert actual.dtype == np.float32
     np.testing.assert_array_equal(actual, np.zeros(8, dtype=np.float32))
+
+
+def test_peak_valley_port_handles_the_first_interior_peak():
+    signal = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+
+    peak_count, peak_times, peak_values, *_ = commercial._find_peak_valley(signal)
+
+    assert peak_count == 1
+    np.testing.assert_array_equal(peak_times, np.asarray([1], dtype=np.int16))
+    np.testing.assert_array_equal(peak_values, np.asarray([1.0], dtype=np.float32))
 
 
 def test_exact_port_dc_uses_absolute_raw_mean():
@@ -239,6 +250,136 @@ def test_batch_extraction_overrides_commercial_fields_from_raw_100hz_windows(mon
     assert observed
 
 
+def test_three_second_windows_do_not_mix_in_five_second_commercial_overrides(monkeypatch):
+    ppg, acc = _raw_window(900)
+    observed = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
+    monkeypatch.setattr(
+        s03,
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: ({"GREEN_CORR": -1.0}, {}, {}),
+    )
+
+    def fake_overrides(*args, **kwargs):
+        observed.append((args, kwargs))
+        return OrderedDict((("GREEN_CORR", 10.0),))
+
+    monkeypatch.setattr(s03, "extract_commercial_feature_overrides", fake_overrides)
+    rows = s03._extract_rows_for_sample(
+        {
+            "sample_name": "sample_3s",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_len=300,
+        stride_len=100,
+        fs=100,
+        target_aware_stride=False,
+        stride_neg=100,
+        stride_pos=100,
+    )
+
+    assert rows
+    assert all(row["GREEN_CORR"] == -1.0 for row in rows)
+    assert observed == []
+
+
+def test_s06_continuous_inference_applies_same_commercial_overrides_as_training(monkeypatch):
+    ppg, acc = _raw_window(1500)
+    observed = []
+    predicted_features = []
+
+    monkeypatch.setattr(s06, "validate_h5_file", lambda *_args: (True, None))
+    monkeypatch.setattr(s06, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s06, "load_acc", lambda _sample: acc)
+    monkeypatch.setattr(
+        s06,
+        "extract_feature_pool_from_window",
+        lambda **_kwargs: ({"GREEN_CORR": -1.0}, {}),
+    )
+    monkeypatch.setattr(s06, "extract_acc_features", lambda *_args, **_kwargs: {})
+
+    def fake_overrides(raw_ppg, raw_acc, frequency, ppg_config):
+        observed.append((raw_ppg.shape, raw_acc.shape, frequency, ppg_config))
+        return OrderedDict((("GREEN_CORR", 10.0),))
+
+    def fake_predict(features, bundle):
+        predicted_features.extend(features)
+        return np.ones(len(features), dtype=int), np.full(len(features), 0.8)
+
+    monkeypatch.setattr(s06, "extract_commercial_feature_overrides", fake_overrides)
+    monkeypatch.setattr(s06, "predict_label_windows", fake_predict)
+
+    result = s06._infer_one_sample(
+        {
+            "sample_name": "sample",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_sec=5,
+        stride_sec=1,
+        bundle={"feature_names": ["GREEN_CORR"], "feature_quantiles": None},
+    )
+
+    assert result["fallback"] is False
+    assert predicted_features
+    assert all(feature["GREEN_CORR"] == 10.0 for feature in predicted_features)
+    assert all(item == ((500, 6), (500, 3), 100, 0) for item in observed)
+
+
+def test_s06_prewindowed_inference_applies_same_commercial_overrides_as_training(monkeypatch):
+    raw_ppg, raw_acc = _raw_window(500)
+    ppg = np.stack([raw_ppg, raw_ppg], axis=0)
+    acc = np.stack([raw_acc, raw_acc], axis=0)
+    predicted_features = []
+
+    monkeypatch.setattr(
+        s06,
+        "extract_feature_pool_from_window",
+        lambda **_kwargs: ({"GREEN_CORR": -1.0}, {}),
+    )
+    monkeypatch.setattr(s06, "extract_acc_features", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        s06,
+        "extract_commercial_feature_overrides",
+        lambda *_args, **_kwargs: OrderedDict((("GREEN_CORR", 10.0),)),
+    )
+
+    def fake_predict(features, bundle):
+        predicted_features.extend(features)
+        return np.ones(len(features), dtype=int), np.full(len(features), 0.8)
+
+    monkeypatch.setattr(s06, "predict_label_windows", fake_predict)
+    result = s06._infer_prewindowed_sample(
+        {
+            "sample_name": "sample",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+            "window_indices": [],
+            "window_labels": [],
+            "fallback": False,
+        },
+        ppg,
+        acc,
+        window_sec=5,
+        stride_sec=1,
+        bundle={"feature_names": ["GREEN_CORR"], "feature_quantiles": None},
+        use_stage2_ir=False,
+        skip_initial_windows=0,
+    )
+
+    assert result["fallback"] is False
+    assert len(predicted_features) == 2
+    assert all(feature["GREEN_CORR"] == 10.0 for feature in predicted_features)
+
+
 def test_commercial_only_continuous_100hz_uses_raw_windows(monkeypatch):
     ppg, acc = _raw_window(1500)
     observed = []
@@ -314,3 +455,48 @@ def test_commercial_only_prewindowed_100hz_uses_raw_windows(monkeypatch):
         assert ppg_config == 0
         np.testing.assert_array_equal(raw_ppg, ppg[index])
         np.testing.assert_array_equal(raw_acc, acc[index])
+
+
+def test_regular_prewindowed_training_applies_exact_commercial_overrides(monkeypatch):
+    raw_ppg, raw_acc = _raw_window(500)
+    ppg = np.stack([raw_ppg, raw_ppg + 1000], axis=0)
+    acc = np.stack([raw_acc, raw_acc + 10], axis=0)
+    observed = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
+    monkeypatch.setattr(
+        s03,
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: ({"GREEN_CORR": -1.0}, {}, {}),
+    )
+
+    def fake_overrides(window_ppg, window_acc, frequency, ppg_config):
+        observed.append((window_ppg.copy(), window_acc.copy(), frequency, ppg_config))
+        return OrderedDict((("GREEN_CORR", 10.0),))
+
+    monkeypatch.setattr(s03, "extract_commercial_feature_overrides", fake_overrides)
+    rows = s03._extract_rows_for_sample(
+        {
+            "sample_name": "sample",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_len=500,
+        stride_len=100,
+        fs=100,
+        target_aware_stride=False,
+        stride_neg=100,
+        stride_pos=100,
+    )
+
+    assert len(rows) == 2
+    assert all(row["GREEN_CORR"] == 10.0 for row in rows)
+    assert len(observed) == 2
+    for index, (window_ppg, window_acc, frequency, ppg_config) in enumerate(observed):
+        assert frequency == 100
+        assert ppg_config == 0
+        np.testing.assert_array_equal(window_ppg, ppg[index])
+        np.testing.assert_array_equal(window_acc, acc[index])

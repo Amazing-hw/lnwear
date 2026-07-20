@@ -21,6 +21,46 @@ import s08_run_pipeline as s08
 import stage2_feature_catalog as catalog
 
 
+def _write_version_contract_test_bundle(path, version_marker):
+    bundle = {
+        "feature_names": ["GREEN_CORR"],
+        "fill_values": {"GREEN_CORR": 0.0},
+        "model": object(),
+        "threshold": 0.5,
+        "meta": {"fs_ppg": 25.0, "win_sec": 5.0, "step_sec": 1.0},
+    }
+    if version_marker is not None:
+        bundle["feature_pool_version"] = version_marker
+    joblib.dump(bundle, path / "model_bundle.pkl")
+
+
+@pytest.mark.parametrize("version_marker", [None, "stage2_interpretable_v9"])
+def test_feature_extractor_export_rejects_unversioned_or_stale_bundle_before_writes(
+    tmp_path, version_marker
+):
+    _write_version_contract_test_bundle(tmp_path, version_marker)
+
+    with pytest.raises(ValueError, match="feature_pool_version"):
+        s08.export_feature_extractor_script(str(tmp_path))
+
+    assert not (tmp_path / "deploy_feature_extractor.py").exists()
+    assert not (tmp_path / "deploy_selected_feature_formulas.json").exists()
+    assert not (tmp_path / "stage2_feature_catalog.json").exists()
+    assert not (tmp_path / "stage2_c_contract.json").exists()
+
+
+@pytest.mark.parametrize("version_marker", [None, "stage2_interpretable_v9"])
+def test_s06_deploy_export_rejects_unversioned_or_stale_bundle_before_writes(
+    tmp_path, version_marker
+):
+    _write_version_contract_test_bundle(tmp_path, version_marker)
+
+    with pytest.raises(ValueError, match="feature_pool_version"):
+        s06.export_deploy_artifacts(str(tmp_path))
+
+    assert not (tmp_path / "deploy_package").exists()
+
+
 def test_removed_high_order_shape_features_are_rejected_by_deploy_formulas():
     with pytest.raises(ValueError, match="unknown Stage2 model candidates"):
         s08.build_selected_feature_formulas(["AMBX_bp_skewness", "AMBX_bp_kurtosis"])
@@ -258,6 +298,7 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
 
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "clip_bounds": {"GREEN_AC_DC_RATIO": [0.0, 0.0]},
@@ -492,13 +533,16 @@ def test_standalone_extractor_accepts_raw_ppg_frequency_and_config(tmp_path):
     spec.loader.exec_module(module)
 
     raw = np.tile(np.arange(40, dtype=float), (500, 1))
+    raw[:, 3] += np.arange(500, dtype=float)
+    raw[:, 9] += 3.0 * np.arange(500, dtype=float)
     from_raw = module.extract_features_from_ppg(
         raw, frequency=100, ppg_config=1
     )
+    ir, ambient, g1, g2, g3 = module.get_channels_from_window(
+        raw[::4], ppg_config=1
+    )
     direct = module.extract_features(
-        np.zeros(125), np.ones(125),
-        np.full(125, 6.0), np.full(125, 7.0), np.full(125, 8.0),
-        fs=25, ppg_config=1,
+        ir, ambient, g1, g2, g3, fs=25, ppg_config=1,
     )
 
     assert from_raw == pytest.approx(direct)
@@ -523,6 +567,7 @@ def test_feature_script_and_model_json_are_sufficient_for_python_inference(tmp_p
     model.save_model(artifact_dir / "final_model.json")
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "clip_bounds": {},
@@ -593,6 +638,7 @@ def test_export_feature_extractor_script_embeds_bundle_threshold(tmp_path):
     ]
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "threshold": 0.37,
@@ -722,6 +768,7 @@ def test_export_feature_extractor_rejects_ir_features_in_stage2_bundle(tmp_path)
     ]
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "threshold": 0.37,
@@ -738,6 +785,7 @@ def test_deploy_feature_extractor_ignores_ir_for_stage2_features(tmp_path):
     selected = ["GREEN_AC_RMS", "AMBX_AC_RMS"]
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "threshold": 0.37,
@@ -796,6 +844,7 @@ def test_s08_deploy_feature_script_and_xgboost_metadata_share_bundle_source(tmp_
     )
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: float(i) for i, name in enumerate(selected)},
             "model": model,
@@ -842,6 +891,7 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
     )
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": bundle_features,
             "fill_values": {name: 0.0 for name in bundle_features},
             "model": model,
@@ -891,6 +941,7 @@ def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(t
 
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: float(i) for i, name in enumerate(selected)},
             "clip_bounds": {"GREEN_AC_RMS": [-1.0, 1.0]},
@@ -949,6 +1000,7 @@ def test_export_golden_vectors_and_validate_feature_order(tmp_path):
     )
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "clip_bounds": {},
@@ -996,6 +1048,7 @@ def test_deploy_extractor_supports_green_and_ambient_fft_features(tmp_path):
     ]
     joblib.dump(
         {
+            "feature_pool_version": catalog.FEATURE_POOL_VERSION,
             "feature_names": selected,
             "fill_values": {name: 0.0 for name in selected},
             "clip_bounds": {},

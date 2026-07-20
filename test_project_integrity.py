@@ -29,3 +29,19 @@ def test_active_optimization_plan_documents_manual_resume_command():
     assert "--feature_selection_mode manual" in plan
     assert "--manual_feature_file artifacts/manual_feature_selection.csv" in plan
     assert "--skip s01,s03,s04" in plan
+
+
+def test_active_docs_describe_two_file_python_deployment_without_scipy():
+    from pathlib import Path
+
+    readme = Path("README.md").read_text(encoding="utf-8")
+    plan = Path("SINGLE_WINDOW_98_FEATURE_OPTIMIZATION_PLAN.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        "部署最小组合为独立的 `deploy_feature_extractor.py` 和 XGBoost 模型 JSON"
+        in readme
+    )
+    assert "NumPy 和 XGBoost 属于 Python 运行环境依赖" in plan
+    assert "NumPy、SciPy" not in plan
