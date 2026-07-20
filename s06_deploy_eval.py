@@ -198,6 +198,23 @@ def assert_bundle_ok(bundle):
             raise ValueError(f"meta missing: {k}")
 
 
+def bundle_meta_log_summary(bundle):
+    """Return only concise deployment-relevant metadata for console logging."""
+    meta = bundle.get("meta") or {}
+    model_search = meta.get("model_search") or {}
+    hard_negative = meta.get("hard_negative_mining") or {}
+    return {
+        "feature_pool_version": bundle.get(
+            "feature_pool_version", meta.get("feature_pool_version")
+        ),
+        "feature_count": int(len(bundle.get("feature_names") or [])),
+        "window_sec": meta.get("win_sec"),
+        "stride_sec": meta.get("step_sec"),
+        "model_search_enabled": bool(model_search.get("enabled", False)),
+        "hard_negative_enabled": bool(hard_negative.get("enabled", False)),
+    }
+
+
 def validate_inference_window_contract(bundle, window_sec, stride_sec):
     """Reject inference windows that differ from the trained bundle contract."""
     meta = bundle.get("meta", {}) if isinstance(bundle, dict) else {}
@@ -2811,7 +2828,9 @@ def main(args=None):
     use_stage2_ir = resolve_use_stage2_ir(bundle, args.use_stage2_ir)
     print(f"feature_names: {len(bundle['feature_names'])} 个特征")
     print(f"threshold: {bundle['threshold']}")
-    print(f"meta: {bundle['meta']}")
+    print("meta summary: " + json.dumps(
+        bundle_meta_log_summary(bundle), ensure_ascii=False
+    ))
     print(f"use_stage2_ir: {use_stage2_ir}")
 
     # 参数优化

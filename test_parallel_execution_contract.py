@@ -3,6 +3,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 import s01_data_split as s01
@@ -39,6 +41,69 @@ def test_s04_parallelizes_fold_batches_but_avoids_tiny_pool_overhead(monkeypatch
     assert s04.resolve_n_workers(4, n_items=10) == 4
     assert s04.resolve_n_workers(4, n_items=4) == 1
     assert s04.resolve_n_workers(8, n_items=5) == 5
+
+
+def test_s04_parallel_fold_aggregation_is_independent_of_completion_order(monkeypatch):
+    monkeypatch.delenv("WL_FORCE_SERIAL", raising=False)
+    completion = {"reverse": False}
+
+    class FakeFuture:
+        def __init__(self, task_index, task):
+            self.task_index = task_index
+            self.task = task
+
+        def result(self):
+            seed, fold_id, n_folds = self.task[:3]
+            info = {
+                "seed": seed,
+                "fold": fold_id + 1,
+                "n_folds": n_folds,
+                "auc": 1.0,
+            }
+            values = [1e16, -1e16, 1.0]
+            fold_out = (
+                [(0, values[self.task_index], 1)]
+                if self.task_index < len(values)
+                else []
+            )
+            return info, fold_out
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs):
+            self.submitted = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def submit(self, _fn, task):
+            future = FakeFuture(self.submitted, task)
+            self.submitted += 1
+            return future
+
+    def fake_as_completed(futures):
+        ordered = list(futures)
+        return list(reversed(ordered)) if completion["reverse"] else ordered
+
+    monkeypatch.setattr(s04, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(s04, "as_completed", fake_as_completed)
+    frame = pd.DataFrame({
+        "sample_name": [f"sample_{idx}" for idx in range(10)],
+        "target": np.arange(10) % 2,
+        "feature_a": np.arange(10, dtype=float),
+    })
+
+    forward = s04.stability_selection(
+        frame, ["feature_a"], max_splits=5, n_workers=2, min_fold_auc=0.5
+    )
+    completion["reverse"] = True
+    reverse = s04.stability_selection(
+        frame, ["feature_a"], max_splits=5, n_workers=2, min_fold_auc=0.5
+    )
+
+    assert forward == reverse
 
 
 def test_s07_postprocess_workers_do_not_exceed_grid_size(monkeypatch):

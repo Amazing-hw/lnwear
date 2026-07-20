@@ -926,7 +926,9 @@ def stability_selection(df, feature_cols, max_splits=5, seeds=None, n_workers=No
     print(f"\n  稳定性选择: {n_folds_total} folds (seeds={len(seeds)} x splits={n_splits}), "
           f"workers={'mp' if use_mp else 1}")
 
-    fold_results = []
+    # Always aggregate in the deterministic task order.  Completion order may
+    # differ between process runs, and floating-point sums are not associative.
+    fold_results = [None] * len(tasks)
     if use_mp:
         data_pickle = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
         pool_kwargs = {
@@ -944,6 +946,7 @@ def stability_selection(df, feature_cols, max_splits=5, seeds=None, n_workers=No
             total = len(futures)
             print(f"  (parallel, {total} folds)")
             for fut in as_completed(futures):
+                task_index = futures[fut]
                 try:
                     info, fold_out = fut.result()
                 except Exception as e:
@@ -957,7 +960,7 @@ def stability_selection(df, feature_cols, max_splits=5, seeds=None, n_workers=No
                 tag = "KEPT" if fold_out else "DROP"
                 print(f"  [{done_count}/{total}] seed={info['seed']} fold={info['fold']}/{info['n_folds']} "
                       f"{auc_str} {tag}")
-                fold_results.append((info, fold_out))
+                fold_results[task_index] = (info, fold_out)
     else:
         for i, t in enumerate(tasks):
             seed, fold_id, n_folds = t[0], t[1], t[2]
@@ -966,7 +969,7 @@ def stability_selection(df, feature_cols, max_splits=5, seeds=None, n_workers=No
             auc_str = f"auc={info['auc']:.3f}" if info['auc'] else "auc=?"
             tag = "KEPT" if fold_out else "DROP"
             print(f"{auc_str} {tag}")
-            fold_results.append((info, fold_out))
+            fold_results[i] = (info, fold_out)
 
     # 聚合结果
     selected_count = defaultdict(int)

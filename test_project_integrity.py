@@ -3,15 +3,28 @@ def test_model_fingerprint_hashes_complete_feature_pool_file(tmp_path):
 
     splits_path = tmp_path / "splits.json"
     feature_path = tmp_path / "feature_pool_train.csv"
+    valid_feature_path = tmp_path / "feature_pool_valid.csv"
     splits_path.write_text('{"train":[]}', encoding="utf-8")
     feature_path.write_bytes(b"a" * (4 * 1024 * 1024) + b"x")
+    valid_feature_path.write_bytes(b"valid-x")
 
-    before = s05.build_fingerprint(tmp_path, feature_path, splits_path)
+    before = s05.build_fingerprint(
+        tmp_path, feature_path, splits_path, valid_feature_path
+    )
     feature_path.write_bytes(b"a" * (4 * 1024 * 1024) + b"y")
-    after = s05.build_fingerprint(tmp_path, feature_path, splits_path)
+    after = s05.build_fingerprint(
+        tmp_path, feature_path, splits_path, valid_feature_path
+    )
 
     assert before["feature_pool_train_sha256"] != after["feature_pool_train_sha256"]
+    assert before["feature_pool_valid_sha256"] == after["feature_pool_valid_sha256"]
     assert before["splits_sha256"] == after["splits_sha256"]
+
+    valid_feature_path.write_bytes(b"valid-y")
+    valid_changed = s05.build_fingerprint(
+        tmp_path, feature_path, splits_path, valid_feature_path
+    )
+    assert after["feature_pool_valid_sha256"] != valid_changed["feature_pool_valid_sha256"]
 
 
 def test_active_optimization_plan_documents_manual_resume_command():

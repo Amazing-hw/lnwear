@@ -2056,7 +2056,10 @@ def main():
     p.add_argument("--model_search_size_cost", type=float, default=0.1,
                    help="s05 model-size penalty in model-search score")
     p.add_argument("--model_search_accuracy_tolerance", type=float, default=0.0,
-                   help="s05 accuracy gap allowed when preferring a smaller model; default 0.0 means accuracy strictly wins under the node budget")
+                   help=(
+                       "s05 mean-CV accuracy gap allowed when preferring better "
+                       "cross-seed repeat stability; default 0.0 keeps strict mean-accuracy priority"
+                   ))
     p.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                    help="fraction of valid calibration pool used for model search")
     p.add_argument("--model_search_max_candidates", type=int, default=180,

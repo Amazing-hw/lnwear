@@ -3630,6 +3630,9 @@ def extract_commercial_feature_overrides(ppg_window, acc_window, frequency, ppg_
     Returns an OrderedDict of the 8 ``COMMERCIAL_STAGE2_FIELDS`` computed by
     ``commercial_liveness_features.main``, overriding any Stage2 candidates that
     share the same field names.
+
+    Inputs are passed as float32 to preserve full precision; the port internally
+    applies F32() casts and ACC/4096 scaling exactly as the C reference does.
     """
     ppg = np.asarray(ppg_window)
     if frequency not in (25, 100):
@@ -3650,17 +3653,17 @@ def extract_commercial_feature_overrides(ppg_window, acc_window, frequency, ppg_
             f"at {frequency} Hz, got {acc.shape[0]}"
         )
 
-    strided_ppg = np.nan_to_num(ppg[::stride], nan=0.0, posinf=0.0, neginf=0.0)
-    strided_acc = np.nan_to_num(acc[::stride], nan=0.0, posinf=0.0, neginf=0.0).astype(np.int16)
+    strided_ppg = np.nan_to_num(ppg[::stride], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    strided_acc = np.nan_to_num(acc[::stride], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
     _, ambient, g1, g2, g3 = get_channels_from_window(strided_ppg, ppg_config)
-    green = ((np.asarray(g1, dtype=np.float64)
-              + np.asarray(g2, dtype=np.float64)
-              + np.asarray(g3, dtype=np.float64)) / 3.0).astype(np.int32)
+    green = (np.asarray(g1, dtype=np.float64)
+             + np.asarray(g2, dtype=np.float64)
+             + np.asarray(g3, dtype=np.float64)).astype(np.float32) / np.float32(3.0)
 
-    port_ppg = np.zeros((125, 4), dtype=np.int32)
+    port_ppg = np.zeros((125, 4), dtype=np.float32)
     port_ppg[:, 0] = green
-    port_ppg[:, 3] = ambient.astype(np.int32)
+    port_ppg[:, 3] = ambient.astype(np.float32)
 
     result = _commercial_port_main(port_ppg, strided_acc)
 

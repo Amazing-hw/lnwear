@@ -21,8 +21,8 @@ EXPECTED_STAGE2_FIELDS = (
 
 
 def _raw_window(length):
-    idx = np.arange(length, dtype=np.int32)
-    ppg = np.zeros((length, 6), dtype=np.int32)
+    idx = np.arange(length, dtype=np.float32)
+    ppg = np.zeros((length, 6), dtype=np.float32)
     ppg[:, 0] = 4_000_000 + idx
     ppg[:, 1] = 100_000 + 2 * idx
     ppg[:, 3] = 2_000_000 + idx
@@ -32,13 +32,13 @@ def _raw_window(length):
         100 + idx,
         -200 + 2 * idx,
         4096 + 3 * idx,
-    ]).astype(np.int16)
+    ]).astype(np.float32)
     return ppg, acc
 
 
 def test_exact_port_zero_inputs_return_eight_float32_zeros():
-    ppg = np.zeros((125, 4), dtype=np.int32)
-    acc = np.zeros((125, 3), dtype=np.int16)
+    ppg = np.zeros((125, 4), dtype=np.float32)
+    acc = np.zeros((125, 3), dtype=np.float32)
 
     actual = commercial.main(ppg, acc)
 
@@ -58,10 +58,10 @@ def test_peak_valley_port_handles_the_first_interior_peak():
 
 
 def test_exact_port_dc_uses_absolute_raw_mean():
-    ppg = np.zeros((125, 4), dtype=np.int32)
+    ppg = np.zeros((125, 4), dtype=np.float32)
     ppg[:, 0] = -2_000_000
     ppg[:, 3] = 100_000
-    acc = np.zeros((125, 3), dtype=np.int16)
+    acc = np.zeros((125, 3), dtype=np.float32)
 
     actual = commercial.main(ppg, acc)
 
@@ -69,7 +69,7 @@ def test_exact_port_dc_uses_absolute_raw_mean():
     assert actual[5] == np.float32(100_000)
 
 
-def test_commercial_adapter_uses_raw_stride_and_truncated_three_zone_mean(monkeypatch):
+def test_commercial_adapter_uses_raw_stride_and_float32_precision(monkeypatch):
     ppg, acc = _raw_window(500)
     captured = {}
 
@@ -90,17 +90,17 @@ def test_commercial_adapter_uses_raw_stride_and_truncated_three_zone_mean(monkey
     expected_ppg = ppg[::4]
     expected_green = (
         (expected_ppg[:, 3] + expected_ppg[:, 4] + expected_ppg[:, 5]) / 3.0
-    ).astype(np.int32)
+    )
     assert captured["ppg"].shape == (125, 4)
-    assert captured["ppg"].dtype == np.int32
-    np.testing.assert_array_equal(captured["ppg"][:, 0], expected_green)
+    assert captured["ppg"].dtype == np.float32
+    np.testing.assert_array_equal(captured["ppg"][:, 0], expected_green.astype(np.float32))
     np.testing.assert_array_equal(
-        captured["ppg"][:, 3], expected_ppg[:, 1].astype(np.int32)
+        captured["ppg"][:, 3], expected_ppg[:, 1].astype(np.float32)
     )
     np.testing.assert_array_equal(captured["ppg"][:, 1:3], 0)
     assert captured["acc"].shape == (125, 3)
-    assert captured["acc"].dtype == np.int16
-    np.testing.assert_array_equal(captured["acc"], acc[::4])
+    assert captured["acc"].dtype == np.float32
+    np.testing.assert_array_equal(captured["acc"], acc[::4].astype(np.float32))
     assert isinstance(actual, OrderedDict)
     assert tuple(actual) == EXPECTED_STAGE2_FIELDS
     assert list(actual.values()) == pytest.approx(np.arange(8, dtype=float))
@@ -118,14 +118,14 @@ def test_commercial_adapter_native_25hz_does_not_resample(monkeypatch):
     monkeypatch.setattr(s03, "_commercial_port_main", fake_main)
     s03.extract_commercial_feature_overrides(ppg, acc, frequency=25, ppg_config=0)
 
-    expected_green = ((ppg[:, 3] + ppg[:, 4] + ppg[:, 5]) / 3.0).astype(np.int32)
-    np.testing.assert_array_equal(captured["ppg"][:, 0], expected_green)
-    np.testing.assert_array_equal(captured["acc"], acc)
+    expected_green = ((ppg[:, 3] + ppg[:, 4] + ppg[:, 5]) / 3.0)
+    np.testing.assert_array_equal(captured["ppg"][:, 0], expected_green.astype(np.float32))
+    np.testing.assert_array_equal(captured["acc"], acc.astype(np.float32))
 
 
-def test_commercial_adapter_truncates_after_combining_fractional_green_zones(monkeypatch):
-    ppg = np.zeros((125, 12), dtype=np.int32)
-    acc = np.zeros((125, 3), dtype=np.int16)
+def test_commercial_adapter_preserves_fractional_green_zones(monkeypatch):
+    ppg = np.zeros((125, 12), dtype=np.float32)
+    acc = np.zeros((125, 3), dtype=np.float32)
     ppg[:, 1] = 100
     ppg[:, 3] = 0
     ppg[:, 9] = 1
@@ -142,8 +142,11 @@ def test_commercial_adapter_truncates_after_combining_fractional_green_zones(mon
     monkeypatch.setattr(s03, "_commercial_port_main", fake_main)
     s03.extract_commercial_feature_overrides(ppg, acc, frequency=25, ppg_config=1)
 
-    # Physical zones are 0.5, 0.5, and 2.5. C receives int32(mean(...)) == 1.
-    np.testing.assert_array_equal(captured["ppg"][:, 0], np.ones(125, dtype=np.int32))
+    # Physical zones are 0.5, 0.5, and 2.5.  With float32 precision the mean is
+    # (0.5+0.5+2.5)/3 = 7/6 ≈ 1.1666666, not truncated to 1.
+    np.testing.assert_array_almost_equal(
+        captured["ppg"][:, 0], np.full(125, np.float32(7.0 / 6.0)), decimal=4
+    )
 
 
 @pytest.mark.parametrize(

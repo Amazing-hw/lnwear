@@ -21,6 +21,34 @@ import s08_run_pipeline as s08
 import stage2_feature_catalog as catalog
 
 
+def test_deploy_console_meta_summary_excludes_nested_training_details():
+    bundle = {
+        "feature_pool_version": catalog.FEATURE_POOL_VERSION,
+        "feature_names": ["GREEN_CORR", "mode"],
+        "threshold": 0.47,
+        "meta": {
+            "win_sec": 5.0,
+            "step_sec": 1.0,
+            "model_search": {"enabled": True, "top_candidates": list(range(100))},
+            "hard_negative_mining": {"enabled": True, "report": "large payload"},
+            "feature_selection": {"ranking": list(range(100))},
+        },
+    }
+
+    summary = s06.bundle_meta_log_summary(bundle)
+
+    assert summary == {
+        "feature_pool_version": catalog.FEATURE_POOL_VERSION,
+        "feature_count": 2,
+        "window_sec": 5.0,
+        "stride_sec": 1.0,
+        "model_search_enabled": True,
+        "hard_negative_enabled": True,
+    }
+    assert "top_candidates" not in repr(summary)
+    assert "feature_selection" not in repr(summary)
+
+
 def _write_version_contract_test_bundle(path, version_marker):
     bundle = {
         "feature_names": ["GREEN_CORR"],

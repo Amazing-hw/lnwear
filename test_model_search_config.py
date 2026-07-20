@@ -1835,6 +1835,55 @@ def test_cv_model_search_prefers_better_candidate_and_filters_oversized():
     assert chosen["chosen_reason"] == "best_cv_accuracy"
 
 
+def test_cv_summary_reports_repeat_level_stability():
+    fold_metrics = [
+        {"accuracy": 0.90, "fp_rate": 0.04, "precision": 0.90, "recall": 0.92},
+        {"accuracy": 0.94, "fp_rate": 0.02, "precision": 0.94, "recall": 0.93},
+        {"accuracy": 0.84, "fp_rate": 0.08, "precision": 0.86, "recall": 0.88},
+        {"accuracy": 0.88, "fp_rate": 0.06, "precision": 0.89, "recall": 0.87},
+    ]
+
+    summary = s05.summarize_cv_metrics(fold_metrics, n_folds_per_repeat=2)
+
+    assert summary["cv_repeats_completed"] == 2
+    assert summary["min_repeat_cv_accuracy"] == pytest.approx(0.86)
+    assert summary["max_repeat_cv_accuracy"] == pytest.approx(0.92)
+    assert summary["std_repeat_cv_accuracy"] == pytest.approx(0.03)
+    assert summary["max_repeat_cv_fp_rate"] == pytest.approx(0.07)
+
+
+def test_cv_model_search_uses_worst_repeat_inside_accuracy_tolerance():
+    records = [
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.9820,
+            "std_cv_accuracy": 0.010,
+            "min_repeat_cv_accuracy": 0.970,
+            "std_repeat_cv_accuracy": 0.012,
+            "mean_cv_fp_rate": 0.01,
+            "final_total_nodes": 180,
+            "is_default_params": False,
+            "rank_input_order": 1,
+        },
+        {
+            "eligible": True,
+            "mean_cv_accuracy": 0.9815,
+            "std_cv_accuracy": 0.006,
+            "min_repeat_cv_accuracy": 0.980,
+            "std_repeat_cv_accuracy": 0.002,
+            "mean_cv_fp_rate": 0.01,
+            "final_total_nodes": 200,
+            "is_default_params": False,
+            "rank_input_order": 2,
+        },
+    ]
+
+    chosen = s05.choose_cv_model_search_record(records, accuracy_tolerance=0.001)
+
+    assert chosen["rank_input_order"] == 2
+    assert chosen["chosen_reason"] == "within_accuracy_tolerance_most_repeat_stable"
+
+
 def test_model_search_result_rows_include_accuracy_first_fields():
     rows = s05.build_model_search_result_rows([
         {

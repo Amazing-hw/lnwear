@@ -1525,15 +1525,54 @@ def _std_or_none(values):
     return float(np.std(values))
 
 
-def summarize_cv_metrics(fold_metrics):
-    return {
+def summarize_cv_metrics(fold_metrics, n_folds_per_repeat=None):
+    """Aggregate fold metrics and expose fixed-seed repeat robustness.
+
+    ``build_repeated_group_cv_splits`` appends all folds from one repeat before
+    the next repeat.  Keeping the repeat boundary lets model selection
+    distinguish a consistently good candidate from one whose overall mean is
+    driven by a single fortunate split.
+    """
+    summary = {
         "mean_cv_accuracy": _mean_or_none([m.get("accuracy") for m in fold_metrics]),
         "std_cv_accuracy": _std_or_none([m.get("accuracy") for m in fold_metrics]),
         "mean_cv_fp_rate": _mean_or_none([m.get("fp_rate") for m in fold_metrics]),
         "mean_cv_precision": _mean_or_none([m.get("precision") for m in fold_metrics]),
         "mean_cv_recall": _mean_or_none([m.get("recall") for m in fold_metrics]),
         "cv_folds_completed": int(len(fold_metrics)),
+        "cv_repeats_completed": 0,
+        "min_repeat_cv_accuracy": None,
+        "max_repeat_cv_accuracy": None,
+        "std_repeat_cv_accuracy": None,
+        "max_repeat_cv_fp_rate": None,
     }
+    try:
+        folds_per_repeat = int(n_folds_per_repeat or 0)
+    except (TypeError, ValueError):
+        folds_per_repeat = 0
+    if folds_per_repeat <= 0 or not fold_metrics:
+        return summary
+
+    complete_repeats = len(fold_metrics) // folds_per_repeat
+    repeat_accuracy = []
+    repeat_fp_rate = []
+    for repeat_idx in range(complete_repeats):
+        start = repeat_idx * folds_per_repeat
+        repeat_metrics = fold_metrics[start:start + folds_per_repeat]
+        accuracy = _mean_or_none([m.get("accuracy") for m in repeat_metrics])
+        fp_rate = _mean_or_none([m.get("fp_rate") for m in repeat_metrics])
+        if accuracy is not None:
+            repeat_accuracy.append(accuracy)
+        if fp_rate is not None:
+            repeat_fp_rate.append(fp_rate)
+    summary["cv_repeats_completed"] = int(complete_repeats)
+    if repeat_accuracy:
+        summary["min_repeat_cv_accuracy"] = float(min(repeat_accuracy))
+        summary["max_repeat_cv_accuracy"] = float(max(repeat_accuracy))
+        summary["std_repeat_cv_accuracy"] = float(np.std(repeat_accuracy))
+    if repeat_fp_rate:
+        summary["max_repeat_cv_fp_rate"] = float(max(repeat_fp_rate))
+    return summary
 
 
 def choose_cv_model_search_record(records, accuracy_tolerance=0.0):
@@ -1569,6 +1608,11 @@ def choose_cv_model_search_record(records, accuracy_tolerance=0.0):
     chosen = min(
         candidates,
         key=lambda r: (
+            -float(r.get("min_repeat_cv_accuracy")
+                   if r.get("min_repeat_cv_accuracy") is not None
+                   else r.get("mean_cv_accuracy") or 0.0),
+            float(r.get("std_repeat_cv_accuracy")
+                  if r.get("std_repeat_cv_accuracy") is not None else 1.0),
             float(r.get("std_cv_accuracy") if r.get("std_cv_accuracy") is not None else 1.0),
             float(r.get("mean_cv_fp_rate") if r.get("mean_cv_fp_rate") is not None else 1.0),
             int(r.get("final_total_nodes", r.get("total_nodes", 0))),
@@ -1580,7 +1624,11 @@ def choose_cv_model_search_record(records, accuracy_tolerance=0.0):
     default_acc = float(default_record.get("mean_cv_accuracy") or 0.0) if default_record else float("-inf")
     for r in records:
         r["beats_default_params"] = bool(float(r.get("mean_cv_accuracy") or 0.0) > default_acc + tolerance)
-    chosen["chosen_reason"] = "best_cv_accuracy"
+    chosen["chosen_reason"] = (
+        "within_accuracy_tolerance_most_repeat_stable"
+        if float(chosen.get("mean_cv_accuracy") or 0.0) < best_accuracy
+        else "best_cv_accuracy"
+    )
     return chosen
 
 
@@ -1605,6 +1653,11 @@ def build_model_search_result_rows(model_search_records):
             "mean_cv_precision": _json_safe_float(r.get("mean_cv_precision", 0.0)),
             "mean_cv_recall": _json_safe_float(r.get("mean_cv_recall", 0.0)),
             "cv_folds_completed": int(r.get("cv_folds_completed", 0)),
+            "cv_repeats_completed": int(r.get("cv_repeats_completed", 0)),
+            "min_repeat_cv_accuracy": _json_safe_float(r.get("min_repeat_cv_accuracy")),
+            "max_repeat_cv_accuracy": _json_safe_float(r.get("max_repeat_cv_accuracy")),
+            "std_repeat_cv_accuracy": _json_safe_float(r.get("std_repeat_cv_accuracy")),
+            "max_repeat_cv_fp_rate": _json_safe_float(r.get("max_repeat_cv_fp_rate")),
             "is_default_params": bool(r.get("is_default_params", False)),
             "beats_default_params": bool(r.get("beats_default_params", False)),
             "chosen_reason": str(r.get("chosen_reason", "")),
@@ -1677,10 +1730,29 @@ def summarize_model_search_stability(results_df, accuracy_close_margin=0.002):
     if "feature_count" in close_df.columns:
         feature_counts = sorted({int(v) for v in pd.to_numeric(close_df["feature_count"], errors="coerce").dropna()})
 
+    best_min_repeat_accuracy = None
+    best_repeat_accuracy_range = None
+    if "min_repeat_cv_accuracy" in df.columns:
+        value = pd.to_numeric(
+            pd.Series([df.loc[0, "min_repeat_cv_accuracy"]]), errors="coerce"
+        ).iloc[0]
+        if pd.notna(value):
+            best_min_repeat_accuracy = float(value)
+    if "max_repeat_cv_accuracy" in df.columns and best_min_repeat_accuracy is not None:
+        value = pd.to_numeric(
+            pd.Series([df.loc[0, "max_repeat_cv_accuracy"]]), errors="coerce"
+        ).iloc[0]
+        if pd.notna(value):
+            best_repeat_accuracy_range = float(value) - best_min_repeat_accuracy
+
     is_unstable = bool(
         len(close_df) > 1
         or (top_margin is not None and top_margin <= float(accuracy_close_margin))
         or (default_rank is not None and default_rank <= 3)
+        or (
+            best_repeat_accuracy_range is not None
+            and best_repeat_accuracy_range > float(accuracy_close_margin)
+        )
     )
     return {
         "available": True,
@@ -1691,6 +1763,8 @@ def summarize_model_search_stability(results_df, accuracy_close_margin=0.002):
         "close_top_candidate_count": int(len(close_df)),
         "close_top_feature_counts": feature_counts,
         "default_params_rank": default_rank,
+        "best_min_repeat_cv_accuracy": best_min_repeat_accuracy,
+        "best_repeat_accuracy_range": best_repeat_accuracy_range,
         "is_unstable": is_unstable,
     }
 
@@ -1720,9 +1794,14 @@ def _json_safe_model_search_record(record):
         "mean_cv_fp_rate",
         "mean_cv_precision",
         "mean_cv_recall",
+        "min_repeat_cv_accuracy",
+        "max_repeat_cv_accuracy",
+        "std_repeat_cv_accuracy",
+        "max_repeat_cv_fp_rate",
     ]:
         out[key] = _json_safe_float(out.get(key))
     out["cv_folds_completed"] = int(out.get("cv_folds_completed", 0))
+    out["cv_repeats_completed"] = int(out.get("cv_repeats_completed", 0))
     out["is_default_params"] = bool(out.get("is_default_params", False))
     out["beats_default_params"] = bool(out.get("beats_default_params", False))
     out["chosen_reason"] = str(out.get("chosen_reason", ""))
@@ -1778,7 +1857,10 @@ def score_fixed_params_with_train_cv(args, X_train, y_train, groups, params,
             X_train[valid_idx],
             y_train[valid_idx],
         ))
-    cv_summary = summarize_cv_metrics(fold_metrics)
+    cv_summary = summarize_cv_metrics(
+        fold_metrics,
+        n_folds_per_repeat=cv_meta.get("n_splits"),
+    )
     if total_nodes is None:
         final_model = train_xgb_with_params(params, X_train, y_train, sample_weight=sample_weight)
         total_nodes = count_xgb_nodes(final_model)
@@ -2146,7 +2228,10 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
                 f"{len(fold_metrics_map)}/{fold_count} folds"
             )
         fold_metrics = [fold_metrics_map[fold_idx] for fold_idx in range(fold_count)]
-        cv_summary = summarize_cv_metrics(fold_metrics)
+        cv_summary = summarize_cv_metrics(
+            fold_metrics,
+            n_folds_per_repeat=cv_meta.get("n_splits"),
+        )
         final_total_nodes = final_nodes_by_candidate[candidate_idx]
         mean_accuracy = float(cv_summary.get("mean_cv_accuracy") or 0.0)
         mean_fp_rate = float(cv_summary.get("mean_cv_fp_rate") or 0.0)
@@ -2212,6 +2297,11 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
     cv_records.sort(key=lambda r: (
         not r["eligible"],
         -float(r.get("mean_cv_accuracy") or 0.0),
+        -float(r.get("min_repeat_cv_accuracy")
+               if r.get("min_repeat_cv_accuracy") is not None
+               else r.get("mean_cv_accuracy") or 0.0),
+        float(r.get("std_repeat_cv_accuracy")
+              if r.get("std_repeat_cv_accuracy") is not None else 1.0),
         float(r.get("std_cv_accuracy") if r.get("std_cv_accuracy") is not None else 1.0),
         float(r.get("mean_cv_fp_rate") if r.get("mean_cv_fp_rate") is not None else 1.0),
         int(r.get("final_total_nodes", r.get("total_nodes", 0))),
@@ -2233,7 +2323,10 @@ def _search_xgb_hyperparameters_staged_group_cv(args, X_train, y_train, groups=N
         "enabled": True,
         "strategy": "staged_group_cv",
         "selection_data": "train_group_cv",
-        "selection_policy": "mean_cv_accuracy_std_fp_nodes",
+        "selection_policy": (
+            "mean_cv_accuracy_then_min_repeat_accuracy_"
+            "repeat_std_fold_std_fp_nodes"
+        ),
         "max_model_nodes": int(args.max_model_nodes),
         "fp_cost": float(args.model_search_fp_cost),
         "size_cost": float(args.model_search_size_cost),
@@ -2672,8 +2765,9 @@ def compute_feature_quantiles(df_train, features, q_low=0.05, q_high=0.95):
     return out
 
 
-def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
-    """收集 provenance：版本号、数据 hash、git sha、训练时间。"""
+def build_fingerprint(artifact_dir, feature_pool_path, splits_path,
+                      feature_pool_valid_path=None):
+    """收集 provenance：环境、完整 train/valid 数据 hash、split 和 git sha。"""
     import hashlib
     import time
     import platform
@@ -2706,7 +2800,7 @@ def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
 
     def sha256_file(path):
         """Stream the complete file so provenance also detects tail changes."""
-        if not os.path.exists(path):
+        if not path or not os.path.exists(path):
             return None
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -2716,6 +2810,7 @@ def build_fingerprint(artifact_dir, feature_pool_path, splits_path):
 
     info["splits_sha256"] = sha256_file(splits_path)
     info["feature_pool_train_sha256"] = sha256_file(feature_pool_path)
+    info["feature_pool_valid_sha256"] = sha256_file(feature_pool_valid_path)
 
     # git sha（如果可用）
     try:
@@ -3059,7 +3154,11 @@ def main(args=None):
     parser.add_argument("--model_search_size_cost", type=float, default=0.1,
                         help="model-size penalty in model-search score")
     parser.add_argument("--model_search_accuracy_tolerance", type=float, default=0.0,
-                        help="accuracy gap allowed when preferring a smaller model in --model_search; default 0.0 means accuracy strictly wins under the node budget")
+                        help=(
+                            "mean-CV accuracy gap allowed when preferring a model with "
+                            "better worst-repeat stability; default 0.0 means mean accuracy "
+                            "strictly wins under the node budget"
+                        ))
     parser.add_argument("--model_search_valid_fraction", type=float, default=0.5,
                         help="fraction of the valid calibration pool reserved for single_split model-search selection")
     parser.add_argument("--model_search_max_candidates", type=int, default=360,
@@ -3742,7 +3841,10 @@ def main(args=None):
     raw_model.save_model(model_path)
 
     fingerprint = build_fingerprint(
-        args.artifact_dir, feature_pool_train_path, splits_path
+        args.artifact_dir,
+        feature_pool_train_path,
+        splits_path,
+        feature_pool_valid_path,
     )
 
     model_search_results_path = None
@@ -3759,11 +3861,13 @@ def main(args=None):
                 by=[
                     "eligible",
                     "mean_cv_accuracy",
+                    "min_repeat_cv_accuracy",
+                    "std_repeat_cv_accuracy",
                     "std_cv_accuracy",
                     "mean_cv_fp_rate",
                     "final_total_nodes",
                 ],
-                ascending=[False, False, True, True, True],
+                ascending=[False, False, False, True, True, True, True],
             )
         else:
             results_df = results_df.sort_values(

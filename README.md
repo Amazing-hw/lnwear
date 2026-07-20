@@ -209,8 +209,15 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --comm
   `fast` 为 60/6，`thorough` 保持 360/48。显式 CLI 参数优先于档位默认值。
 - 默认使用 3 折、2 次重复的 grouped CV；人工/direct `balanced` 加上最终重训和
   hard-negative 流程时，最多约 141 次 XGBoost 拟合。
+- 两次 repeat 使用固定 seed（默认 42、43）。结果除总体 fold 均值/标准差外，还记录
+  `min_repeat_cv_accuracy`、`std_repeat_cv_accuracy` 和 `max_repeat_cv_fp_rate`；平均准确率进入
+  `--model_search_accuracy_tolerance` 容差后，优先选择最差 repeat 更好、跨 seed 波动更小的候选。
+  默认容差为 `0.0`，因此仍是平均准确率严格优先；若更看重商用稳定性，可显式设置
+  `--model_search_accuracy_tolerance 0.002`，允许在平均准确率相差不超过 0.2 个百分点时选择更稳的模型。
 - hard-negative 候选只使用 train OOF 误报挖掘；只有 valid 指标满足接受条件才替换参考模型。
 - test 只用于冻结配置后的只读最终评估，不参与特征、阈值或超参数选择。
+
+相同输入、相同人工特征 CSV、相同依赖环境和相同参数下，重复训练应得到相同结果；搜参范围是否充分影响可达到的最优准确率，但不应造成随机漂移。默认数据划分、模型搜索和校准种子均为 42，s04 并行 fold 也按固定任务顺序归并。若重复运行结果不同，先比较两次 `final_model_config.json` 中的 `fingerprint`（特别是 `splits_sha256`、`feature_pool_train_sha256`、`feature_pool_valid_sha256`）、`feature_selection`、`xgboost_params`、`window_model_threshold` 和 `valid_best_threshold_metrics`。可临时加 `--no-model_search_cache` 做一次无缓存对照；正确缓存不应改变结果。
 
 如需无人值守基线：
 
