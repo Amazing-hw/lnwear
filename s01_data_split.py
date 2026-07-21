@@ -233,6 +233,7 @@ def _scan_one_h5(h5_file):
                     _record_filtered(filtered, h5_file, sample_name, reason)
                     continue
 
+                shape = grp["ppg"].shape
                 samples.append({
                     "sample_name": sample_name,
                     "h5_file": h5_file,

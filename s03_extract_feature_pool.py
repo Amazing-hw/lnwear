@@ -270,29 +270,21 @@ _REDUNDANT_FEATURES = {
 # =========================================================
 
 def normalize_ppg_array(arr):
-    """Normalize H5 PPG arrays whose last axis is points to (T, C) or (N_win, T_win, C)."""
+    """Normalize H5 PPG arrays to (T, C) or (N_win, T_win, C) channel-last layout."""
     x = np.asarray(arr)
     if x.ndim == 2:
-        if x.shape[0] != 40:
-            raise ValueError(f"expected PPG shape (C,T) with C=40, got {x.shape}")
         return x.T
     if x.ndim == 3:
-        if x.shape[1] != 40:
-            raise ValueError(f"expected pre-windowed PPG shape (N,C,T) with C=40, got {x.shape}")
         return np.transpose(x, (0, 2, 1))
     raise ValueError(f"unsupported PPG ndim={x.ndim}, shape={x.shape}")
 
 
 def normalize_acc_array(arr):
-    """Normalize H5 ACC arrays whose last axis is points to (T, C) or (N_win, T_win, C)."""
+    """Normalize H5 ACC arrays to (T, C) or (N_win, T_win, C) channel-last layout."""
     x = np.asarray(arr)
     if x.ndim == 2:
-        if x.shape[0] > 6:
-            raise ValueError(f"expected ACC shape (C,T), got {x.shape}")
         return x.T
     if x.ndim == 3:
-        if x.shape[1] > 6:
-            raise ValueError(f"expected pre-windowed ACC shape (N,C,T), got {x.shape}")
         return np.transpose(x, (0, 2, 1))
     raise ValueError(f"unsupported ACC ndim={x.ndim}, shape={x.shape}")
 
