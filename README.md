@@ -57,7 +57,7 @@ H5 数据
 | 1 | 6 通道 | `g1=(ch3+ch9)/2`，`g2=(ch4+ch10)/2`，`g3=(ch5+ch11)/2` |
 | 2 | 9 通道 | `g1=(ch6+ch9+ch12)/3`，`g2=(ch7+ch10+ch13)/3`，`g3=(ch8+ch11+ch14)/3` |
 
-读取并按窗口编号排序后，每条数据固定删除前三个和后三个窗口。窗口不足七个时，s03 会以 `no_windows_after_edge_trim` 记录并跳过该样本，同时输出原窗口数和跳过总数；这不是致命错误。H5 读取损坏、无法识别任何 PPG 窗口或特征计算失败仍会在处理完其他样本后汇总报错。元数据缺失、取值非法或通道数不足的记录会被跳过，并输出统计与原因。
+读取并按窗口编号稳定排序后，所有合法窗口都会进入特征提取、训练和评估，不再自动裁剪首尾窗口，也没有额外的窗口跳过参数。H5 读取损坏、无法识别任何 PPG 窗口或特征计算失败仍会在处理完其他样本后汇总报错。元数据缺失、取值非法或通道数不足的记录会被跳过，并输出统计与原因。修改窗口策略后必须从 s03 开始重新生成特征、模型和部署产物，禁止混用旧缓存。
 
 ## 3. 三光区绿光处理
 
@@ -303,6 +303,26 @@ python s07_postprocess_optimize.py \
 - `deploy_cookbook.json`：通道映射、预处理、特征和 XGBoost 推理配方。
 
 部署最小组合为独立的 `deploy_feature_extractor.py` 和 XGBoost 模型 JSON。特征脚本已内嵌特征顺序、fill/clip 和窗口阈值；其他模型元数据仅用于审计和非 Python 端移植。部署判决不需要任何 IR 阈值配置文件。
+
+Python 端应把一个原始模型窗口直接交给脚本；25 Hz 的 5 秒窗口为 125 点，
+100 Hz 为 500 点。入口会按 `frequency` 执行固定四选一降采样，按 `ppg_config`
+生成三个固定光区，并对原商用精确移植字段保留原始通道布局与 float32 计算顺序：
+
+```python
+feature_vector = deploy_feature_extractor.extract_features_from_ppg(
+    ppg_window,          # (T, 40)
+    acc=acc_window,      # (T, 3)
+    frequency=100,       # 25 或 100
+    ppg_config=1,        # 0、1 或 2
+)
+probability = model.predict_proba(
+    np.asarray([feature_vector], dtype=float)
+)[0, 1]
+```
+
+返回向量已经按模型 `FEATURE_ORDER` 完成缺失值填充和训练边界裁剪。若要检查裁剪前的
+所选特征，可调用 `extract_raw_feature_dict_from_ppg(...)`。这两个接口都把输入视为一个
+模型窗口；整条连续记录应由调用方按训练配置（默认 5 秒窗口、1 秒步长）切窗后逐窗调用。
 
 ## 10. 验证
 

@@ -8,12 +8,13 @@ import s04_feature_selection as s04
 import s06_deploy_eval as s06
 
 
-def test_trim_ordered_windows_removes_leading_and_trailing_windows():
-    assert s03.trim_ordered_windows(list(range(10))) == [3, 4, 5, 6]
-    assert s03.trim_ordered_windows(list(range(6))) == []
+def test_s03_has_no_automatic_window_trim_contract():
+    assert not hasattr(s03, "trim_ordered_windows")
+    assert not hasattr(s03, "EDGE_WINDOW_TRIM")
+    assert not hasattr(s03, "NoUsableWindowsAfterEdgeTrim")
 
 
-def test_s03_prewindowed_sample_trims_both_ends_when_read(monkeypatch, tmp_path):
+def test_s03_prewindowed_sample_keeps_every_stored_window(monkeypatch, tmp_path):
     ppg_windows = np.zeros((10, 40, 300), dtype=float)
     ppg_windows[:, 0, :] = 4.0e6
     ppg_windows[:, 1, :] = 1.0e5
@@ -44,11 +45,10 @@ def test_s03_prewindowed_sample_trims_both_ends_when_read(monkeypatch, tmp_path)
         target_aware_stride=False,
         stride_neg=100,
         stride_pos=100,
-        skip_initial_windows=0,
         use_stage2_ir=False,
     )
 
-    assert [row["window_index"] for row in rows] == [0, 1, 2, 3]
+    assert [row["window_index"] for row in rows] == list(range(10))
 
 
 def test_s03_parallel_extraction_schedules_heaviest_first_and_preserves_input_order(monkeypatch):
@@ -169,9 +169,7 @@ def test_s03_sample_read_failure_is_not_silently_converted_to_empty_rows(monkeyp
         )
 
 
-def test_s03_grouped_sample_with_no_windows_after_edge_trim_is_reported_and_skipped(
-    tmp_path, capsys
-):
+def test_s03_grouped_sample_keeps_all_six_windows(tmp_path, capsys, monkeypatch):
     h5_path = tmp_path / "short_grouped.h5"
     sample_name = "short_grouped"
     with h5py.File(h5_path, "w") as f:
@@ -180,6 +178,15 @@ def test_s03_grouped_sample_with_no_windows_after_edge_trim_is_reported_and_skip
             window_group = sample_group.create_group(f"record_w{window_index}_1")
             window_group.create_dataset("ppg", data=np.zeros((40, 500), dtype=float))
 
+    monkeypatch.setattr(
+        s03,
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: (
+            {"GREEN_CORR": 1.0},
+            {"feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION},
+            {},
+        ),
+    )
     result = s03.extract_features_for_split(
         [{
             "sample_name": sample_name,
@@ -194,13 +201,12 @@ def test_s03_grouped_sample_with_no_windows_after_edge_trim_is_reported_and_skip
     )
 
     output = capsys.readouterr().out
-    assert result.empty
-    assert "reason=no_windows_after_edge_trim" in output
-    assert "original_windows=6" in output
-    assert "no_windows_after_edge_trim=1" in output
+    assert len(result) == 6
+    assert result["window_index"].tolist() == list(range(6))
+    assert "no_windows_after_edge_trim" not in output
 
 
-def test_s03_parallel_workers_preserve_grouped_edge_trim_skip_reason(
+def test_s03_parallel_workers_keep_all_grouped_windows(
     tmp_path, capsys, monkeypatch
 ):
     monkeypatch.delenv("WL_FORCE_SERIAL", raising=False)
@@ -232,8 +238,11 @@ def test_s03_parallel_workers_preserve_grouped_edge_trim_skip_reason(
     )
 
     output = capsys.readouterr().out
-    assert result.empty
-    assert "no_windows_after_edge_trim=3" in output
+    assert len(result) == 18
+    assert result.groupby("sample_name").size().to_dict() == {
+        name: 6 for name in sample_names
+    }
+    assert "no_windows_after_edge_trim" not in output
     assert "[ERROR]" not in output
 
 
@@ -257,13 +266,24 @@ def test_s03_grouped_sample_with_no_recognized_ppg_windows_remains_fatal(tmp_pat
         )
 
 
-def test_s03_array_prewindowed_sample_reports_empty_after_edge_trim(tmp_path, capsys):
+def test_s03_array_prewindowed_sample_keeps_all_six_windows(
+    tmp_path, capsys, monkeypatch
+):
     h5_path = tmp_path / "short_array_prewindowed.h5"
     sample_name = "short_array_prewindowed"
     with h5py.File(h5_path, "w") as f:
         sample_group = f.create_group(sample_name)
         sample_group.create_dataset("ppg", data=np.zeros((6, 40, 500), dtype=float))
 
+    monkeypatch.setattr(
+        s03,
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: (
+            {"GREEN_CORR": 1.0},
+            {"feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION},
+            {},
+        ),
+    )
     result = s03.extract_features_for_split(
         [{
             "sample_name": sample_name,
@@ -277,13 +297,12 @@ def test_s03_array_prewindowed_sample_reports_empty_after_edge_trim(tmp_path, ca
     )
 
     output = capsys.readouterr().out
-    assert result.empty
-    assert "reason=no_windows_after_edge_trim" in output
-    assert "original_windows=6" in output
-    assert "no_windows_after_edge_trim=1" in output
+    assert len(result) == 6
+    assert result["window_index"].tolist() == list(range(6))
+    assert "no_windows_after_edge_trim" not in output
 
 
-def test_s03_continuous_sample_reports_empty_after_edge_trim(tmp_path, capsys):
+def test_s03_continuous_sample_keeps_all_six_windows(tmp_path, capsys, monkeypatch):
     h5_path = tmp_path / "short_continuous.h5"
     sample_name = "short_continuous"
     # 1000 points at 100 Hz produce exactly six 5 s windows with a 1 s stride.
@@ -291,6 +310,15 @@ def test_s03_continuous_sample_reports_empty_after_edge_trim(tmp_path, capsys):
         sample_group = f.create_group(sample_name)
         sample_group.create_dataset("ppg", data=np.zeros((40, 1000), dtype=float))
 
+    monkeypatch.setattr(
+        s03,
+        "extract_stage2_window",
+        lambda *_args, **_kwargs: (
+            {"GREEN_CORR": 1.0},
+            {"feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION},
+            {},
+        ),
+    )
     result = s03.extract_features_for_split(
         [{
             "sample_name": sample_name,
@@ -304,10 +332,10 @@ def test_s03_continuous_sample_reports_empty_after_edge_trim(tmp_path, capsys):
     )
 
     output = capsys.readouterr().out
-    assert result.empty
-    assert "reason=no_windows_after_edge_trim" in output
-    assert "original_windows=6" in output
-    assert "no_windows_after_edge_trim=1" in output
+    assert len(result) == 6
+    assert result["start_100hz"].tolist() == [0, 100, 200, 300, 400, 500]
+    assert result["window_index"].tolist() == list(range(6))
+    assert "no_windows_after_edge_trim" not in output
 
 
 def test_s03_attempts_all_sample_windows_then_reports_feature_failures(monkeypatch):
@@ -396,12 +424,11 @@ def test_s03_prewindowed_sample_uses_all_windows(monkeypatch):
         target_aware_stride=False,
         stride_neg=100,
         stride_pos=100,
-        skip_initial_windows=1,
         use_stage2_ir=False,
     )
 
-    assert len(rows) == 3
-    assert [r["start_100hz"] for r in rows] == [100, 200, 300]
+    assert len(rows) == 4
+    assert [r["start_100hz"] for r in rows] == [0, 100, 200, 300]
 
 
 def test_s06_prewindowed_inference_runs_xgboost_for_all_windows(monkeypatch):
@@ -449,13 +476,12 @@ def test_s06_prewindowed_inference_runs_xgboost_for_all_windows(monkeypatch):
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
         use_stage2_ir=False,
-        skip_initial_windows=1,
     )
 
-    assert result["window_start_sec"] == [1.0, 2.0, 3.0]
-    assert result["window_end_sec"] == [4.0, 5.0, 6.0]
-    assert result["window_preds"] == [1, 1, 1]
-    assert result["window_probs"] == [0.8, 0.8, 0.8]
+    assert result["window_start_sec"] == [0.0, 1.0, 2.0, 3.0]
+    assert result["window_end_sec"] == [3.0, 4.0, 5.0, 6.0]
+    assert result["window_preds"] == [1, 1, 1, 1]
+    assert result["window_probs"] == [0.8, 0.8, 0.8, 0.8]
     assert "stage1_gate_flags" not in result
     assert "stage2_enabled_flags" not in result
 
@@ -493,12 +519,11 @@ def test_s06_continuous_inference_runs_xgboost_for_all_windows(monkeypatch):
         window_sec=3,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
-        skip_initial_windows=0,
         use_stage2_ir=False,
     )
 
-    assert result["window_probs"] == [0.8, 0.8, 0.8, 0.8]
-    assert result["window_preds"] == [1, 1, 1, 1]
+    assert result["window_probs"] == [0.8] * 10
+    assert result["window_preds"] == [1] * 10
     assert "stage1_gate_flags" not in result
     assert "stage2_enabled_flags" not in result
 
@@ -529,8 +554,7 @@ def test_s06_prewindowed_all_feature_failures_are_explicit_fallback(monkeypatch)
         window_sec=5,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
-        use_stage2_ir=False,
-        skip_initial_windows=0,
+        use_stage2_ir=False
     )
 
     assert result["fallback"] is True
@@ -577,8 +601,7 @@ def test_s06_prewindowed_partial_failure_drops_invalid_window_and_keeps_alignmen
         window_sec=5,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
-        use_stage2_ir=False,
-        skip_initial_windows=0,
+        use_stage2_ir=False
     )
 
     assert result["fallback"] is False
@@ -608,7 +631,6 @@ def test_s06_continuous_all_feature_failures_are_explicit_fallback(monkeypatch):
         window_sec=3,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
-        skip_initial_windows=0,
         use_stage2_ir=False,
     )
 
@@ -616,7 +638,7 @@ def test_s06_continuous_all_feature_failures_are_explicit_fallback(monkeypatch):
     assert result["fallback_reason"].startswith("all_window_feature_extraction_failed")
     assert "RuntimeError: continuous feature failure" in result["fallback_reason"]
     assert result["window_probs"] == []
-    assert result["window_feature_failure_count"] == 4
+    assert result["window_feature_failure_count"] == 10
 
 
 def test_s01_scans_grouped_window_h5_layout(tmp_path):
@@ -711,12 +733,15 @@ def test_s03_grouped_window_h5_uses_w_order_for_skip_and_start(monkeypatch, tmp_
         target_aware_stride=False,
         stride_neg=100,
         stride_pos=100,
-        skip_initial_windows=0,
         use_stage2_ir=False,
     )
 
-    assert [row["start_100hz"] for row in rows] == [300, 400, 500, 600]
-    assert [row["window_index"] for row in rows] == [3, 4, 5, 6]
+    assert [row["start_100hz"] for row in rows] == [
+        0, 100, 200, 300, 400, 500, 600, 700, 800, 2000,
+    ]
+    assert [row["window_index"] for row in rows] == [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 20,
+    ]
     assert all(row["target"] == 1 for row in rows)
 
 
@@ -770,14 +795,17 @@ def test_s06_grouped_window_inference_uses_w_order_for_timestamps(monkeypatch, t
         window_sec=3,
         stride_sec=1,
         bundle={"feature_quantiles": None, "feature_names": []},
-        skip_initial_windows=0,
         use_stage2_ir=False,
     )
 
-    assert result["window_start_sec"] == [3.0, 4.0, 5.0, 6.0]
-    assert result["window_end_sec"] == [6.0, 7.0, 8.0, 9.0]
-    assert result["window_indices"] == [3, 4, 5, 6]
-    assert result["window_targets"] == [1, 1, 1, 1]
+    assert result["window_start_sec"] == [
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 20.0,
+    ]
+    assert result["window_end_sec"] == [
+        3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 23.0,
+    ]
+    assert result["window_indices"] == [0, 1, 2, 3, 4, 5, 6, 7, 8, 20]
+    assert result["window_targets"] == [1] * 10
 
 
 def test_s04_excludes_window_metadata_but_keeps_mode_candidate():

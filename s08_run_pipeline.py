@@ -583,11 +583,11 @@ def extract_features(ir, ambient, g1, g2, g3, acc=None, fs=25, ppg_config=0):
     return [feature_dict[name] for name in FEATURE_ORDER]
 
 
-def extract_features_from_ppg(ppg, acc=None, *, frequency, ppg_config):
-    """Extract the model vector directly from raw multi-channel PPG."""
-    raw_ppg = np.asarray(ppg, dtype=float)
-    if raw_ppg.ndim != 2:
-        raise ValueError(f"ppg must have shape (T, C), got {{raw_ppg.shape}}")
+def extract_raw_feature_dict_from_ppg(ppg, acc=None, *, frequency, ppg_config):
+    """Extract raw selected features directly from one native-rate PPG window."""
+    source_ppg = np.asarray(ppg, dtype=float)
+    if source_ppg.ndim != 2:
+        raise ValueError(f"ppg must have shape (T, C), got {{source_ppg.shape}}")
     try:
         frequency = int(frequency)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -595,17 +595,52 @@ def extract_features_from_ppg(ppg, acc=None, *, frequency, ppg_config):
     if frequency not in (25, 100):
         raise ValueError(f"frequency must be 25 or 100, got {{frequency}}")
 
-    raw_acc = None if acc is None else np.asarray(acc, dtype=float)
+    source_acc = None if acc is None else np.asarray(acc, dtype=float)
+    ppg_25 = source_ppg
+    acc_25 = source_acc
     if frequency == 100:
         # Fixed phase: retain source indices 0, 4, 8, ... exactly.
-        raw_ppg = raw_ppg[::4]
-        if raw_acc is not None and raw_acc.size:
-            raw_acc = raw_acc[::4]
-    ir, ambient, g1, g2, g3 = get_channels_from_window(raw_ppg, ppg_config)
-    return extract_features(
+        ppg_25 = source_ppg[::4]
+        if source_acc is not None and source_acc.size:
+            acc_25 = source_acc[::4]
+    ir, ambient, g1, g2, g3 = get_channels_from_window(ppg_25, ppg_config)
+    raw = extract_raw_feature_dict(
         ir, ambient, g1, g2, g3,
-        acc=raw_acc, fs=25, ppg_config=ppg_config,
+        acc=acc_25, fs=25, ppg_config=ppg_config,
     )
+
+    # The eight exact commercial-port fields are sensitive to float32 operation
+    # order.  Training computes them from the native raw channel layout, before
+    # the common three-zone float64 path.  Recompute and override them here so
+    # ppg_config 1/2 deployment matches s03 bit-for-bit within the C contract.
+    if source_acc is not None and any(
+            name in COMMERCIAL_STAGE2_FIELDS for name in FEATURE_ORDER):
+        try:
+            commercial = extract_commercial_feature_overrides(
+                source_ppg,
+                source_acc,
+                frequency=frequency,
+                ppg_config=ppg_config,
+            )
+        except Exception:
+            # Match s03.extract_window_features fallback semantics for windows
+            # that cannot satisfy the exact five-second commercial-port contract.
+            commercial = {{}}
+        for name in FEATURE_ORDER:
+            if name in commercial:
+                raw[name] = float(commercial[name])
+    return {{name: float(raw[name]) for name in FEATURE_ORDER}}
+
+
+def extract_features_from_ppg(ppg, acc=None, *, frequency, ppg_config):
+    """Return the cleaned model vector from one native-rate raw PPG window."""
+    raw = extract_raw_feature_dict_from_ppg(
+        ppg,
+        acc=acc,
+        frequency=frequency,
+        ppg_config=ppg_config,
+    )
+    return [_clean_value(name, raw[name]) for name in FEATURE_ORDER]
 
 
 def classify_probability(probability):
@@ -2001,8 +2036,6 @@ def main():
     p.add_argument("--window_sec", type=int, default=5, choices=[3, 5],
                    help="Stage2 窗口秒数：3s (75点@25Hz) 或 5s (125点@25Hz)")
     p.add_argument("--stride_sec", type=int, default=1, help="Stage2 滑窗步长（秒）")
-    p.add_argument("--skip_initial_windows", type=int, default=0,
-                   help="optional extra leading-window skip after automatic [3:-3] trimming")
     p.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction, default=False,
                    help="legacy compatibility flag; Stage2 model features are always ambient/green/ACC only")
 
@@ -2452,9 +2485,7 @@ def main():
             f'"{PYTHON}" "{_script_path("s03_extract_feature_pool")}" '
             f'--artifact_dir "{args.artifact_dir}" '
             f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag} '
+            f'--stride_sec {args.stride_sec} '            f'{stage2_ir_flag} '
             f'--n_workers {args.n_workers}'
             f'{_commercial_only_flag}'
             f'{_direct_extract_flag}'
@@ -2574,9 +2605,7 @@ def main():
             f'--n_workers {args.n_workers} '
             f'--optimize '
             f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag}'
+            f'--stride_sec {args.stride_sec} '            f'{stage2_ir_flag}'
         )
     elif "s06_opt" not in skip_set:
         print("(s06_opt: --no-optimize 跳过)")
@@ -2589,9 +2618,7 @@ def main():
             f'--split {args.postprocess_split} '
             f'--n_workers {args.n_workers} '
             f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag} '
+            f'--stride_sec {args.stride_sec} '            f'{stage2_ir_flag} '
             f'--window_output_root window_outputs'
             f'{cache_export_flag}'
         )
@@ -2606,9 +2633,7 @@ def main():
             f'--split {args.split} '
             f'--n_workers {args.n_workers} '
             f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag} '
+            f'--stride_sec {args.stride_sec} '            f'{stage2_ir_flag} '
             f'--window_output_root window_outputs'
             f'{cache_export_flag}'
         )
@@ -2623,9 +2648,7 @@ def main():
             f'--split {args.split} '
             f'--n_workers {args.n_workers} '
             f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag} '
+            f'--stride_sec {args.stride_sec} '            f'{stage2_ir_flag} '
             f'--window_output_root window_outputs'
         )
 
@@ -2668,9 +2691,7 @@ def main():
             f'--split {args.split} '
             f'--n_workers {args.n_workers} '
             f'--window_sec {args.window_sec} '
-            f'--stride_sec {args.stride_sec} '
-            f'--skip_initial_windows {args.skip_initial_windows} '
-            f'{stage2_ir_flag} '
+            f'--stride_sec {args.stride_sec} '            f'{stage2_ir_flag} '
             f'--export_deploy'
         )
     elif "s06_xpt" not in skip_set:

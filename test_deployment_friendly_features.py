@@ -203,8 +203,8 @@ def test_deploy_extractor_is_self_contained_without_profile_meta(tmp_path):
     assert "S03_SOURCE_DIR" not in text
     assert "sys.path.insert" not in text
     assert "from scipy.signal import resample_poly" not in text
-    assert "raw_ppg = raw_ppg[::4]" in text
-    assert "raw_acc = raw_acc[::4]" in text
+    assert "ppg_25 = source_ppg[::4]" in text
+    assert "acc_25 = source_acc[::4]" in text
     assert "FEATURE_ORDER" in text
 
 

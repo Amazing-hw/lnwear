@@ -375,7 +375,6 @@ def test_s06_prewindowed_inference_applies_same_commercial_overrides_as_training
         stride_sec=1,
         bundle={"feature_names": ["GREEN_CORR"], "feature_quantiles": None},
         use_stage2_ir=False,
-        skip_initial_windows=0,
     )
 
     assert result["fallback"] is False
@@ -416,8 +415,8 @@ def test_commercial_only_continuous_100hz_uses_raw_windows(monkeypatch):
     first_ppg, first_acc, frequency, ppg_config = observed[0]
     assert frequency == 100
     assert ppg_config == 0
-    np.testing.assert_array_equal(first_ppg, ppg[300:800])
-    np.testing.assert_array_equal(first_acc, acc[300:800])
+    np.testing.assert_array_equal(first_ppg, ppg[0:500])
+    np.testing.assert_array_equal(first_acc, acc[0:500])
 
 
 def test_commercial_only_prewindowed_100hz_uses_raw_windows(monkeypatch):

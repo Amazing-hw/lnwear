@@ -43,8 +43,6 @@ def _write_cache(path, sample_name, target, probs, **contract_overrides):
             contract_overrides.get("model_fingerprint", {"source": "test"}))),
         "feature_names_json": np.asarray(json.dumps(
             contract_overrides.get("feature_names", ["GREEN_AC_RMS"]))),
-        "skip_initial_windows": np.asarray(
-            contract_overrides.get("skip_initial_windows", 3), dtype=np.int32),
         "window_indices": np.arange(n, dtype=np.int32),
         "window_targets": np.full(n, target, dtype=np.int32),
     }
@@ -77,7 +75,6 @@ def test_s06_window_contract_rejects_cli_mismatch():
         ("model_threshold", 0.6),
         ("window_sec", 3.0),
         ("stride_sec", 2.0),
-        ("skip_initial_windows", 4),
     ],
 )
 def test_s07_rejects_mixed_cache_contracts(tmp_path, field, override):
@@ -236,7 +233,7 @@ def test_s07_parallel_grid_search_initializes_worker_caches(tmp_path):
     assert provenance["model_threshold"] == 0.5
     assert provenance["window_sec"] == 5.0
     assert provenance["stride_sec"] == 1.0
-    assert provenance["skip_initial_windows"] == 3
+    assert "skip_initial_windows" not in provenance
     assert final_config["postprocess_optimization"]["cache_provenance"] == provenance
 
 

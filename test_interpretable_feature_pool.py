@@ -786,7 +786,7 @@ def test_mode_zero_preserves_explicit_three_green_channel_layout():
 def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
     import stage2_feature_catalog as catalog
 
-    # Seven candidate windows become one retained center window after [3:-3].
+    # Every legal candidate window reaches the shared extraction interface.
     *_, ppg, acc = _signals(n=900, fs=100.0)
     calls = []
 
@@ -817,12 +817,12 @@ def test_s03_batch_extraction_calls_shared_window_interface(monkeypatch):
         target_aware_stride=False,
         stride_neg=100,
         stride_pos=100,
-        skip_initial_windows=0,
         use_stage2_ir=False,
     )
 
-    assert len(rows) == 1
-    assert len(calls) == 1
+    assert len(rows) == 7
+    assert len(calls) == 7
+    assert [row["window_index"] for row in rows] == list(range(7))
     assert rows[0]["feature_pool_version"] == catalog.FEATURE_POOL_VERSION
     assert set(catalog.model_candidate_names()) <= set(rows[0])
 

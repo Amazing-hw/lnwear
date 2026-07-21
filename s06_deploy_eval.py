@@ -54,7 +54,6 @@ from s03_extract_feature_pool import (
     extract_acc_green_coupling_features,
     validate_h5_file,
     load_grouped_window_metadata,
-    trim_ordered_windows,
 )
 from stage2_feature_catalog import (
     FEATURE_CATALOG,
@@ -80,7 +79,6 @@ DEFAULT_POSTPROCESS_CONFIG = {
     "sample_pred_warmup_frames": 0,
 }
 
-DEFAULT_SKIP_INITIAL_WINDOWS = 0
 DEFAULT_USE_STAGE2_IR = False
 
 
@@ -601,8 +599,7 @@ def _finalize_window_inference(
 
 
 def _infer_prewindowed_sample(base, ppg, acc,
-                              window_sec, stride_sec, bundle, use_stage2_ir,
-                              skip_initial_windows):
+                              window_sec, stride_sec, bundle, use_stage2_ir):
     """Run XGBoost inference on every stored window."""
     FEATURE_FS = 25
     window_meta = load_grouped_window_metadata(base)
@@ -620,8 +617,7 @@ def _infer_prewindowed_sample(base, ppg, acc,
     emitted_window_targets = []
     window_errors = []
 
-    first_step = max(0, int(skip_initial_windows))
-    for step in range(first_step, ppg.shape[0]):
+    for step in range(ppg.shape[0]):
         raw_window = ppg[step]
         window_number = int(window_indices[step]) if window_indices and step < len(window_indices) else int(step)
         window_target = int(window_labels[step]) if window_labels and step < len(window_labels) else int(base.get("target", 0))
@@ -699,7 +695,6 @@ def _infer_prewindowed_sample(base, ppg, acc,
 # =========================================================
 
 def _infer_one_sample(sample, window_sec, stride_sec, bundle,
-                      skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                       use_stage2_ir=DEFAULT_USE_STAGE2_IR):
     """
     对全部合法窗口提取特征并执行 XGBoost 预测。
@@ -746,7 +741,6 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
         return _infer_prewindowed_sample(
             base, ppg, acc,
             window_sec, stride_sec, bundle, use_stage2_ir,
-            skip_initial_windows,
         )
 
     # 3. 100Hz 信号固定按 x[::4] 取为 25Hz（原生 25Hz 跳过）。
@@ -779,9 +773,7 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
         window_end_sec = []
         window_errors = []
 
-        window_steps = trim_ordered_windows(list(range(max(0, n_steps_s2))))
-        if skip_initial_windows:
-            window_steps = window_steps[max(0, int(skip_initial_windows)):]
+        window_steps = list(range(max(0, n_steps_s2)))
         for step in window_steps:
             s2_start = step * stride_25
             window_start_sec.append(float(s2_start / FEATURE_FS))
@@ -871,16 +863,14 @@ def _init_worker(bundle_path):
 
 def _worker_infer(args_tuple):
     """子进程入口。"""
-    (sample, window_sec, stride_sec, skip_initial_windows, use_stage2_ir) = args_tuple
+    (sample, window_sec, stride_sec, use_stage2_ir) = args_tuple
     return _infer_one_sample(
         sample, window_sec, stride_sec, _WORKER_BUNDLE,
-        skip_initial_windows=skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
     )
 
 
 def run_inference_parallel(samples, window_sec, stride_sec, bundle_path, n_workers,
-                           skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                            use_stage2_ir=None):
     """
     并行单趟推理，返回与 samples 同序的 results 列表。
@@ -890,7 +880,7 @@ def run_inference_parallel(samples, window_sec, stride_sec, bundle_path, n_worke
         bundle_for_meta = _BUNDLE if _BUNDLE is not None else joblib.load(bundle_path)
         use_stage2_ir = resolve_use_stage2_ir(bundle_for_meta)
     args_list = [
-        (s, window_sec, stride_sec, skip_initial_windows, bool(use_stage2_ir))
+        (s, window_sec, stride_sec, bool(use_stage2_ir))
         for s in samples
     ]
 
@@ -900,7 +890,6 @@ def run_inference_parallel(samples, window_sec, stride_sec, bundle_path, n_worke
         return [
             _infer_one_sample(
                 s, window_sec, stride_sec, bundle,
-                skip_initial_windows=skip_initial_windows,
                 use_stage2_ir=use_stage2_ir,
             )
             for s in samples
@@ -1750,7 +1739,6 @@ def _score_grid_point(args_tuple):
 
 def optimize_state_machine_params(samples, window_sec=5, stride_sec=1, min_recall=0.95,
                                    bundle_path=None, n_workers=None,
-                                   skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                    use_stage2_ir=None):
     """
     网格搜索最优状态机参数。
@@ -1777,7 +1765,6 @@ def optimize_state_machine_params(samples, window_sec=5, stride_sec=1, min_recal
     print("预计算样本窗口概率（并行）...")
     results = run_inference_parallel(
         samples, window_sec, stride_sec, bundle_path, n_workers,
-        skip_initial_windows=skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
     )
 
@@ -1852,7 +1839,6 @@ def optimize_state_machine_params(samples, window_sec=5, stride_sec=1, min_recal
 
 def predict_sample_with_bundle(sample, window_sec=5, stride_sec=1,
                                 method="state_machine", postprocess_cfg=None,
-                                skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                 use_stage2_ir=None):
     """
     单样本部署预测（向后兼容）。内部走优化后的推理路径（无重复 preprocess）。
@@ -1863,7 +1849,6 @@ def predict_sample_with_bundle(sample, window_sec=5, stride_sec=1,
         postprocess_cfg = dict(DEFAULT_POSTPROCESS_CONFIG)
 
     r = _infer_one_sample(sample, window_sec, stride_sec, _BUNDLE,
-                          skip_initial_windows=skip_initial_windows,
                           use_stage2_ir=resolve_use_stage2_ir(_BUNDLE, use_stage2_ir))
     target = int(r["target"])
     if len(r["window_probs"]) == 0 or r["fallback"]:
@@ -1892,7 +1877,6 @@ def predict_sample_with_bundle(sample, window_sec=5, stride_sec=1,
 
 def predict_sample_safe(sample, window_sec=5, stride_sec=1,
                         method="state_machine", postprocess_cfg=None,
-                        skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                         use_stage2_ir=None):
     """带 fallback 的预测（向后兼容）。"""
     fallback_result = {
@@ -1919,7 +1903,6 @@ def predict_sample_safe(sample, window_sec=5, stride_sec=1,
             sample,
             window_sec=window_sec, stride_sec=stride_sec,
             method=method, postprocess_cfg=postprocess_cfg,
-            skip_initial_windows=skip_initial_windows,
             use_stage2_ir=use_stage2_ir,
         )
         res["fallback"] = False
@@ -1933,7 +1916,6 @@ def predict_sample_safe(sample, window_sec=5, stride_sec=1,
 
 def evaluate_streaming_window_accuracy(samples, window_sec=5, stride_sec=1, postprocess_cfg=None,
                                        bundle_path=None, n_workers=None,
-                                       skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                        use_stage2_ir=None):
     """
     流式窗口级评估（向后兼容）。可选并行推理。
@@ -1949,7 +1931,6 @@ def evaluate_streaming_window_accuracy(samples, window_sec=5, stride_sec=1, post
             n_workers = max(1, min(4, (os.cpu_count() or 4) // 2))
         results = run_inference_parallel(
             samples, window_sec, stride_sec, bundle_path, n_workers,
-            skip_initial_windows=skip_initial_windows,
             use_stage2_ir=use_stage2_ir,
         )
     else:
@@ -1958,7 +1939,6 @@ def evaluate_streaming_window_accuracy(samples, window_sec=5, stride_sec=1, post
         results = [
             _infer_one_sample(
                 s, window_sec, stride_sec, _BUNDLE,
-                skip_initial_windows=skip_initial_windows,
                 use_stage2_ir=resolve_use_stage2_ir(_BUNDLE, use_stage2_ir),
             )
             for s in samples
@@ -2160,7 +2140,7 @@ def build_feature_formula_map(selected_features):
     )
 
 
-def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS):
+def export_deploy_artifacts(artifact_dir):
     """
     导出所有部署所需产物到 artifacts/deploy_package/。
 
@@ -2226,7 +2206,6 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
         ("window_config", {
             "duration_sec": float(bundle["meta"]["win_sec"]),
             "stride_sec": float(bundle["meta"]["step_sec"]),
-            "skip_initial_windows": int(skip_initial_windows),
             "use_stage2_ir": False,
             "fs_ppg": float(bundle["meta"]["fs_ppg"]),
         }),
@@ -2406,7 +2385,6 @@ def export_deploy_artifacts(artifact_dir, skip_initial_windows=DEFAULT_SKIP_INIT
             ("window_config", OrderedDict([
                 ("duration_sec", float(bundle["meta"]["win_sec"])),
                 ("stride_sec", float(bundle["meta"]["step_sec"])),
-                ("skip_initial_windows", int(skip_initial_windows)),
                 ("use_stage2_ir", False),
             ])),
             ("n_features", len(selected_features)),
@@ -2536,7 +2514,6 @@ def write_window_cache_npz(result, out_dir, window_sec, stride_sec, model_thresh
         cache_schema_version=np.array("xgboost_window_outputs_v1"),
         model_fingerprint_json=np.array(json.dumps(metadata.get("model_fingerprint", {}), ensure_ascii=False)),
         feature_names_json=np.array(json.dumps(list(metadata.get("feature_names", [])), ensure_ascii=False)),
-        skip_initial_windows=np.array(int(metadata.get("skip_initial_windows", 0)), dtype=np.int64),
         use_stage2_ir=np.array(0, dtype=np.int64),
     )
     return fpath
@@ -2739,7 +2716,6 @@ def export_window_cache(results, artifact_dir, split, window_sec, stride_sec, mo
                 "cache_schema_version": "xgboost_window_outputs_v1",
                 "model_fingerprint": metadata.get("model_fingerprint", {}),
                 "feature_names": list(metadata.get("feature_names", [])),
-                "skip_initial_windows": int(metadata.get("skip_initial_windows", 0)),
                 "use_stage2_ir": False,
                 "fallback": int(bool(r.get("fallback", False))),
                 "fallback_reason": str(r.get("fallback_reason", "")),
@@ -2770,8 +2746,6 @@ def main(args=None):
                         choices=["mean_vote", "prob_mean", "state_machine"])
     parser.add_argument("--window_sec", type=int, default=5)
     parser.add_argument("--stride_sec", type=int, default=1)
-    parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,
-                        help="optional extra leading-window skip after automatic [3:-3] trimming")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction,
                         default=None,
                         help="whether Stage2 feature extraction uses IR channel values; defaults to model bundle metadata")
@@ -2844,7 +2818,6 @@ def main(args=None):
             stride_sec=args.stride_sec,
             bundle_path=bundle_path,
             n_workers=args.n_workers,
-            skip_initial_windows=args.skip_initial_windows,
             use_stage2_ir=use_stage2_ir,
         )
         best_params = opt["best_params"]
@@ -2890,7 +2863,6 @@ def main(args=None):
         stride_sec=args.stride_sec,
         bundle_path=bundle_path,
         n_workers=args.n_workers,
-        skip_initial_windows=args.skip_initial_windows,
         use_stage2_ir=use_stage2_ir,
     )
 
@@ -3090,15 +3062,13 @@ def main(args=None):
             metadata={
                 "model_fingerprint": bundle.get("fingerprint", {}),
                 "feature_names": bundle.get("feature_names", []),
-                "skip_initial_windows": args.skip_initial_windows,
                 "use_stage2_ir": use_stage2_ir,
             },
             cache_root=args.window_output_root,
         )
     if args.export_deploy:
         export_deploy_artifacts(
-            args.artifact_dir,
-            skip_initial_windows=args.skip_initial_windows,
+            args.artifact_dir
         )
 
 
@@ -3689,7 +3659,7 @@ def build_action_items(window_strata, sample_strata, hard_payload, model_search_
                 f"time_bin={row['stratum']}",
                 f"errors={int(row['fp'] + row['fn'])}",
                 row["n_samples"],
-                "Review skip_initial_windows, warmup behavior, and window ordering.",
+                "Review warmup behavior and window ordering.",
             )
         for row in _top_rows(
             window_strata,

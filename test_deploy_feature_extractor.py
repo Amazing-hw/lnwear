@@ -577,6 +577,85 @@ def test_standalone_extractor_accepts_raw_ppg_frequency_and_config(tmp_path):
     assert from_raw[1] == 1.0
 
 
+@pytest.mark.parametrize("frequency", [25, 100])
+@pytest.mark.parametrize("ppg_config", [0, 1, 2])
+def test_standalone_raw_ppg_all_layouts_matches_training_commercial_overrides(
+        tmp_path, frequency, ppg_config):
+    selected = list(s03.COMMERCIAL_STAGE2_FIELDS) + [
+        "GZONE1_DC_CONTRAST",
+        "G_TOP2_CORR_MIN",
+        "mode",
+    ]
+    formulas = {name: {"formula": name, "intermediate_signals": {}} for name in selected}
+    script = s08._render_selected_feature_extractor(
+        selected,
+        {name: 0.0 for name in selected},
+        {},
+        formulas,
+    )
+    script_path = tmp_path / "deploy_feature_extractor.py"
+    script_path.write_text(script, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location(
+        f"raw_layout_{frequency}_{ppg_config}", script_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    n = 5 * frequency
+    t = np.arange(n, dtype=float) / frequency
+    zones = [
+        2.0e6 + (8.0e3 + 300.0 * index)
+        * np.sin(2 * np.pi * 1.17 * t + 0.03 * index)
+        for index in range(3)
+    ]
+    raw = np.zeros((n, 40), dtype=float)
+    raw[:, 0] = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.17 * t)
+    raw[:, 1] = 1.0e5 + 700.0 * np.sin(2 * np.pi * 0.37 * t)
+    layouts = (
+        ((3,), (4,), (5,)),
+        ((3, 9), (4, 10), (5, 11)),
+        ((6, 9, 12), (7, 10, 13), (8, 11, 14)),
+    )
+    scales = (
+        (1.0,),
+        (0.99, 1.01),
+        (0.98, 1.0, 1.02),
+    )
+    for columns, zone in zip(layouts[ppg_config], zones):
+        for column, scale in zip(columns, scales[ppg_config]):
+            raw[:, column] = zone * scale
+    acc = np.column_stack([
+        0.02 * np.sin(2 * np.pi * 0.8 * t),
+        0.03 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.01 * np.sin(2 * np.pi * 0.6 * t),
+    ])
+
+    actual = module.extract_features_from_ppg(
+        raw,
+        acc=acc,
+        frequency=frequency,
+        ppg_config=ppg_config,
+    )
+    ppg_25 = raw if frequency == 25 else raw[::4]
+    acc_25 = acc if frequency == 25 else acc[::4]
+    expected = s03.extract_window_features(
+        ppg_25,
+        fs=25,
+        acc_window=acc_25,
+        use_stage2_ir=False,
+        ppg_config=ppg_config,
+        selected_features=selected,
+    )
+
+    for name, value in zip(selected, actual):
+        record = catalog.feature_record(name)
+        assert value == pytest.approx(
+            expected[name],
+            abs=float(record["c_abs_tolerance"]),
+            rel=float(record["c_rel_tolerance"]),
+        ), name
+
+
 def test_feature_script_and_model_json_are_sufficient_for_python_inference(tmp_path):
     selected = ["GREEN_CORR", "GREEN_AC_RMS", "mode"]
     model = XGBClassifier(
@@ -939,7 +1018,7 @@ def test_s06_deploy_package_uses_bundle_features_over_stale_selected_features(tm
         tmp_path / "model_bundle.pkl",
     )
 
-    s06.export_deploy_artifacts(str(tmp_path), skip_initial_windows=3)
+    s06.export_deploy_artifacts(str(tmp_path))
 
     model_params = (tmp_path / "deploy_package" / "model_params.json").read_text(encoding="utf-8")
     feature_formulas = (tmp_path / "deploy_package" / "feature_formulas.json").read_text(encoding="utf-8")
@@ -989,7 +1068,7 @@ def test_validate_deploy_artifact_consistency_passes_and_catches_feature_drift(t
     )
     s08.export_feature_extractor_script(str(tmp_path))
     s08.export_deploy_cookbook(str(tmp_path))
-    s06.export_deploy_artifacts(str(tmp_path), skip_initial_windows=3)
+    s06.export_deploy_artifacts(str(tmp_path))
 
     report = s08.validate_deploy_artifact_consistency(str(tmp_path))
     assert report["feature_names"] == selected
@@ -1048,7 +1127,7 @@ def test_export_golden_vectors_and_validate_feature_order(tmp_path):
     )
     s08.export_feature_extractor_script(str(tmp_path))
     s08.export_deploy_cookbook(str(tmp_path))
-    s06.export_deploy_artifacts(str(tmp_path), skip_initial_windows=3)
+    s06.export_deploy_artifacts(str(tmp_path))
 
     golden_path = s08.export_golden_vectors(str(tmp_path))
     golden = json.loads(Path(golden_path).read_text(encoding="utf-8"))

@@ -13,6 +13,38 @@ import stage2_feature_catalog as catalog
 ROOT = Path(__file__).resolve().parent
 
 
+def test_active_pipeline_has_no_window_skipping_contract():
+    active = [
+        "s03_extract_feature_pool.py",
+        "s06_deploy_eval.py",
+        "s07_postprocess_optimize.py",
+        "s08_run_pipeline.py",
+    ]
+    source = "\n".join(
+        (ROOT / name).read_text(encoding="utf-8") for name in active
+    )
+    assert "skip_initial_windows" not in source
+    assert "no_windows_after_edge_trim" not in source
+    assert "trim_ordered_windows" not in source
+    assert "EDGE_WINDOW_TRIM" not in source
+
+
+def test_active_clis_reject_removed_skip_option():
+    for script in (
+        "s03_extract_feature_pool.py",
+        "s06_deploy_eval.py",
+        "s08_run_pipeline.py",
+    ):
+        completed = subprocess.run(
+            [sys.executable, str(ROOT / script), "--skip_initial_windows", "1"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert completed.returncode != 0, script
+
+
 def _write_synthetic_grouped_h5(dataset_dir):
     dataset_dir.mkdir(parents=True, exist_ok=True)
     h5_path = dataset_dir / "synthetic_grouped.h5"

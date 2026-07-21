@@ -15,8 +15,7 @@
 功能：
 1. 读取 artifacts/splits.json
 2. 对全部合法样本/窗口提取 5s/25Hz XGBoost 特征
-3. 读入并排序后固定删除每条数据的前三个和后三个窗口；裁剪后为空的
-   短样本记录原因并跳过，不中断其余样本。
+3. 读入并排序后保留每条数据的全部合法窗口。
 4. 复用原始 H5 读取方式。
 5. 只按 H5 `ppg_config` 构建三个固定物理光区，不做信号方差判断。
 6. 模型候选使用与部署一致的短窗预处理：有限值替换、孤立毛刺修复、
@@ -63,8 +62,6 @@ EPS = 1e-12
 MIN_ZONE_RELATIVE_AC_RMS = 1e-8
 MIN_ZONE_ABSOLUTE_AC_RMS = 1e-9
 DEFAULT_FS = 100.0
-DEFAULT_SKIP_INITIAL_WINDOWS = 0
-EDGE_WINDOW_TRIM = 3
 DEFAULT_USE_STAGE2_IR = False
 COMMERCIAL_8_FEATURE_NAMES = [
     "GREEN_CORR",
@@ -89,27 +86,6 @@ COMMERCIAL_STAGE2_FIELDS = (
 )
 
 WINDOW_NAME_RE = re.compile(r"(?:^|_)w(?P<index>\d+)_(?P<label>[01])$")
-
-
-class NoUsableWindowsAfterEdgeTrim(RuntimeError):
-    """A valid sample has no windows left after the required 3+3 trim."""
-
-
-def _no_usable_windows_after_edge_trim(sample_name, original_windows):
-    return NoUsableWindowsAfterEdgeTrim(
-        f"sample={sample_name}, "
-        f"reason=no_windows_after_edge_trim, "
-        f"original_windows={int(original_windows)}, "
-        f"edge_trim={EDGE_WINDOW_TRIM}+{EDGE_WINDOW_TRIM}"
-    )
-
-
-def trim_ordered_windows(items):
-    """Drop the first and last three ordered windows immediately after loading."""
-    if len(items) <= 2 * EDGE_WINDOW_TRIM:
-        return items[0:0] if isinstance(items, np.ndarray) else []
-    trimmed = items[EDGE_WINDOW_TRIM:-EDGE_WINDOW_TRIM]
-    return trimmed if isinstance(items, np.ndarray) else list(trimmed)
 
 
 def apply_stage2_ir_policy(ir, use_stage2_ir=DEFAULT_USE_STAGE2_IR):
@@ -341,7 +317,7 @@ def parse_grouped_window_name(name):
 
 
 def _raw_sorted_grouped_window_items(group):
-    """Return recognized grouped PPG windows before the required edge trim."""
+    """Return all recognized grouped PPG windows in numeric window order."""
     items = []
     for child_name in group.keys():
         parsed = parse_grouped_window_name(child_name)
@@ -355,10 +331,6 @@ def _raw_sorted_grouped_window_items(group):
     return sorted(items, key=lambda item: item[0])
 
 
-def _sorted_grouped_window_items(group):
-    return trim_ordered_windows(_raw_sorted_grouped_window_items(group))
-
-
 def load_grouped_window_metadata(sample):
     if sample.get("window_layout") != "grouped_windows":
         return None
@@ -366,14 +338,13 @@ def load_grouped_window_metadata(sample):
     labels = sample.get("window_labels")
     names = sample.get("window_names")
     if indices is not None and labels is not None:
-        positions = trim_ordered_windows(list(range(len(indices))))
         return {
-            "window_indices": [int(indices[i]) for i in positions],
-            "window_labels": [int(labels[i]) for i in positions],
-            "window_names": [str(names[i]) for i in positions] if names is not None else None,
+            "window_indices": [int(value) for value in indices],
+            "window_labels": [int(value) for value in labels],
+            "window_names": [str(value) for value in names] if names is not None else None,
         }
     with h5py.File(sample["h5_file"], "r") as f:
-        items = _sorted_grouped_window_items(f[sample["sample_name"]])
+        items = _raw_sorted_grouped_window_items(f[sample["sample_name"]])
     return {
         "window_indices": [int(item[0]) for item in items],
         "window_labels": [int(item[1]) for item in items],
@@ -389,12 +360,7 @@ def load_ppg(sample):
     with h5py.File(sample["h5_file"], "r") as f:
         grp = f[sample["sample_name"]]
         if sample.get("window_layout") == "grouped_windows" or "ppg" not in grp:
-            raw_items = _raw_sorted_grouped_window_items(grp)
-            grouped_items = trim_ordered_windows(raw_items)
-            if not grouped_items and raw_items:
-                raise _no_usable_windows_after_edge_trim(
-                    sample["sample_name"], len(raw_items)
-                )
+            grouped_items = _raw_sorted_grouped_window_items(grp)
             windows = []
             for _idx, _label, _name, child in grouped_items:
                 windows.append(normalize_ppg_array(child["ppg"][:]))
@@ -403,13 +369,6 @@ def load_ppg(sample):
             ppg = np.stack(windows, axis=0)
         else:
             ppg = normalize_ppg_array(grp["ppg"][:])
-            if is_prewindowed_signal(ppg):
-                original_windows = int(ppg.shape[0])
-                ppg = trim_ordered_windows(ppg)
-                if original_windows and ppg.shape[0] == 0:
-                    raise _no_usable_windows_after_edge_trim(
-                        sample["sample_name"], original_windows
-                    )
     return ppg
 
 
@@ -424,7 +383,7 @@ def load_acc(sample):
         grp = f[sample["sample_name"]]
         if sample.get("window_layout") == "grouped_windows" or "ppg" not in grp:
             acc_windows = []
-            for _idx, _label, _name, child in _sorted_grouped_window_items(grp):
+            for _idx, _label, _name, child in _raw_sorted_grouped_window_items(grp):
                 if "acc" not in child:
                     return None
                 acc_windows.append(normalize_acc_array(child["acc"][:]))
@@ -434,8 +393,6 @@ def load_acc(sample):
         if "acc" not in grp:
             return None
         acc = normalize_acc_array(grp["acc"][:])
-        if is_prewindowed_signal(acc):
-            acc = trim_ordered_windows(acc)
     return acc
 
 def get_sample_frequency(sample):
@@ -563,7 +520,7 @@ def validate_h5_file(h5_file, sample_name):
 
             grp = f[sample_name]
             if "ppg" not in grp:
-                items = _sorted_grouped_window_items(grp)
+                items = _raw_sorted_grouped_window_items(grp)
                 if not items:
                     return False, f"样本 {sample_name} 缺少PPG数据"
                 ppg = normalize_ppg_array(items[0][3]["ppg"][:])
@@ -3814,7 +3771,6 @@ def _raise_sample_window_failures(sample_name, failures, attempted_windows):
 
 def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                               target_aware_stride, stride_neg, stride_pos,
-                              skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                               use_stage2_ir=DEFAULT_USE_STAGE2_IR,
                               commercial_only=False,
                               selected_features=None):
@@ -3835,8 +3791,6 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         acc = load_acc(sample)
         sample_frequency = get_sample_frequency(sample)
         mode = get_sample_ppg_config(sample)
-    except NoUsableWindowsAfterEdgeTrim:
-        raise
     except Exception as e:
         sample_name = sample.get("sample_name", "unknown")
         raise RuntimeError(
@@ -3856,8 +3810,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         ppg_src_fs = 25 if native_25hz else 100
         rows = []
         window_failures = []
-        first_idx = max(0, int(skip_initial_windows))
-        for win_idx in range(first_idx, ppg.shape[0]):
+        for win_idx in range(ppg.shape[0]):
             window_number = int(window_indices[win_idx]) if window_indices and win_idx < len(window_indices) else int(win_idx)
             window_target = int(window_labels[win_idx]) if window_labels and win_idx < len(window_labels) else int(sample["target"])
             raw_window = ppg[win_idx]
@@ -3946,7 +3899,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         _raise_sample_window_failures(
             sample.get("sample_name", "unknown"),
             window_failures,
-            max(0, int(ppg.shape[0]) - first_idx),
+            int(ppg.shape[0]),
         )
         return rows
 
@@ -3987,14 +3940,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
 
     rows = []
     window_failures = []
-    candidate_starts = list(range(0, len(ppg_25) - win_25 + 1, stride_25))
-    starts = trim_ordered_windows(candidate_starts)
-    if candidate_starts and not starts:
-        raise _no_usable_windows_after_edge_trim(
-            sample.get("sample_name", "unknown"), len(candidate_starts)
-        )
-    if skip_initial_windows:
-        starts = starts[max(0, int(skip_initial_windows)):]
+    starts = list(range(0, len(ppg_25) - win_25 + 1, stride_25))
     for start in starts:
         window = ppg_25[start:start + win_25, :]
         try:
@@ -4071,11 +4017,11 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
 def _worker_extract(args_tuple):
     """子进程入口。"""
     (sample, window_len, stride_len, fs,
-     target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
+     target_aware_stride, stride_neg, stride_pos,
      use_stage2_ir, commercial_only, selected_features) = args_tuple
     return _extract_rows_for_sample(
         sample, window_len, stride_len, fs,
-        target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
+        target_aware_stride, stride_neg, stride_pos,
         use_stage2_ir=use_stage2_ir,
         commercial_only=commercial_only,
         selected_features=selected_features,
@@ -4088,7 +4034,6 @@ def extract_features_for_split(samples,
                                fs=100,
                                target_aware_stride=False,
                                target_ratio=5.0,
-                               skip_initial_windows=DEFAULT_SKIP_INITIAL_WINDOWS,
                                use_stage2_ir=DEFAULT_USE_STAGE2_IR,
                                n_workers=None,
                                commercial_only=False,
@@ -4136,24 +4081,18 @@ def extract_features_for_split(samples,
 
     args_list = [
         (s, window_len, stride_len, fs,
-         target_aware_stride, stride_neg, stride_pos, skip_initial_windows,
+         target_aware_stride, stride_neg, stride_pos,
          use_stage2_ir, commercial_only, selected_features)
         for s in ordered_samples
     ]
 
     rows_by_sample = [[] for _ in original_samples]
     failures = []
-    skipped_after_edge_trim = []
     if n_workers == 1:
         for i, a in enumerate(args_list, 1):
             original_idx = ordered_original_indices[i - 1]
             try:
                 rows_by_sample[original_idx] = _worker_extract(a)
-            except NoUsableWindowsAfterEdgeTrim as exc:
-                sample_name = original_samples[original_idx].get(
-                    "sample_name", f"idx={original_idx}")
-                skipped_after_edge_trim.append((sample_name, exc))
-                print(f"  [SKIP] {exc}", flush=True)
             except Exception as exc:
                 sample_name = original_samples[original_idx].get(
                     "sample_name", f"idx={original_idx}")
@@ -4185,12 +4124,6 @@ def extract_features_for_split(samples,
                 sample_idx = future_to_idx[fut]
                 try:
                     rows = fut.result()
-                except NoUsableWindowsAfterEdgeTrim as exc:
-                    sample_name = original_samples[sample_idx].get(
-                        "sample_name", f"idx={sample_idx}")
-                    skipped_after_edge_trim.append((sample_name, exc))
-                    print(f"  [SKIP] {exc}", flush=True)
-                    rows = []
                 except Exception as exc:
                     sample_name = original_samples[sample_idx].get(
                         "sample_name", f"idx={sample_idx}")
@@ -4205,13 +4138,6 @@ def extract_features_for_split(samples,
                 completed += 1
                 if completed % max(1, total // 10) == 0 or completed == total:
                     print(f"  s03 progress: {completed}/{total} samples", flush=True)
-
-    if skipped_after_edge_trim:
-        print(
-            "  s03 skipped samples: "
-            f"no_windows_after_edge_trim={len(skipped_after_edge_trim)}",
-            flush=True,
-        )
 
     if failures:
         examples = "; ".join(
@@ -4239,8 +4165,6 @@ def main(args=None):
     parser.add_argument("--window_sec", type=int, default=5, choices=[3, 5],
                         help="Stage2 窗口秒数：3s (75点@25Hz) 或 5s (125点@25Hz)")
     parser.add_argument("--stride_sec", type=int, default=1)
-    parser.add_argument("--skip_initial_windows", type=int, default=DEFAULT_SKIP_INITIAL_WINDOWS,
-                        help="optional extra leading-window skip after automatic [3:-3] trimming")
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction,
                         default=DEFAULT_USE_STAGE2_IR,
                         help="legacy compatibility flag; Stage2 model features are always ambient/green/ACC only")
@@ -4309,7 +4233,6 @@ def main(args=None):
             fs=100,
             target_aware_stride=args.target_aware_stride,
             target_ratio=args.target_ratio,
-            skip_initial_windows=args.skip_initial_windows,
             use_stage2_ir=args.use_stage2_ir,
             n_workers=args.n_workers,
             commercial_only=args.commercial_only,

@@ -355,7 +355,6 @@ def test_window_cache_export_removes_only_top_level_obsolete_npz(tmp_path):
         metadata={
             "model_fingerprint": {"source": "test"},
             "feature_names": ["GREEN_AC_RMS"],
-            "skip_initial_windows": 3,
         },
     )
 
@@ -432,7 +431,7 @@ def test_export_deploy_artifacts_writes_selected_stage2_contracts(
     }
     monkeypatch.setattr(s06.joblib, "load", lambda _path: bundle)
 
-    s06.export_deploy_artifacts(tmp_path, skip_initial_windows=3)
+    s06.export_deploy_artifacts(tmp_path)
 
     deploy_dir = tmp_path / "deploy_package"
     catalog = json.loads(

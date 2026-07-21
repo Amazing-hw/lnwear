@@ -26,7 +26,6 @@ REQUIRED_NPZ_KEYS = [
     "prob_raw", "pred_raw", "quality", "ood_rate",
     "mode", "fallback", "model_threshold", "window_sec", "stride_sec",
     "cache_schema_version", "model_fingerprint_json", "feature_names_json",
-    "skip_initial_windows",
 ]
 
 DEFAULT_WARMUP_FRAMES = 5
@@ -38,7 +37,6 @@ CACHE_CONTRACT_FIELDS = (
     "model_threshold",
     "window_sec",
     "stride_sec",
-    "skip_initial_windows",
 )
 
 
@@ -98,7 +96,6 @@ def load_window_cache_npz(path):
     out["cache_schema_version"] = str(_scalar(out["cache_schema_version"]))
     out["model_fingerprint"] = json.loads(str(_scalar(out["model_fingerprint_json"])))
     out["feature_names"] = json.loads(str(_scalar(out["feature_names_json"])))
-    out["skip_initial_windows"] = int(_scalar(out["skip_initial_windows"]))
     if not isinstance(out["model_fingerprint"], dict):
         raise ValueError(f"{path} model_fingerprint_json must encode an object")
     if (not isinstance(out["feature_names"], list)
@@ -109,8 +106,6 @@ def load_window_cache_npz(path):
             raise ValueError(f"{path} key {key} must be finite")
     if out["window_sec"] <= 0 or out["stride_sec"] <= 0:
         raise ValueError(f"{path} window_sec and stride_sec must be positive")
-    if out["skip_initial_windows"] < 0:
-        raise ValueError(f"{path} skip_initial_windows must be non-negative")
     return out
 
 
