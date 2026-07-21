@@ -11,7 +11,7 @@
    按 w 编号排序并保留窗口 label 序列。
 5. 切分逻辑、输出 schema 向后兼容
 
-CLI 兼容旧版：仅新增 --n_workers 可选参数。
+CLI：可选 --n_workers 参数控制并行度（WL_FORCE_SERIAL=1 强制串行）。
 """
 
 import os

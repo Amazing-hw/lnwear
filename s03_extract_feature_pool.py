@@ -2037,14 +2037,12 @@ def _extract_legacy_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, ret
     feat["G_mean_diff_std"] = float(np.std(np.diff(g_mean_raw)))
     feat["G_mean_acdc"] = safe_div(np.sqrt(np.mean(g_mean_bp ** 2)), abs(g_mean_dc) + EPS)
 
-    # IR-G 关系
-    # Ambient
+    # Ambient statistics
     feat["Ambient_mean"] = float(np.mean(amb_raw))
     feat["Ambient_std"] = float(np.std(amb_raw))
     feat["Ambient_p95"] = float(np.percentile(amb_raw, 95))
     feat["corr_Ambient_Gmean"] = safe_corr(amb_raw, g_mean_raw)
 
-    # IR / Ambient 比值 — 皮肤接触指示器（佩戴时皮肤遮挡Ambient，比值变化显著）
     # =====================================================
     # 3. 单通道增强特征（使用FFT缓存）
     # =====================================================
