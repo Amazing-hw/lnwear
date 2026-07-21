@@ -380,11 +380,14 @@ def test_s03_attempts_all_sample_windows_then_reports_feature_failures(monkeypat
     assert len(calls) == 3
 
 
-def test_s01_accepts_prewindowed_ppg_shape():
+def test_s01_accepts_any_2d_or_3d_ppg_shape():
     assert s01.is_supported_ppg_shape((40, 300))
     assert s01.is_supported_ppg_shape((5, 40, 300))
-    assert not s01.is_supported_ppg_shape((5, 300, 40))
-    assert not s01.is_supported_ppg_shape((5, 20, 300))
+    assert s01.is_supported_ppg_shape((5, 300, 40))
+    assert s01.is_supported_ppg_shape((5, 20, 300))
+    assert s01.is_supported_ppg_shape((100, 6))
+    assert not s01.is_supported_ppg_shape((40,))
+    assert not s01.is_supported_ppg_shape((5, 40, 300, 1))
 
 
 def test_s03_normalizes_h5_prewindowed_channel_points_layout():

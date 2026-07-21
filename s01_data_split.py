@@ -35,7 +35,6 @@ FILTER_REASON_KEYS = (
     "missing_ppg_config",
     "invalid_ppg_config",
     "inconsistent_metadata",
-    "channel_count",
 )
 
 
@@ -259,12 +258,8 @@ def _scan_one_h5(h5_file):
 
 
 def is_supported_ppg_shape(shape):
-    """Accept H5 PPG with last axis as points: (40, T) or (N_win, 40, T_win)."""
-    if len(shape) == 2:
-        return int(shape[0]) == 40
-    if len(shape) == 3:
-        return int(shape[1]) == 40
-    return False
+    """Accept any 2-D (samples, channels) or 3-D (windows, samples, channels) PPG."""
+    return len(shape) in (2, 3)
 
 
 def scan_h5_samples(dataset_dir, n_workers=None):
@@ -303,11 +298,8 @@ def scan_h5_samples(dataset_dir, n_workers=None):
                 if len(futures) >= 10 and (done_count % max(1, len(futures) // 10) == 0 or done_count == len(futures)):
                     print(f"  s01 progress: {done_count}/{len(futures)} files", flush=True)
 
-    if filtered_count["channel_count"] > 0:
-        print(f"过滤样本: channel!=40: {filtered_count['channel_count']}")
-
     # 保证并行下样本顺序的确定性（按 h5_file + sample_name 排序）
-    for reason in FILTER_REASON_KEYS[:-1]:
+    for reason in FILTER_REASON_KEYS:
         if filtered_count[reason] > 0:
             print(f"filtered samples: {reason}={filtered_count[reason]}")
 
