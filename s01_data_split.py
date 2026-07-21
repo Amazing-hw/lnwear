@@ -162,9 +162,6 @@ def _scan_grouped_window_sample(h5_file, sample_name, grp, filtered):
         if not isinstance(child, h5py.Group) or "ppg" not in child:
             continue
         shape = child["ppg"].shape
-        if not is_supported_ppg_shape(shape):
-            filtered["channel_count"] += 1
-            continue
         window_index, label = parsed
         windows.append((window_index, label, child_name, shape, child))
 
@@ -231,11 +228,6 @@ def _scan_one_h5(h5_file):
                 except (TypeError, ValueError, KeyError):
                     continue
 
-                shape = grp["ppg"].shape
-
-                if not is_supported_ppg_shape(shape):
-                    filtered["channel_count"] += 1
-                    continue
                 frequency, ppg_config, reason = _validate_standard_metadata(grp)
                 if reason is not None:
                     _record_filtered(filtered, h5_file, sample_name, reason)
