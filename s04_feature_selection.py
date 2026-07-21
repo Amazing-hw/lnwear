@@ -45,8 +45,6 @@ from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 
 from s03_extract_feature_pool import (
-    DEPLOYMENT_ALLOWED_FFT_FEATURES as S03_DEPLOYMENT_ALLOWED_FFT_FEATURES,
-    DEPLOYMENT_ALLOWED_NON_FFT_FEATURES as S03_DEPLOYMENT_ALLOWED_NON_FFT_FEATURES,
     filter_deployment_friendly_stage2_features as s03_filter_deployment_friendly_stage2_features,
     filter_stage2_ir_features,
     is_deployment_friendly_stage2_feature as s03_is_deployment_friendly_stage2_feature,
@@ -223,138 +221,18 @@ META_COLS = [
 ]
 
 
-LEGACY_FEATURE_GROUPS = {
+# Retained commercial-eight candidate subset; the full feature groups are
+# derived from the governed catalog below.  There is no separate comparison
+# runtime.
+FEATURE_GROUPS = {
     "commercial_baseline": [
-        "GREEN_CORR",
-        "GREEN_AC",
-        "AMB_AC",
-        "ACC_YSUM",
-        "GREEN_DC",
-        "AMB_DC",
-        "GREEN_XCORR",
-        "FFT_PEAK_MEDIAN_RATIO",
+        "GREEN_CORR", "GREEN_AC", "AMB_AC", "ACC_YSUM",
+        "GREEN_DC", "AMB_DC", "GREEN_XCORR", "FFT_PEAK_MEDIAN_RATIO",
     ],
-    # -- 3s/75点短窗信号质量与鲁棒性 --
-    "signal_quality": [
-        "SQI_FLAT_RATIO", "SQI_SPIKE_RATIO",
-        "GREEN_ROBUST_RANGE_RATIO", "AMB_ROBUST_RANGE_RATIO",
-    ],
-    "short_window_stability": [
-        "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
-        "GTOP2_HALF_ACDC_DELTA", "GTOP2_SEG_ACDC_RANGE",
-        "GREEN_AMB_LEAK_STABILITY",
-    ],
-    "short_window_frequency": [
-        "GREEN_BAND_ENERGY_RATIO", "AMB_BAND_ENERGY_RATIO",
-    ],
-    # -- Green 单通道: 原始(4) + 鲁棒 DC/AC(6) = 10 - limit 2 --
-    "green_stats": [
-        "G_mean_mean", "G_mean_std", "G_mean_diff_std", "G_mean_acdc",
-        "GREEN_DC_MEDIAN", "GREEN_DC_IQR", "GREEN_AC_RMS", "GREEN_AC_MAD",
-        "GREEN_AC_DC_RATIO", "GREEN_DERIV_MAD",
-    ],
-    # -- Ambient 统计(11) - limit 1 --
-    "ambient_stats": [
-        "Ambient_mean", "Ambient_std", "Ambient_p95",
-        "corr_Ambient_Gmean",
-        "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
-        "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
-    ],
-    # -- 绿光三通道空间(13) - limit 2 --
-    "green_spatial": [
-        "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
-        "G_rangeNorm_mean", "G_rangeNorm_p90",
-        "G_spatial_vmag_mean", "G_spatial_vmag_p90",
-        "G_spatial_vmag_iqr", "G_spatial_vmag_std",
-        "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
-        "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
-        "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
-        "G_TOP1_TO_TOP2_AC_RATIO", "G_SPATIAL_VMAG_RANGE",
-    ],
-    # -- 绿光三通道一致性(3) - limit 1 --
-    "green_3ch_consistency": [
-        "G_bp_corr_mean", "G_bp_corr_min", "G_bp_corr_std",
-        "G_bp_lag_std",
-        "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
-        "G_TOP2_RANK_STABILITY", "G_TOP2_SWITCH_RATE",
-    ],
-    # -- Ambient 交叉泄露(5) - limit 1 --
-    "amb_cross": [
-        "GREEN_AMB_BP_CORR",
-        "GREEN_AMB_ENV_CORR",
-        "GREEN_AMB_LEAK",
-        "GREEN_AMB_SEG_CORR_RANGE",
-        "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
-    ],
-    # -- 周期性/频域: FFT + Autocorr + 谐波 (limit 2) --
-    "frequency": [
-        "GTOP2_BAND_ENERGY_RATIO", "GTOP2_FFT_PEAK_MEDIAN_RATIO", "GTOP2_DOM_FREQ",
-        "GREEN_FFT_PEAK_MEDIAN_RATIO", "GREEN_DOM_FREQ",
-        "GREEN_AUTO_CORR_PEAK", "GREEN_AUTO_CORR_LAG_SEC",
-        "AMBX_FFT_PEAK_MEDIAN_RATIO", "AMBX_DOM_FREQ",
-        "AMBX_AUTO_CORR_PEAK", "AMBX_AUTO_CORR_LAG_SEC",
-        "GREEN_FFT_peak_width_Hz", "GREEN_FFT_SNR",
-        "GREEN_FFT_harmonic_ratio", "GREEN_FFT_harmonic_present",
-        "AMB_DOM_FREQ", "AMB_FFT_PEAK_MEDIAN_RATIO",
-    ],
-    # -- 空间-光强耦合(5) - limit 1 --
-    "spatial_coupling": [
-        "corr_Gmean_G_imbalance", "corr_Gmean_vmag",
-        "corr_IR_G_imbalance", "corr_IR_vmag", "corr_Ambient_vmag",
-    ],
-    # -- 信号复杂度: Hjorth(3) + Entropy(3) = 6 - limit 2 --
-    "signal_complexity": [
-        "Hjorth_Activity", "Hjorth_Mobility", "Hjorth_Complexity",
-        "Entropy_Shannon", "Entropy_ApEn", "Entropy_SampEn",
-    ],
-    # -- 波形形态: Derivative(10) + Temporal(5) = 15 - limit 2 --
-    "waveform_morphology": [
-        "GTOP2_bp_skewness", "GTOP2_bp_kurtosis",
-        "GTOP2_zero_cross_rate", "GTOP2_abs_diff_ratio",
-        "Deriv_d1_mean", "Deriv_d1_std", "Deriv_d1_max", "Deriv_d1_min", "Deriv_d1_zcr",
-        "Deriv_d2_mean", "Deriv_d2_std", "Deriv_d2_max", "Deriv_d2_min", "Deriv_d2_zcr",
-        "Temporal_slope_mean", "Temporal_slope_std",
-        "Temporal_peak_prominence", "Temporal_peak_ratio", "Temporal_valley_ratio",
-        "GREEN_bp_skewness", "IRX_bp_skewness",
-        "GREEN_bp_kurtosis", "IRX_bp_kurtosis",
-    ],
-    # -- ACC 核心 (13) - limit 2 --
-    "acc_features": [
-        "ACC_MAG_MEAN", "ACC_MAG_STD", "ACC_MAG_MAD",
-        "ACC_AXIS_STD_SUM", "ACC_GRAVITY_DOM_RATIO",
-        "ACC_BP_RMS", "ACC_DIFF_MAD", "ACC_STILL_SCORE",
-        "ACC_MAG_P50", "ACC_MAG_P90",
-        "ACC_GREEN_BP_CORR", "ACC_IR_BP_CORR",
-        "ACC_ENERGY_TO_GREEN_AC",
-        "ACC_TO_GTOP2_AC_RATIO", "ACC_STILL_X_GREEN_STABILITY",
-        "ACC_DIFF_TO_GTOP2_DIFF_RATIO", "ACC_STILL_GREEN_MISMATCH",
-    ],
-    # -- ACC 分轴统计 (12) - limit 1 --
-    "acc_per_axis": [
-        "ACC_X_MEAN", "ACC_Y_MEAN", "ACC_Z_MEAN",
-        "ACC_X_STD", "ACC_Y_STD", "ACC_Z_STD",
-        "ACC_X_ENERGY", "ACC_Y_ENERGY", "ACC_Z_ENERGY",
-        "ACC_AXIS_MEAN_SUM", "ACC_MAG_ENERGY", "ACC_MAG_P2P",
-    ],
-    # -- ACC 震颤检测 (4) - limit 1 --
-    "acc_tremor": [
-        "ACC_TREMOR_PEAK_FREQ", "ACC_TREMOR_PEAK_POWER",
-        "ACC_TREMOR_POWER_RATIO", "ACC_LOW_MOTION_RATIO",
-    ],
-    # -- ACC 姿态/重力 (3) - limit 1 --
-    "acc_orientation": [
-        "ACC_TILT_ANGLE", "ACC_DOM_AXIS", "ACC_GRAVITY_RATIO",
-    ],
-    # -- Meta --
-    "meta": ["SIG_LEN", "SIG_SEC"],
-    "mode": ["mode"],
 }
-
-# Runtime groups are derived from the catalog. The retained commercial-eight
-# name set is only an internal candidate subset; there is no comparison runtime.
-FEATURE_GROUPS = {"commercial_baseline": list(LEGACY_FEATURE_GROUPS["commercial_baseline"])}
 for _feature_name, _feature_record in FEATURE_CATALOG.items():
     FEATURE_GROUPS.setdefault(str(_feature_record["group"]), []).append(_feature_name)
+
 
 GROUP_LIMITS_DEFAULT = {
     "signal_quality": 2,
@@ -388,137 +266,23 @@ def group_limits_for_ranking_objective(ranking_objective):
         return GROUP_LIMITS_ACCURACY_FIRST
     return GROUP_LIMITS_DEFAULT
 
-DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = {
-    # Signal quality and robust scalar features.
-    "SQI_FLAT_RATIO", "SQI_SPIKE_RATIO",
-    "GREEN_ROBUST_RANGE_RATIO", "AMB_ROBUST_RANGE_RATIO",
-    "GREEN_SEG_ACDC_CV", "AMB_SEG_ACDC_CV",
-    # Green and ambient statistics.
-    "G_mean_mean", "G_mean_std", "G_mean_diff_std", "G_mean_acdc",
-    "GREEN_DC_MEDIAN", "GREEN_DC_IQR", "GREEN_AC_RMS", "GREEN_AC_MAD",
-    "GREEN_AC_DC_RATIO", "GREEN_DERIV_MAD",
-    "Ambient_mean", "Ambient_std", "Ambient_p95", "corr_Ambient_Gmean",
-    "AMBX_DC_MEDIAN", "AMBX_DC_IQR", "AMBX_AC_RMS", "AMBX_AC_MAD",
-    "AMBX_AC_DC_RATIO", "AMBX_DERIV_MAD",
-    "GREEN_AC", "AMB_AC", "GREEN_DC", "AMB_DC", "GREEN_CORR",
-    "AMB_AC_TO_GREEN_AC", "AMB_DC_TO_GREEN_DC",
-    "GREEN_AMB_BP_CORR", "GREEN_AMB_ENV_CORR", "GREEN_AMB_LEAK",
-    # Three-green spatial and reliability features.
-    "G_imbalance_mean", "G_imbalance_p90", "G_imbalance_iqr",
-    "G_rangeNorm_mean", "G_rangeNorm_p90",
-    "G_spatial_vmag_mean", "G_spatial_vmag_p90", "G_spatial_vmag_iqr",
-    "G_spatial_vmag_std", "G_ch_dc_cv", "G_ch_dc_max_min_ratio",
-    "GCH_DC_RANGE_RATIO", "GCH_AC_RANGE_RATIO",
-    "G_2OF3_AC_SUPPORT", "G_TOP2_TO_ALL_AC_RATIO", "G_TOP2_CORR_MIN",
-    "G_WEAK_CHANNEL_GAP", "G_SPATIAL_STABILITY_SCORE",
-    "G_TOP1_TO_TOP2_AC_RATIO", "G_TOP2_RANK_STABILITY", "G_TOP2_SWITCH_RATE",
-    "G_SPATIAL_VMAG_RANGE", "GREEN_AMB_SEG_CORR_RANGE",
-    # Top-2 green non-FFT statistics.
-    "GTOP2_ROBUST_RANGE_RATIO", "GTOP2_SEG_ACDC_CV",
-    "GTOP2_DC_MEDIAN", "GTOP2_DC_IQR", "GTOP2_AC_RMS", "GTOP2_AC_MAD",
-    "GTOP2_AC_DC_RATIO", "GTOP2_DERIV_MAD",
-    "GTOP2_bp_skewness", "GTOP2_bp_kurtosis",
-    "GTOP2_zero_cross_rate", "GTOP2_abs_diff_ratio",
-    "GTOP2_HALF_ACDC_DELTA", "GTOP2_SEG_ACDC_RANGE",
-    "GREEN_AMB_LEAK_STABILITY",
-    # ACC features that stay simple for endpoint deployment.
-    "ACC_MAG_MEAN", "ACC_MAG_STD", "ACC_MAG_MAD", "ACC_AXIS_STD_SUM",
-    "ACC_GRAVITY_DOM_RATIO", "ACC_BP_RMS", "ACC_DIFF_MAD", "ACC_STILL_SCORE",
-    "ACC_MAG_P50", "ACC_MAG_P90", "ACC_YSUM",
-    "ACC_X_MEAN", "ACC_Y_MEAN", "ACC_Z_MEAN",
-    "ACC_X_STD", "ACC_Y_STD", "ACC_Z_STD",
-    "ACC_X_ENERGY", "ACC_Y_ENERGY", "ACC_Z_ENERGY",
-    "ACC_AXIS_MEAN_SUM", "ACC_MAG_ENERGY", "ACC_MAG_P2P",
-    "ACC_TILT_ANGLE", "ACC_DOM_AXIS", "ACC_GRAVITY_RATIO",
-    "ACC_ENERGY_TO_GREEN_AC", "ACC_GREEN_BP_CORR",
-    "ACC_TO_GTOP2_AC_RATIO", "ACC_STILL_X_GREEN_STABILITY",
-    "ACC_DIFF_TO_GTOP2_DIFF_RATIO", "ACC_STILL_GREEN_MISMATCH",
-    # Metadata.
-    "SIG_LEN", "SIG_SEC", "mode",
-    "TOTAL_INVALID_COUNT", "PPG_INVALID_COUNT", "GREEN_INVALID_COUNT",
-    # GREEN/GTOP2/AMBX waveform features (C-friendly: diff, var, sqrt, polyfit)
-    "GREEN_Deriv_d1_mean", "GREEN_Deriv_d1_std", "GREEN_Deriv_d1_max",
-    "GREEN_Deriv_d1_min", "GREEN_Deriv_d1_zcr",
-    "GREEN_Temporal_slope_mean", "GREEN_Temporal_slope_std",
-    "GREEN_Temporal_peak_prominence", "GREEN_Temporal_peak_ratio",
-    "GREEN_Hjorth_Activity", "GREEN_Hjorth_Mobility",
-    "GREEN_Entropy_SampEn",
-    "GREEN_bp_skewness", "GREEN_bp_kurtosis",
-    "GREEN_FFT_SNR", "GREEN_FFT_harmonic_ratio", "GREEN_FFT_harmonic_present",
-    "GREEN_FFT_peak_width_Hz", "GREEN_XCORR",
-    "GREEN_BAND_ENERGY_RATIO", "GREEN_FFT_PEAK_MEDIAN_RATIO", "GREEN_DOM_FREQ",
-    "FFT_PEAK_MEDIAN_RATIO",
-    "GREEN_SAT_FRAC", "GREEN_CLIP_RATE",
-    "GTOP2_Deriv_d1_mean", "GTOP2_Deriv_d1_std", "GTOP2_Deriv_d1_max",
-    "GTOP2_Deriv_d1_min", "GTOP2_Deriv_d1_zcr",
-    "GTOP2_Temporal_slope_mean", "GTOP2_Temporal_slope_std",
-    "GTOP2_Temporal_peak_prominence", "GTOP2_Temporal_peak_ratio",
-    "GTOP2_Hjorth_Activity", "GTOP2_Hjorth_Mobility",
-    "AMBX_Deriv_d1_mean", "AMBX_Deriv_d1_std", "AMBX_Deriv_d1_max",
-    "AMBX_Deriv_d1_min", "AMBX_Deriv_d1_zcr",
-    "AMBX_Temporal_slope_mean", "AMBX_Temporal_slope_std",
-    "AMBX_Temporal_peak_prominence", "AMBX_Temporal_peak_ratio",
-    "AMBX_bp_skewness", "AMBX_bp_kurtosis",
-    # ACC tremor (C-friendly: FFT + band sum)
-    "ACC_TREMOR_PEAK_FREQ", "ACC_TREMOR_PEAK_POWER",
-    "ACC_TREMOR_POWER_RATIO", "ACC_LOW_MOTION_RATIO",
-    "ACC_SAT_FRAC", "ACC_CLIP_RATE",
-    # Green dropout and spatial correlation
-    "G_DROPOUT_COUNT", "G_DROPOUT_ANGLE", "G_MIN_CHANNEL_ID",
-    "G_TOP2_CHANNEL_COUNT", "G_TOP2_WORST_IDX",
-    "G_bp_corr_mean", "G_bp_corr_min", "G_bp_corr_std", "G_bp_lag_std",
-    "corr_Ambient_vmag", "corr_Gmean_G_imbalance", "corr_Gmean_vmag",
-}
-
-DEPLOYMENT_FFT_FEATURE_SOURCES = {
-    "GTOP2_BAND_ENERGY_RATIO": "green_top2",
-    "GTOP2_FFT_PEAK_MEDIAN_RATIO": "green_top2",
-    "GTOP2_DOM_FREQ": "green_top2",
-    "AMB_BAND_ENERGY_RATIO": "ambient",
-    "AMB_FFT_PEAK_MEDIAN_RATIO": "ambient",
-    "AMB_DOM_FREQ": "ambient",
-    "AMBX_FFT_PEAK_MEDIAN_RATIO": "ambient",
-    "AMBX_DOM_FREQ": "ambient",
-    "GREEN_BAND_ENERGY_RATIO": "green",
-    "GREEN_FFT_PEAK_MEDIAN_RATIO": "green",
-    "GREEN_DOM_FREQ": "green",
-    "FFT_PEAK_MEDIAN_RATIO": "green",
-    "GMEDIAN_FFT_PEAK_MEDIAN_RATIO": "green_median",
-    "G_ZONE_DOM_FREQ_MAD_HZ": "green_zones",
-    "G_ZONE_HR_SUPPORT_RATIO": "green_zones",
-    "G_PAIR_FREQ_GAP_MIN_HZ": "green_zones",
-    "G_PAIR_FREQ_GAP_MEDIAN_HZ": "green_zones",
-    "G_ZONE_PHASE_CONCENTRATION": "green_zones",
-    "G_PAIR_SPECTRAL_CONSENSUS": "green_zones",
-}
-
-DEPLOYMENT_FORBIDDEN_TOKENS = (
-    "coherence",  # Welch PSD + cross-spectrum, C-port hard
-)
-
-DEPLOYMENT_ALLOWED_FFT_SOURCES = {
-    "green_top2", "green", "ambient", "green_median", "green_zones"
-}
-
-# s03 is the source of truth for the model-facing deployment-friendly feature pool.
-# s04 may rank and select features, but it must not define a second allowlist.
-DEPLOYMENT_ALLOWED_NON_FFT_FEATURES = S03_DEPLOYMENT_ALLOWED_NON_FFT_FEATURES
-DEPLOYMENT_ALLOWED_FFT_FEATURES = S03_DEPLOYMENT_ALLOWED_FFT_FEATURES
-
-
 def _deployment_fft_source_rank(source):
     order = {
         "green_top2": 0,
         "ambient": 1,
         "green": 2,
         "green_median": 3,
-        "green_zones": 4,
+        "green_3zone": 4,
+        "green_3zone_pairs": 5,
     }
     return order.get(source, 99)
 
 
 def deployment_fft_source_for_feature(feature):
-    return DEPLOYMENT_FFT_FEATURE_SOURCES.get(str(feature))
+    record = FEATURE_CATALOG.get(str(feature))
+    if record is None or not bool(record.get("fft")):
+        return None
+    return str(record["signal_source"])
 
 
 def is_deployment_allowed_feature(feature):

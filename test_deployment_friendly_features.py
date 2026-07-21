@@ -58,7 +58,7 @@ def test_deployment_feature_cost_summary_counts_reused_fft_sources():
     assert summary["feature_set"] == "deployment_friendly"
     assert summary["fft_source_count"] == 4
     assert summary["fft_sources"] == [
-        "green_top2", "ambient", "green_median", "green_zones"
+        "green_top2", "ambient", "green_median", "green_3zone"
     ]
     assert summary["forbidden_selected"] == []  # AMB_BAND_ENERGY_RATIO now allowed
 
@@ -129,8 +129,6 @@ def test_s04_deployment_policy_delegates_to_s03_source_of_truth():
         "IRX_bp_skewness",
     ]
 
-    assert s04.DEPLOYMENT_ALLOWED_NON_FFT_FEATURES is s03.DEPLOYMENT_ALLOWED_NON_FFT_FEATURES
-    assert s04.DEPLOYMENT_ALLOWED_FFT_FEATURES is s03.DEPLOYMENT_ALLOWED_FFT_FEATURES
     for name in features:
         assert s04.is_deployment_allowed_feature(name) == s03.is_deployment_friendly_stage2_feature(name)
 

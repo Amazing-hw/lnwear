@@ -557,7 +557,7 @@ def _finalize_window_inference(
     if not valid_indices:
         base["fallback"] = True
         if candidate_count == 0:
-            base["fallback_reason"] = "no_eligible_windows_after_trim"
+            base["fallback_reason"] = "no_eligible_windows"
         else:
             first_error = window_errors[0]["error"] if window_errors else "unknown error"
             base["fallback_reason"] = (

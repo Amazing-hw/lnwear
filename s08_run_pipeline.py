@@ -57,22 +57,22 @@ count in auto mode, pass one explicit value, for example:
 
 用法:
     # 第一阶段：生成排序 CSV 后暂停
-    python new/s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
+    python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts
 
     # 第二阶段：人工编辑 CSV 后恢复训练、评估和部署导出
-    python new/s08_run_pipeline.py --artifact_dir artifacts --skip s01,s03,s04
+    python s08_run_pipeline.py --artifact_dir artifacts --skip s01,s03,s04
 
     # 需要时再显式打开 NPZ 缓存导出和 s07 后处理搜参
-    python new/s08_run_pipeline.py --artifact_dir artifacts --skip s01,s03,s04 --with_postprocess
+    python s08_run_pipeline.py --artifact_dir artifacts --skip s01,s03,s04 --with_postprocess
 
     # 跳过某些步骤
-    python new/s08_run_pipeline.py --skip s03,s04
+    python s08_run_pipeline.py --skip s03,s04
 
     # 只跑到特征筛选
-    python new/s08_run_pipeline.py --stop_after s04
+    python s08_run_pipeline.py --stop_after s04
 
     # 只复用已有 artifacts 做评估和部署导出
-    python new/s08_run_pipeline.py --artifact_dir artifacts --skip s01,s03,s04,s04_search,s05
+    python s08_run_pipeline.py --artifact_dir artifacts --skip s01,s03,s04,s04_search,s05
 
 流程:
     s01: 数据扫描 & train/valid/test 切分

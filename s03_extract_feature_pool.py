@@ -2337,8 +2337,6 @@ def _extract_legacy_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25, ret
     # 且 s05/s06 的 fill+clip 链会在此基础上做额外的防御性处理。
     # 训练与推理使用相同的 s03 代码，因此这一行为在两端一致，不构成训练-部署 gap。
 
-    # feat = filter_deployment_friendly_stage2_features(feat)  # disabled: all features C-friendly
-
     # ---- Invalid feature count (before NaN→0.0 fill) ----
     # XGBoost runs on every legal window and excludes IR-derived candidates.
     # IR-derived keys must not enter the Stage2 model-facing pool; failing here
