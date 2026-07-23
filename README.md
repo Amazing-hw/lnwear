@@ -217,6 +217,11 @@ python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --comm
 - hard-negative 候选只使用 train OOF 误报挖掘；只有 valid 指标满足接受条件才替换参考模型。
 - test 只用于冻结配置后的只读最终评估，不参与特征、阈值或超参数选择。
 
+模型输入采用特征感知裁剪，而不是对全部特征统一压缩：
+
+- 模型输入不执行任何基于训练集分布的 IQR/分位数裁剪：所有有限特征值原样进入 XGBoost；`NaN` 与 `inf` 仅使用训练集得到的 `fill_values` 填充。
+- 公式内部用于 `arccos`、相关性、熵、稳健偏度和 ACC 孤立毛刺保护的 `np.clip` 不受该策略影响。这些保护服务于数学定义、数值稳定性或单点传感器异常抑制，而不是拟合训练集的特征分布。
+
 相同输入、相同人工特征 CSV、相同依赖环境和相同参数下，重复训练应得到相同结果；搜参范围是否充分影响可达到的最优准确率，但不应造成随机漂移。默认数据划分、模型搜索和校准种子均为 42，s04 并行 fold 也按固定任务顺序归并。若重复运行结果不同，先比较两次 `final_model_config.json` 中的 `fingerprint`（特别是 `splits_sha256`、`feature_pool_train_sha256`、`feature_pool_valid_sha256`）、`feature_selection`、`xgboost_params`、`window_model_threshold` 和 `valid_best_threshold_metrics`。可临时加 `--no-model_search_cache` 做一次无缓存对照；正确缓存不应改变结果。
 
 如需无人值守基线：

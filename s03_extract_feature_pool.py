@@ -34,6 +34,7 @@ import re
 import warnings as _commercial_warnings
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, Tuple
 
 import h5py
 import numpy as np
@@ -700,7 +701,7 @@ def remove_step(x, step_k=10.0):
     return x
 
 # 全局缓存 FIR bandpass 核，避免每窗重算。C 可直译：sinc + Hamming 窗 + 卷积。
-_FIR_BANDPASS_CACHE = {}
+_FIR_BANDPASS_CACHE: Dict[Tuple[float, float, float, int], np.ndarray] = {}
 
 
 def _get_fir_bandpass_kernel(fs, lowcut, highcut, numtaps=65):
@@ -1218,7 +1219,11 @@ def _diff_spike_ratio(x, k=6.0):
     d = np.abs(np.diff(x))
     mad = robust_mad(d)
     if mad <= EPS:
-        return 0.0
+        # A flat or constant-slope trace has zero derivative MAD.  Retain the
+        # no-spike result for a constant slope, but still expose isolated
+        # excursions around that slope (for example, a single ADC glitch).
+        baseline = float(np.median(d))
+        return float(np.mean(np.abs(d - baseline) > _scale_floor(x)))
     return float(np.mean(d > k * mad))
 
 
@@ -3671,24 +3676,22 @@ def extract_window_features(ppg_window, fs=25.0, acc_window=None,
         use_stage2_ir=use_stage2_ir,
         selected_features=selected_features,
     )
-    if acc_window is not None and (
+    expected_commercial_len = 125 * (int(fs) // 25)
+    if len(ppg_window) == expected_commercial_len and acc_window is not None and (
         selected_features is None
         or any(name in COMMERCIAL_STAGE2_FIELDS for name in selected_features)
     ):
-        try:
-            with _commercial_warnings.catch_warnings():
-                _commercial_warnings.simplefilter("ignore", RuntimeWarning)
-                commercial = extract_commercial_feature_overrides(
-                    ppg_window, acc_window, frequency=int(fs), ppg_config=resolved_mode,
-                )
-            if selected_features is None:
-                features.update(commercial)
-            else:
-                for name in selected_features:
-                    if name in commercial:
-                        features[name] = commercial[name]
-        except Exception:
-            pass
+        with _commercial_warnings.catch_warnings():
+            _commercial_warnings.simplefilter("ignore", RuntimeWarning)
+            commercial = extract_commercial_feature_overrides(
+                ppg_window, acc_window, frequency=int(fs), ppg_config=resolved_mode,
+            )
+        if selected_features is None:
+            features.update(commercial)
+        else:
+            for name in selected_features:
+                if name in commercial:
+                    features[name] = commercial[name]
     return features
 
 # =========================================================

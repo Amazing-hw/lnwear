@@ -46,12 +46,10 @@ from s03_extract_feature_pool import (
     get_channels_from_window,
     is_stage2_ir_feature,
     extract_feature_pool_from_window,
+    extract_stage2_window,
     extract_commercial_feature_overrides,
     COMMERCIAL_STAGE2_FIELDS,
     align_acc_window,
-    extract_acc_features,
-    extract_acc_ppg_cross_features,
-    extract_acc_green_coupling_features,
     validate_h5_file,
     load_grouped_window_metadata,
 )
@@ -252,7 +250,6 @@ def apply_preprocess(feat_dict_list, bundle=None):
 
     feature_names = b["feature_names"]
     fill_values = b["fill_values"]
-    clip_bounds = b.get("clip_bounds", {})  # 向后兼容旧 bundle（无 clip_bounds）
 
     df = pd.DataFrame(feat_dict_list)
 
@@ -264,12 +261,6 @@ def apply_preprocess(feat_dict_list, bundle=None):
     for c in feature_names:
         df[c] = df[c].replace([np.inf, -np.inf], np.nan)
         df[c] = df[c].fillna(fill_values[c])
-    for c, bound in clip_bounds.items():
-        if c not in df.columns or not isinstance(bound, (list, tuple)) or len(bound) != 2:
-            continue
-        lo, hi = float(bound[0]), float(bound[1])
-        df[c] = df[c].clip(lower=lo, upper=hi)
-
     return df.values.astype(np.float64)
 
 
@@ -535,6 +526,44 @@ def _apply_selected_commercial_overrides(
     return feat
 
 
+def _extract_model_window_features(
+    ppg_window,
+    acc_window,
+    *,
+    ppg_config,
+    selected_features,
+    use_stage2_ir=DEFAULT_USE_STAGE2_IR,
+    source_ppg=None,
+    source_acc=None,
+    source_frequency=25,
+):
+    """Build one inference feature row through the training's canonical path.
+
+    The governed optical and ACC candidates must be computed by
+    ``extract_stage2_window`` on both sides.  ``source_*`` is used only for the
+    exact commercial-field override, which intentionally retains its original
+    25/100 Hz input contract.
+    """
+    features, _, _ = extract_stage2_window(
+        ppg_window,
+        mode=int(ppg_config),
+        fs=25,
+        acc_window=acc_window,
+        use_stage2_ir=use_stage2_ir,
+        selected_features=selected_features,
+    )
+    if source_ppg is not None:
+        _apply_selected_commercial_overrides(
+            features,
+            source_ppg,
+            source_acc,
+            source_frequency,
+            ppg_config,
+            selected_features,
+        )
+    return features
+
+
 def _finalize_window_inference(
     base,
     feats_list,
@@ -631,14 +660,6 @@ def _infer_prewindowed_sample(base, ppg, acc,
             window = raw_window.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
                 raw_window, src_fs=100, tgt_fs=FEATURE_FS
             )
-            ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-            feat, preprocessed = extract_feature_pool_from_window(
-                ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
-                fs=FEATURE_FS, return_preprocessed=True,
-                selected_features=bundle.get("feature_names"),
-            )
-            feat["mode"] = float(mode)
-
             acc_seg = None
             raw_acc = None
             if acc is not None and is_prewindowed_signal(acc) and step < acc.shape[0]:
@@ -649,23 +670,20 @@ def _infer_prewindowed_sample(base, ppg, acc,
                     )
                 except Exception:
                     acc_seg = None
-            if acc_seg is not None and len(acc_seg) > 0:
-                feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                green_bp = preprocessed.get("g_top2_bp")
-                if green_bp is not None:
-                    feat.update(extract_acc_ppg_cross_features(acc_seg, green_bp, fs=FEATURE_FS))
-                    green_raw = preprocessed.get("g_top2_raw")
-                    if green_raw is not None:
-                        feat.update(extract_acc_green_coupling_features(acc_seg, green_raw, green_bp))
-            if int(round(float(window_sec) * FEATURE_FS)) == 125:
-                _apply_selected_commercial_overrides(
-                    feat,
-                    raw_window,
-                    raw_acc,
-                    25 if native_25hz else 100,
-                    mode,
-                    bundle.get("feature_names"),
-                )
+            commercial_input = (
+                (raw_window, raw_acc, 25 if native_25hz else 100)
+                if int(round(float(window_sec) * FEATURE_FS)) == 125 else (None, None, 25)
+            )
+            feat = _extract_model_window_features(
+                window,
+                acc_seg,
+                ppg_config=mode,
+                selected_features=bundle.get("feature_names"),
+                use_stage2_ir=use_stage2_ir,
+                source_ppg=commercial_input[0],
+                source_acc=commercial_input[1],
+                source_frequency=commercial_input[2],
+            )
 
             feats_list.append(feat)
             quality_metas.append({
@@ -782,25 +800,13 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
             # Stage2: PPG @ 25Hz
             window = ppg_25[s2_start:s2_start + win_25, :]
             try:
-                ir, ambient, g1, g2, g3 = get_channels_from_window(window, mode)
-                feat, preprocessed = extract_feature_pool_from_window(
-                    ir=ir, ambient=ambient, g1=g1, g2=g2, g3=g3,
-                    fs=FEATURE_FS, return_preprocessed=True,
-                    selected_features=bundle.get("feature_names"),
-                )
-                feat["mode"] = float(mode)
+                acc_seg = None
                 if acc_25 is not None and len(acc_25) > 0:
                     acc_seg = align_acc_window(acc_25, len(ppg_25), s2_start, win_25,
                                                fs_ppg=FEATURE_FS, fs_acc=FEATURE_FS)
-                    feat.update(extract_acc_features(acc_seg, fs=FEATURE_FS, prefix="ACC"))
-                    green_bp = preprocessed.get("g_top2_bp")
-                    if green_bp is not None:
-                        feat.update(extract_acc_ppg_cross_features(
-                            acc_seg, green_bp, fs=FEATURE_FS))
-                        green_raw = preprocessed.get("g_top2_raw")
-                        if green_raw is not None:
-                            feat.update(extract_acc_green_coupling_features(
-                                acc_seg, green_raw, green_bp))
+                raw_ppg = None
+                raw_acc = None
+                commercial_frequency = FEATURE_FS
                 if win_25 == 125:
                     source_stride = int(frequency // FEATURE_FS)
                     source_start = int(s2_start * source_stride)
@@ -809,14 +815,17 @@ def _infer_one_sample(sample, window_sec, stride_sec, bundle,
                     raw_acc = None if acc is None else acc[
                         source_start:source_start + source_len
                     ]
-                    _apply_selected_commercial_overrides(
-                        feat,
-                        raw_ppg,
-                        raw_acc,
-                        frequency,
-                        mode,
-                        bundle.get("feature_names"),
-                    )
+                    commercial_frequency = frequency
+                feat = _extract_model_window_features(
+                    window,
+                    acc_seg,
+                    ppg_config=mode,
+                    selected_features=bundle.get("feature_names"),
+                    use_stage2_ir=use_stage2_ir,
+                    source_ppg=raw_ppg,
+                    source_acc=raw_acc,
+                    source_frequency=commercial_frequency,
+                )
                 feats_list.append(feat)
                 quality_metas.append({
                     "Ambient_std": feat.get("Ambient_std"),
@@ -2312,7 +2321,7 @@ def export_deploy_artifacts(artifact_dir):
         ("n_selected_features", len(selected_features)),
         ("selected_features", selected_features),
         ("fill_values", bundle["fill_values"]),
-        ("clip_bounds", bundle.get("clip_bounds", {})),
+        ("clip_bounds", {}),
         ("quality_thresholds", bundle.get("quality_thresholds", {})),
         ("feature_quantiles", bundle.get("feature_quantiles", {})),
         ("fingerprint", bundle.get("fingerprint", {})),
@@ -2748,7 +2757,7 @@ def main(args=None):
     parser.add_argument("--stride_sec", type=int, default=1)
     parser.add_argument("--use_stage2_ir", action=argparse.BooleanOptionalAction,
                         default=None,
-                        help="whether Stage2 feature extraction uses IR channel values; defaults to model bundle metadata")
+                        help="legacy compatibility flag; Stage2 IR is always disabled")
     parser.add_argument("--optimize", action="store_true")
     parser.add_argument("--optimize_split", type=str, default="valid",
                         choices=["train", "valid", "test"])
@@ -2865,7 +2874,6 @@ def main(args=None):
         n_workers=args.n_workers,
         use_stage2_ir=use_stage2_ir,
     )
-
     # XGBoost 主指标与可选后处理参考指标
     sample_summary, details = compute_sample_metrics(
         results, args.method, postprocess_cfg, bundle["threshold"],

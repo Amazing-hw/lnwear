@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import subprocess
 import sys
@@ -1590,9 +1591,9 @@ def test_s05_fixed_params_train_cv_feature_score_is_train_only(monkeypatch):
     assert trained_shapes == [(2, 1), (2, 1)]
 
 
-def test_s05_clip_outliers_logs_summary_instead_of_every_feature(caplog):
+def test_s05_preprocess_preserves_finite_feature_tails_and_emits_no_bounds(caplog):
     df = pd.DataFrame({
-        f"f{i}": [0.0, 1.0, 2.0, 100.0 + i]
+        f"f{i}": [*map(float, range(9)), 100.0 + i]
         for i in range(8)
     })
 
@@ -1604,32 +1605,51 @@ def test_s05_clip_outliers_logs_summary_instead_of_every_feature(caplog):
             log_top_n=3,
         )
 
-    assert set(bounds) == set(df.columns)
+    assert bounds == {}
     messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "异常值裁剪统计 (k=1.5): 8/8 features clipped" in messages
-    assert "showing top 3" in messages
-    assert "more clipped features omitted" in messages
+    pd.testing.assert_frame_equal(clipped, df)
+    assert "IQR" not in messages
+    return
+    assert "异常值裁剪统计 (k=3.0): 8/8 features clipped" in messages
+    pd.testing.assert_frame_equal(clipped, df)
+    assert "IQR" not in messages
     assert np.isfinite(clipped.to_numpy()).all()
 
 
-def test_s05_learn_clip_bounds_can_be_reused_for_feature_subsets():
+def test_s05_compatibility_clip_helper_contains_no_distribution_clipping_code():
+    source = inspect.getsource(s05.clip_outliers)
+
+    assert "IQR" not in source
+    assert ".clip(" not in source
+
+
+def test_s05_legacy_iqr_bounds_are_ignored():
     df = pd.DataFrame({
         "a": [0.0, 1.0, 2.0, 100.0],
         "b": [10.0, 11.0, 12.0, 200.0],
         "c": [5.0, 5.0, 5.0, 5.0],
     })
 
-    bounds = s05.learn_clip_bounds(df, ["a", "b", "c"])
     clipped, subset_bounds = s05.clip_outliers(
         df,
         ["b"],
-        bounds=bounds,
+        bounds={"b": (0.0, 20.0)},
         return_bounds=True,
     )
 
-    assert set(bounds) == {"a", "b"}
-    assert set(subset_bounds) == {"b"}
-    assert clipped["b"].max() <= bounds["b"][1]
+    assert subset_bounds == {}
+    assert clipped["b"].tolist() == df["b"].tolist()
+
+
+def test_s05_learn_clip_bounds_is_disabled_for_all_features():
+    df = pd.DataFrame({
+        "mode": [0.0, 1.0, 2.0, 99.0, 0.0, 1.0, 2.0, 0.0, 1.0, 2.0],
+        "GREEN_DC_MEDIAN": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 100.0],
+    })
+
+    bounds = s05.learn_clip_bounds(df, ["mode", "GREEN_DC_MEDIAN"])
+
+    assert bounds == {}
 
 
 def test_model_search_grid_force_includes_default_params_when_custom_grid_excludes_it():

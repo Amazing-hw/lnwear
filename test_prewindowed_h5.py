@@ -546,8 +546,8 @@ def test_s06_prewindowed_all_feature_failures_are_explicit_fallback(monkeypatch)
     }
     monkeypatch.setattr(
         s06,
-        "extract_feature_pool_from_window",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("forced feature failure")),
+        "_extract_model_window_features",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("forced feature failure")),
     )
 
     result = s06._infer_prewindowed_sample(
@@ -584,13 +584,13 @@ def test_s06_prewindowed_partial_failure_drops_invalid_window_and_keeps_alignmen
     }
     calls = {"count": 0}
 
-    def extract_or_fail(**_kwargs):
+    def extract_or_fail(*_args, **_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("first window failed")
-        return {"GREEN_CORR": 1.0}, {"g_top2_bp": np.ones(125)}
+        return {"GREEN_CORR": 1.0}
 
-    monkeypatch.setattr(s06, "extract_feature_pool_from_window", extract_or_fail)
+    monkeypatch.setattr(s06, "_extract_model_window_features", extract_or_fail)
     monkeypatch.setattr(
         s06,
         "predict_label_windows",
@@ -622,8 +622,8 @@ def test_s06_continuous_all_feature_failures_are_explicit_fallback(monkeypatch):
     monkeypatch.setattr(s06, "load_acc", lambda _sample: None)
     monkeypatch.setattr(
         s06,
-        "extract_feature_pool_from_window",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("continuous feature failure")),
+        "_extract_model_window_features",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("continuous feature failure")),
     )
 
     result = s06._infer_one_sample(

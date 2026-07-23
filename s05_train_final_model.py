@@ -59,6 +59,14 @@ from scientific_figures import save_scientific_figure
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Kept only to accept historical internal call signatures; it is never applied.
+DEFAULT_IQR_CLIP_K = None
+
+
+def learn_clip_bounds(df, columns, k=None):
+    """Compatibility shim: distribution-derived model-input bounds are disabled."""
+    del df, columns, k
+    return {}
 
 def enforce_no_stage2_ir_features(feature_names, context):
     """Filter stale IR-derived features before Stage2 model training/export."""
@@ -641,27 +649,8 @@ def prepare_valid_calibration_threshold_data(df_valid, selected_features, fill_v
     }
 
 
-def learn_clip_bounds(df, columns, k=1.5):
-    """Learn IQR clip bounds once from train rows for the requested numeric columns."""
-    cols = [c for c in columns
-            if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
-    if not cols:
-        return {}
-
-    sub = df[cols]
-    q1 = sub.quantile(0.25)
-    q3 = sub.quantile(0.75)
-    iqr = q3 - q1
-    valid_cols = [c for c in cols if iqr.get(c, 0.0) > 1e-10]
-    if not valid_cols:
-        return {}
-
-    lower = q1[valid_cols] - k * iqr[valid_cols]
-    upper = q3[valid_cols] + k * iqr[valid_cols]
-    return {c: (float(lower[c]), float(upper[c])) for c in valid_cols}
-
-
-def _log_clip_summary(clipped_cols, total_features=None, k=1.5, log_top_n=20):
+def _log_clip_summary(clipped_cols, total_features=None,
+                      k=DEFAULT_IQR_CLIP_K, log_top_n=20):
     if not clipped_cols:
         return
     log_top_n = max(0, int(log_top_n))
@@ -695,14 +684,15 @@ def _log_clip_summary(clipped_cols, total_features=None, k=1.5, log_top_n=20):
         logger.info("  ... %d more clipped features omitted", omitted)
 
 
-def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False, log_top_n=20):
+def _deprecated_iqr_clip_outliers(df, columns, k=DEFAULT_IQR_CLIP_K, bounds=None,
+                                  return_bounds=False, log_top_n=20):
     """
     基于 IQR 的异常值裁剪（向量化版）。
 
     参数:
         df: 输入 DataFrame
         columns: 需要裁剪的列名列表
-        k: IQR 倍数，默认 1.5
+        k: IQR 倍数，默认 3.0；catalog 已定义理论范围的特征跳过统计裁剪
         bounds: dict[col -> (lower, upper)] 预先计算好的裁剪边界。给定时跳过 IQR 估计直接应用。
         return_bounds: 是否同时返回 bounds 字典（仅 bounds=None 时有意义）。
         log_top_n: 最多打印多少个被裁剪特征；其余只汇总，避免搜参日志刷屏。
@@ -711,7 +701,12 @@ def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False, log_top_
         若 return_bounds=False：DataFrame
         若 return_bounds=True：  (DataFrame, bounds_dict)
     """
+    # Model-input clipping based on train-set distribution is intentionally
+    # disabled.  It can collapse valid deployment tails that were not fully
+    # represented by the training collection.  Keep this compatibility helper
+    # while the training flow is migrated away from its historical name.
     df = df.copy()
+    return (df, {}) if return_bounds else df
 
     cols = [c for c in columns
             if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
@@ -762,6 +757,14 @@ def clip_outliers(df, columns, k=1.5, bounds=None, return_bounds=False, log_top_
     _log_clip_summary(clipped_cols, total_features=len(valid_cols), k=k, log_top_n=log_top_n)
 
     return (df, learned_bounds) if return_bounds else df
+
+
+def clip_outliers(df, columns=None, k=None, bounds=None,
+                  return_bounds=False, log_top_n=20):
+    """Keep all finite model-input values; retained for call compatibility."""
+    del columns, k, bounds, log_top_n
+    output = df.copy()
+    return (output, {}) if return_bounds else output
 
 
 def prepare_fill_values(df_train, selected_features):
@@ -2857,10 +2860,13 @@ def _train_for_k(args, k, features, df_train_raw, df_valid_raw, train_groups,
             for f in features
             if f in clip_bounds_cache
         }
-        df_train = clip_outliers(df_train_raw, features, k=1.5, bounds=clip_bounds)
+        df_train = clip_outliers(
+            df_train_raw, features, k=DEFAULT_IQR_CLIP_K, bounds=clip_bounds)
     else:
-        df_train, clip_bounds = clip_outliers(df_train_raw, features, k=1.5, return_bounds=True)
-    df_valid = clip_outliers(df_valid_raw, features, k=1.5, bounds=clip_bounds)
+        df_train, clip_bounds = clip_outliers(
+            df_train_raw, features, k=DEFAULT_IQR_CLIP_K, return_bounds=True)
+    df_valid = clip_outliers(
+        df_valid_raw, features, k=DEFAULT_IQR_CLIP_K, bounds=clip_bounds)
 
     # fill
     fill_values = prepare_fill_values(df_train, features)
@@ -3347,7 +3353,8 @@ def main(args=None):
             r["feature"] for r in _ranked[:_clip_feature_limit]
             if r.get("feature") in df_train_raw.columns
         ]
-        _clip_bounds_cache = learn_clip_bounds(df_train_raw, _clip_feature_candidates, k=1.5)
+        _clip_bounds_cache = learn_clip_bounds(
+            df_train_raw, _clip_feature_candidates, k=DEFAULT_IQR_CLIP_K)
         logger.info(
             "预计算 clip bounds: %d/%d candidate features (reuse across k/local-swap)",
             len(_clip_bounds_cache),
@@ -3358,7 +3365,8 @@ def main(args=None):
         _all_features = [r["feature"] for r in _ranked]
         _feats_tmp = _all_features[:min(10, len(_all_features))]
         _tmp_bounds = {f: _clip_bounds_cache[f] for f in _feats_tmp if f in _clip_bounds_cache}
-        _df_tmp = clip_outliers(df_train_raw, _feats_tmp, k=1.5, bounds=_tmp_bounds)
+        _df_tmp = clip_outliers(
+            df_train_raw, _feats_tmp, k=DEFAULT_IQR_CLIP_K, bounds=_tmp_bounds)
         _fv_tmp = prepare_fill_values(_df_tmp, _feats_tmp)
         _X_tmp, _y_tmp, _ = prepare_xy(_df_tmp, _feats_tmp, fill_values=_fv_tmp)
         _train_groups = (df_train_raw["sample_name"].astype("object").to_numpy()
@@ -3417,7 +3425,7 @@ def main(args=None):
         _df_valid_final = clip_outliers(
             df_valid_raw,
             selected_features,
-            k=1.5,
+            k=DEFAULT_IQR_CLIP_K,
             bounds=clip_bounds,
         )
         _valid_splits = prepare_valid_calibration_threshold_data(
@@ -3441,16 +3449,21 @@ def main(args=None):
         neg_count, pos_count = _neg_count, _pos_count
         p_train_pos = _p_train_pos
         feature_quantiles = compute_feature_quantiles(
-            clip_outliers(df_train_raw, selected_features, k=1.5, bounds=clip_bounds),
+            clip_outliers(
+                df_train_raw, selected_features,
+                k=DEFAULT_IQR_CLIP_K, bounds=clip_bounds),
             selected_features, q_low=args.ood_q_low, q_high=args.ood_q_high,
         )
 
     else:
         # ============ 单 k 分支（原有逻辑）============
         logger.info("应用异常值裁剪 (train 学边界 → train/valid 同步应用)...")
-        df_train, clip_bounds = clip_outliers(df_train_raw, selected_features, k=1.5,
-                                              return_bounds=True)
-        df_valid = clip_outliers(df_valid_raw, selected_features, k=1.5, bounds=clip_bounds)
+        df_train, clip_bounds = clip_outliers(
+            df_train_raw, selected_features, k=DEFAULT_IQR_CLIP_K,
+            return_bounds=True)
+        df_valid = clip_outliers(
+            df_valid_raw, selected_features,
+            k=DEFAULT_IQR_CLIP_K, bounds=clip_bounds)
 
         quality_thresholds = learn_quality_thresholds(df_train, QUALITY_FEATURES_DEFAULT)
         feature_quantiles = compute_feature_quantiles(
@@ -3595,7 +3608,8 @@ def main(args=None):
     model_candidate_decision = None
     if args.mine_hard_negatives:
         df_train_for_hn = clip_outliers(
-            df_train_raw, selected_features, k=1.5, bounds=clip_bounds)
+            df_train_raw, selected_features,
+            k=DEFAULT_IQR_CLIP_K, bounds=clip_bounds)
         X_train_hn, y_train_hn, _ = prepare_xy(
             df_train_for_hn, selected_features, fill_values=fill_values)
         groups_hn = (
@@ -3732,7 +3746,9 @@ def main(args=None):
     try:
         _ = quality_thresholds
     except NameError:
-        _df_qc, _ = clip_outliers(df_train_raw, selected_features, k=1.5, return_bounds=True)
+        _df_qc, _ = clip_outliers(
+            df_train_raw, selected_features,
+            k=DEFAULT_IQR_CLIP_K, return_bounds=True)
         quality_thresholds = learn_quality_thresholds(_df_qc, QUALITY_FEATURES_DEFAULT)
 
     # 确保 scale_pos_weight_strategy 已初始化
@@ -3838,6 +3854,12 @@ def main(args=None):
     config_path = os.path.join(args.artifact_dir, "final_model_config.json")
     bundle_path = os.path.join(args.artifact_dir, "model_bundle.pkl")
 
+    clip_policy = {
+        "strategy": "no_distribution_based_input_clipping",
+        "finite_value_policy": "replace_nan_or_inf_with_train_fill_value",
+        "signal_and_formula_guards": "feature_extractor_only",
+    }
+
     raw_model.save_model(model_path)
 
     fingerprint = build_fingerprint(
@@ -3896,7 +3918,8 @@ def main(args=None):
             "calibration_data": "valid_calibration_split",
             "calibration": calibration_meta,
         },
-        "clip_bounds": clip_bounds,            # train 学到的 IQR 边界
+        "clip_bounds": clip_bounds,            # 仅无理论边界特征的 train 3×IQR
+        "clip_policy": clip_policy,
         "quality_thresholds": quality_thresholds,  # 给 s06.compute_quality 用
         "feature_quantiles": feature_quantiles,    # 给 s06 OOD 监控用
         "fingerprint": fingerprint,                # provenance
@@ -3922,6 +3945,8 @@ def main(args=None):
         "selected_features": selected_features,
         "selected_feature_count": len(selected_features),
         "fill_values": fill_values,
+        "clip_bounds": clip_bounds,
+        "clip_policy": clip_policy,
 
         "model_path": model_path,
         "window_model_threshold": best_threshold["threshold"],

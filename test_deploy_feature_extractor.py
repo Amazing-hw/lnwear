@@ -21,6 +21,35 @@ import s08_run_pipeline as s08
 import stage2_feature_catalog as catalog
 
 
+def test_s06_window_feature_builder_matches_training_for_all_acc_candidates():
+    fs = 25
+    n = 125
+    t = np.arange(n, dtype=float) / fs
+    ppg = np.zeros((n, 6), dtype=float)
+    ppg[:, 0] = 4.0e6
+    ppg[:, 1] = 1.0e5 + 300.0 * np.sin(2 * np.pi * 0.4 * t)
+    for column, phase in zip((3, 4, 5), (0.0, 0.06, -0.04)):
+        ppg[:, column] = 2.0e6 + 8.0e3 * np.sin(2 * np.pi * 1.2 * t + phase)
+    acc = np.column_stack([
+        0.08 * np.sin(2 * np.pi * 0.7 * t),
+        0.05 * np.cos(2 * np.pi * 0.5 * t),
+        1.0 + 0.03 * np.sin(2 * np.pi * 0.9 * t),
+    ])
+    selected = catalog.model_candidate_names()
+
+    expected = s03.extract_window_features(
+        ppg, fs=fs, acc_window=acc, ppg_config=0, selected_features=selected,
+    )
+    actual = s06._extract_model_window_features(
+        ppg, acc, ppg_config=0, selected_features=selected,
+        source_ppg=ppg, source_acc=acc, source_frequency=fs,
+    )
+
+    assert list(actual) == selected
+    for name in selected:
+        assert actual[name] == pytest.approx(expected[name], abs=1e-10), name
+
+
 def test_deploy_console_meta_summary_excludes_nested_training_details():
     bundle = {
         "feature_pool_version": catalog.FEATURE_POOL_VERSION,
@@ -460,7 +489,10 @@ def test_export_feature_contract_files_and_golden_raw_values(tmp_path):
     assert list(vector["features_raw"]) == selected
     assert list(vector["tolerances"]) == selected
     assert vector["features_raw"]["GREEN_AC_DC_RATIO"] != 0.0
-    assert vector["features_after_fill_clip"]["GREEN_AC_DC_RATIO"] == 0.0
+    assert (
+        vector["features_after_fill_clip"]["GREEN_AC_DC_RATIO"]
+        == vector["features_raw"]["GREEN_AC_DC_RATIO"]
+    )
     for name in selected:
         assert vector["tolerances"][name] == {
             "abs": catalog.feature_record(name)["c_abs_tolerance"],

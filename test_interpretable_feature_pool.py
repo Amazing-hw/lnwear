@@ -647,6 +647,16 @@ def test_quality_features_see_spikes_before_pulse_preprocessing_repairs_them():
     assert abs(spiked["GREEN_DOM_FREQ"] - clean["GREEN_DOM_FREQ"]) <= 0.2
 
 
+def test_quality_spike_ratio_detects_an_isolated_spike_on_a_flat_baseline():
+    n = 125
+    base = np.full(n, 2.0e6)
+    spiked = base.copy()
+    spiked[n // 2] += 5.0e5
+
+    assert s03._diff_spike_ratio(base) == 0.0
+    assert s03._diff_spike_ratio(spiked) > 0.0
+
+
 def test_contact_level_path_preserves_real_step_transition():
     ir, ambient, g1, g2, g3, _, _ = _signals()
     baseline = s03.extract_feature_pool_from_window(ir, ambient, g1, g2, g3, fs=25.0)

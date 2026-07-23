@@ -30,6 +30,45 @@ def test_window_model_metrics_include_all_xgboost_windows():
     assert metrics["accuracy"] == 1.0
 
 
+def test_apply_preprocess_ignores_legacy_iqr_clip_bounds():
+    bundle = {
+        "feature_names": ["GREEN_DC_MEDIAN"],
+        "fill_values": {"GREEN_DC_MEDIAN": 0.0},
+        "clip_bounds": {"GREEN_DC_MEDIAN": (0.0, 10.0)},
+    }
+
+    actual = s06.apply_preprocess(
+        [{"GREEN_DC_MEDIAN": 100.0}], bundle=bundle)
+
+    assert actual.tolist() == [[100.0]]
+
+
+def test_finalize_window_inference_has_no_input_clip_diagnostics(monkeypatch):
+    monkeypatch.setattr(
+        s06,
+        "predict_label_windows",
+        lambda feats, bundle: (np.ones(len(feats), dtype=int), np.full(len(feats), 0.8)),
+    )
+    result = s06._finalize_window_inference(
+        {"sample_name": "sample", "target": 1, "fallback": False},
+        [
+            {"mode": 1.0, "GREEN_DC_MEDIAN": 5.0},
+            {"mode": 9.0, "GREEN_DC_MEDIAN": 20.0},
+        ],
+        [{}, {}],
+        [0.0, 1.0],
+        [5.0, 6.0],
+        {
+            "feature_names": ["mode", "GREEN_DC_MEDIAN"],
+            "clip_bounds": {"GREEN_DC_MEDIAN": (0.0, 10.0)},
+            "feature_quantiles": None,
+        },
+        [],
+    )
+
+    assert "feature_clip_diagnostics" not in result
+
+
 def test_state_machine_output_is_not_masked_by_legacy_gate_fields():
     cfg = {
         **s06.DEFAULT_POSTPROCESS_CONFIG,

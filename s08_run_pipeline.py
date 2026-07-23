@@ -787,7 +787,7 @@ def export_feature_extractor_script(artifact_dir):
     _assert_selected_features_deployment_allowed(selected)
 
     fill_values = _json_float_map(bundle.get("fill_values", {}), selected)
-    clip_bounds = _json_clip_map(bundle.get("clip_bounds", {}), selected)
+    clip_bounds = {}
     formulas = build_selected_feature_formulas(selected)
     script_text = _render_selected_feature_extractor(
         selected,
@@ -1015,7 +1015,7 @@ def validate_deploy_artifact_consistency(artifact_dir):
     selected = list(bundle["feature_names"])
     threshold = float(bundle.get("threshold", 0.5))
     expected_fill = _json_float_map(bundle.get("fill_values", {}), selected)
-    expected_clip = _json_clip_map(bundle.get("clip_bounds", {}), selected)
+    expected_clip = {}
     expected_meta = {
         key: bundle.get("meta", {}).get(key)
         for key in ("fs_ppg", "win_sec", "step_sec")
@@ -1459,7 +1459,7 @@ def export_deploy_cookbook(artifact_dir):
     _assert_current_feature_pool_bundle(bundle, action="deployment cookbook export")
     selected = bundle["feature_names"]
     fill_values = bundle["fill_values"]
-    clip_bounds = bundle.get("clip_bounds", {})
+    clip_bounds = {}
     threshold = float(bundle["threshold"])
     meta = bundle.get("meta", {}) or {}
     model = bundle["model"]
@@ -1530,19 +1530,17 @@ def export_deploy_cookbook(artifact_dir):
             "preprocess_order": [
                 "1. select feature_order",
                 "2. fill NaN/inf with fill_values",
-                "3. clip each selected feature by clip_bounds",
             ],
             "fill_rule": "feature_vec[i] 为 NaN/inf 时用 fill_values[feature_name] 替换",
-            "clip_rule": "fill 后对每个入选特征执行 clip(lower, upper)，边界来自训练集 IQR（s05 clip_outliers k=1.5）",
+            "clip_rule": "不执行任何基于训练集分布的模型输入裁剪；仅用 fill_values 替换 NaN/inf。",
             "model_threshold": threshold,
             "n_estimators": n_estimators,
             "model_json": _json.loads(booster.save_config()),
             "inference": [
                 "1. feature_vec = [compute_feature(f) for f in feature_order]",
                 "2. for i, v in enumerate(feature_vec): if isnan(v) or isinf(v): feature_vec[i] = fill_values[feature_order[i]]",
-                "3. for i, v in enumerate(feature_vec): feature_vec[i] = clamp(v, clip_bounds[feature_order[i]][0], clip_bounds[feature_order[i]][1])",
-                "4. proba = xgboost_predict(model, feature_vec)  // → float in [0,1]",
-                "5. window_pred = 1 if proba >= threshold else 0",
+                "3. proba = xgboost_predict(model, feature_vec)  // → float in [0,1]",
+                "4. window_pred = 1 if proba >= threshold else 0",
             ],
         },
 
@@ -1576,7 +1574,6 @@ def export_deploy_cookbook(artifact_dir):
             "preprocess_order": [
                 "select feature_order",
                 "fill NaN/inf with fill_values",
-                "clip by clip_bounds",
             ],
             "n_estimators": n_estimators,
             "threshold": threshold,

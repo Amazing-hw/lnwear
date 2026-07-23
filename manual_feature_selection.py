@@ -7,6 +7,7 @@ import hashlib
 import math
 import numbers
 from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, cast
 
 from stage2_feature_catalog import FEATURE_POOL_VERSION, feature_record, is_model_candidate
 
@@ -47,9 +48,9 @@ def _load_ranking(path: Path) -> dict:
     return payload
 
 
-def _row_for_feature(item: dict, ranking_sha256: str) -> dict:
+def _row_for_feature(item: Dict[str, Any], ranking_sha256: str) -> Dict[str, Any]:
     name = str(item["feature"])
-    record = feature_record(name)
+    record: Mapping[str, object] = feature_record(name)
     return {
         "selected": 0,
         "csv_schema_version": CSV_SCHEMA_VERSION,
@@ -66,16 +67,16 @@ def _row_for_feature(item: dict, ranking_sha256: str) -> dict:
         "valid_auc": item.get("valid_auc"),
         "fp_proxy_sample_fp_rate": item.get("fp_proxy_sample_fp_rate"),
         "valid_psi": item.get("valid_psi"),
-        "deployment_cost": float(record["deployment_cost"]),
+        "deployment_cost": float(cast(Any, record["deployment_cost"])),
         "signal_source": str(record["signal_source"]),
         "preprocessing": str(record["preprocessing"]),
         "unit": str(record["unit"]),
         "formula": str(record["formula"]),
         "fft": int(bool(record["fft"])),
-        "buffer_samples": int(record["buffer_samples"]),
+        "buffer_samples": int(cast(Any, record["buffer_samples"])),
         "accumulator": str(record["accumulator"]),
-        "c_operators": ", ".join(map(str, record["c_operators"])),
-        "risk_flags": ", ".join(map(str, item.get("risk_flags") if item.get("risk_flags") is not None else record.get("risk_flags", []))),
+        "c_operators": ", ".join(map(str, cast(Iterable[Any], record["c_operators"]))),
+        "risk_flags": ", ".join(map(str, cast(Iterable[Any], item.get("risk_flags") if item.get("risk_flags") is not None else record.get("risk_flags", [])))),
         "ineligible_reasons": ", ".join(map(str, item.get("ineligible_reasons") or [])),
     }
 

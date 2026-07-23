@@ -24,7 +24,7 @@ import re
 from collections import defaultdict, OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import pandas as pd
@@ -1074,7 +1074,7 @@ def compute_drift_metrics(x_train, x_valid, n_bins=10):
 
 
 DEPLOYMENT_COST_BY_FEATURE = {
-    name: float(catalog_feature_record(name)["deployment_cost"])
+    name: float(cast(float, catalog_feature_record(name)["deployment_cost"]))
     for name in FEATURE_CATALOG
 }
 
@@ -2830,7 +2830,7 @@ def _save_figure(fig, stem: Path, formats: Sequence[str], dpi: int) -> List[str]
     paths = []
     for fmt in formats:
         out = stem.with_suffix(f".{fmt}")
-        save_kwargs = {"dpi": dpi}
+        save_kwargs: Dict[str, object] = {"dpi": dpi}
         if fmt.lower() in {"png", "tif", "tiff"}:
             save_kwargs["facecolor"] = "white"
         fig.savefig(out, **save_kwargs)
@@ -2898,7 +2898,7 @@ def _plot_feature_distribution(
             showmedians=False,
             showextrema=False,
         )
-        for body in violin["bodies"]:
+        for body in cast(Any, violin)["bodies"]:
             body.set_facecolor("#E8E8E8")
             body.set_edgecolor("#A0A0A0")
             body.set_linewidth(0.5)
@@ -3309,7 +3309,7 @@ def _write_report(
             lines.append(f"- {key}: " + ", ".join(rel))
     if balanced_keys:
         lines.extend(["", "### Balanced (正样本降采样至与负样本同数量)", ""])
-        bal_info = summary.get("balanced", {})
+        bal_info = cast(Mapping[str, object], summary.get("balanced", {}))
         if bal_info.get("status") == "ok":
             lines.append(f"- n_neg={bal_info.get('n_neg')}, n_pos_downsampled={bal_info.get('n_pos_downsampled')}, n_total={bal_info.get('n_total_balanced')}")
         for key in sorted(balanced_keys):
@@ -3348,7 +3348,7 @@ def _write_report(
             "## Method Status",
         ]
     )
-    for method, info in summary["methods"].items():
+    for method, info in cast(Mapping[str, object], summary["methods"]).items():
         lines.append(f"- {METHOD_TITLES.get(method, method.upper())}: {info}")
     lines.append("")
 
@@ -3510,7 +3510,7 @@ def run_embedding_report(
         _write_source_data_balanced(out_dir, balanced_sampled, balanced_embeddings)
     else:
         balanced_embeddings = {}
-        balanced_method_status = balance_info
+        balanced_method_status = cast(Dict[str, Mapping[str, object]], balance_info)
 
     source_path = _write_source_data(out_dir, sampled, embeddings)
     distribution_paths, distribution_source_path = plot_selected_feature_distributions(

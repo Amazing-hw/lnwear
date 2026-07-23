@@ -1,4 +1,7 @@
 from collections import OrderedDict
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -215,6 +218,36 @@ def test_stage2_existing_commercial_fields_are_overridden(monkeypatch):
     assert [features[name] for name in EXPECTED_STAGE2_FIELDS] == pytest.approx(expected)
 
 
+def test_window_feature_extraction_propagates_commercial_override_errors(monkeypatch):
+    ppg, acc = _raw_window(125)
+
+    monkeypatch.setattr(
+        s03,
+        "extract_commercial_feature_overrides",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("port failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="port failed"):
+        s03.extract_window_features(
+            ppg,
+            fs=25,
+            acc_window=acc,
+            ppg_config=0,
+        )
+
+
+def test_s06_help_marks_stage2_ir_option_as_legacy():
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("s06_deploy_eval.py")), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "legacy compatibility flag; Stage2 IR is always" in result.stdout
+
+
 def test_batch_extraction_overrides_commercial_fields_from_raw_100hz_windows(monkeypatch):
     ppg, acc = _raw_window(1500)
     observed = []
@@ -299,13 +332,6 @@ def test_s06_continuous_inference_applies_same_commercial_overrides_as_training(
     monkeypatch.setattr(s06, "validate_h5_file", lambda *_args: (True, None))
     monkeypatch.setattr(s06, "load_ppg", lambda _sample: ppg)
     monkeypatch.setattr(s06, "load_acc", lambda _sample: acc)
-    monkeypatch.setattr(
-        s06,
-        "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": -1.0}, {}),
-    )
-    monkeypatch.setattr(s06, "extract_acc_features", lambda *_args, **_kwargs: {})
-
     def fake_overrides(raw_ppg, raw_acc, frequency, ppg_config):
         observed.append((raw_ppg.shape, raw_acc.shape, frequency, ppg_config))
         return OrderedDict((("GREEN_CORR", 10.0),))
@@ -342,12 +368,6 @@ def test_s06_prewindowed_inference_applies_same_commercial_overrides_as_training
     acc = np.stack([raw_acc, raw_acc], axis=0)
     predicted_features = []
 
-    monkeypatch.setattr(
-        s06,
-        "extract_feature_pool_from_window",
-        lambda **_kwargs: ({"GREEN_CORR": -1.0}, {}),
-    )
-    monkeypatch.setattr(s06, "extract_acc_features", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         s06,
         "extract_commercial_feature_overrides",
