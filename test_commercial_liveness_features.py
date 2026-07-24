@@ -202,6 +202,26 @@ def test_commercial_only_row_requires_acc_and_propagates_port_errors(monkeypatch
         s03._commercial_only_feature_row(ppg, acc, mode=0, frequency=25)
 
 
+def test_commercial_only_row_3s_falls_back_to_governed_features():
+    """The original commercial port is 5 s only; 3 s uses matching governed fields."""
+    ppg, acc = _raw_window(75)
+
+    actual = s03._commercial_only_feature_row(ppg, acc, mode=0, frequency=25)
+    expected, diagnostics, _ = s03.extract_stage2_window(
+        ppg,
+        mode=0,
+        fs=25,
+        acc_window=acc,
+        selected_features=s03.COMMERCIAL_STAGE2_FIELDS,
+    )
+
+    assert [actual[name] for name in EXPECTED_STAGE2_FIELDS] == pytest.approx(
+        [expected[name] for name in EXPECTED_STAGE2_FIELDS]
+    )
+    assert actual["TOTAL_INVALID_COUNT"] == diagnostics["TOTAL_INVALID_COUNT"]
+    assert actual["ACC_AVAILABLE"] == diagnostics["ACC_AVAILABLE"]
+
+
 def test_stage2_existing_commercial_fields_are_overridden(monkeypatch):
     ppg, acc = _raw_window(125)
     expected = np.arange(8, dtype=np.float32) + np.float32(10)
@@ -437,6 +457,48 @@ def test_commercial_only_continuous_100hz_uses_raw_windows(monkeypatch):
     assert ppg_config == 0
     np.testing.assert_array_equal(first_ppg, ppg[0:500])
     np.testing.assert_array_equal(first_acc, acc[0:500])
+
+
+def test_commercial_only_continuous_3s_uses_actual_source_window(monkeypatch):
+    ppg, acc = _raw_window(900)
+    observed_lengths = []
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: acc)
+
+    def fake_row(raw_ppg, raw_acc, mode, frequency):
+        observed_lengths.append((len(raw_ppg), len(raw_acc), mode, frequency))
+        return {
+            **{name: 0.0 for name in s03.stage2_model_candidate_names()},
+            "mode": int(mode),
+            "feature_pool_version": s03.STAGE2_FEATURE_POOL_VERSION,
+            "TOTAL_INVALID_COUNT": 0.0,
+            "PPG_INVALID_COUNT": 0.0,
+            "GREEN_INVALID_COUNT": 0.0,
+            "ACC_AVAILABLE": 1.0,
+        }
+
+    monkeypatch.setattr(s03, "_commercial_only_feature_row", fake_row)
+    rows = s03._extract_rows_for_sample(
+        {
+            "sample_name": "sample_3s",
+            "h5_file": "sample.h5",
+            "target": 1,
+            "frequency": 100,
+            "ppg_config": 0,
+        },
+        window_len=300,
+        stride_len=100,
+        fs=100,
+        target_aware_stride=False,
+        stride_neg=100,
+        stride_pos=100,
+        commercial_only=True,
+    )
+
+    assert rows
+    assert observed_lengths
+    assert all(item == (300, 300, 0, 100) for item in observed_lengths)
 
 
 def test_commercial_only_prewindowed_100hz_uses_raw_windows(monkeypatch):

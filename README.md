@@ -29,7 +29,7 @@ python -m pip install -r requirements.txt
 ```text
 H5 数据
   → s01 数据扫描、元数据校验、train/valid/test 分组切分
-  → s03 全量合法窗口特征提取（5 秒窗口且 ACC 可用时，商用 8 特征由精确端口覆盖）
+  → s03 全量合法窗口特征提取（支持 3 秒/75 点和 5 秒/125 点；仅 5 秒且 ACC 可用时，商用 8 特征由精确端口覆盖）
   → s04 完整特征排序与 manual_feature_selection.csv
   → 人工只修改 selected 列（也可用 direct 清单或 --commercial_only）
   → s05 固定所选特征，充分搜索 XGBoost 超参数并进行 hard-negative 候选训练
@@ -169,7 +169,14 @@ python s08_run_pipeline.py \
 python s08_run_pipeline.py --dataset_dir dataset --artifact_dir artifacts --commercial_only
 ```
 
-该模式要求使用 5 秒 PPG 窗口，并提供长度对齐的 ACC；缺失或错位数据会按窗口提取失败处理并记录原因。
+该模式支持 3 秒和 5 秒 PPG 窗口，并要求 ACC 与 PPG 长度对齐。原商用 float32
+端口的固定公式仅适用于 5 秒（25 Hz 为 125 点、100 Hz 为 500 点）：在 5 秒窗口中会
+严格使用该端口；在 3 秒窗口中会自动改用同名、时长自适应的受治理特征公式。这样 3 秒
+不会因把 75 点传给 125 点端口而失败，但它不是原商用 5 秒公式的截断版本。
+
+预切窗 H5 会校验每个存储窗口与 `--window_sec` 是否一致；例如 75 点的 25 Hz 数据必须
+以 `--window_sec 3` 运行，125 点数据必须以 `--window_sec 5` 运行。长度不匹配会明确报错，
+避免以错误的窗口配置静默训练或推理。
 
 内部流程：
 
@@ -256,6 +263,7 @@ python s06_deploy_eval.py \
 主要输出包括：
 
 - `end_to_end_eval_<split>_<method>.json`
+- `per_sample_inference_summary_<split>_<method>.csv`：全量样本推理汇总，含窗口正确/错误数、窗口准确率、窗口 TP/TN/FP/FN、特征失败数与 fallback 原因。
 - `per_sample_xgboost_windows.csv`
 - `per_sample_final_prediction.csv`
 - `hard_negatives_<split>_<method>.json`
@@ -309,8 +317,9 @@ python s07_postprocess_optimize.py \
 
 部署最小组合为独立的 `deploy_feature_extractor.py` 和 XGBoost 模型 JSON。特征脚本已内嵌特征顺序、fill/clip 和窗口阈值；其他模型元数据仅用于审计和非 Python 端移植。部署判决不需要任何 IR 阈值配置文件。
 
-Python 端应把一个原始模型窗口直接交给脚本；25 Hz 的 5 秒窗口为 125 点，
-100 Hz 为 500 点。入口会按 `frequency` 执行固定四选一降采样，按 `ppg_config`
+Python 端应把一个原始模型窗口直接交给脚本；25 Hz 下 3 秒/5 秒分别为 75/125 点，
+100 Hz 下分别为 300/500 点。窗口长度必须与导出模型的 `DEFAULT_WINDOW_SEC` 一致。
+入口会按 `frequency` 执行固定四选一降采样，按 `ppg_config`
 生成三个固定光区，并对原商用精确移植字段保留原始通道布局与 float32 计算顺序：
 
 ```python
@@ -327,7 +336,9 @@ probability = model.predict_proba(
 
 返回向量已经按模型 `FEATURE_ORDER` 完成缺失值填充和训练边界裁剪。若要检查裁剪前的
 所选特征，可调用 `extract_raw_feature_dict_from_ppg(...)`。这两个接口都把输入视为一个
-模型窗口；整条连续记录应由调用方按训练配置（默认 5 秒窗口、1 秒步长）切窗后逐窗调用。
+模型窗口；整条连续记录应由调用方按训练配置（默认 5 秒窗口、1 秒步长；也可显式选用
+3 秒窗口）切窗后逐窗调用。3 秒模型必须重新完成特征排序、人工选择和训练，不可复用
+5 秒模型或其特征分布边界。
 
 ## 10. 验证
 

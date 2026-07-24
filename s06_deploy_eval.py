@@ -635,6 +635,8 @@ def _infer_prewindowed_sample(base, ppg, acc,
     window_indices = list(window_meta.get("window_indices") or []) if window_meta else []
     window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
     native_25hz = get_sample_frequency(base) == FEATURE_FS
+    source_frequency = FEATURE_FS if native_25hz else 100
+    expected_native_window_len = int(round(float(window_sec) * source_frequency))
     mode = get_sample_ppg_config(base)
     base["mode"] = int(mode)
 
@@ -657,6 +659,12 @@ def _infer_prewindowed_sample(base, ppg, acc,
         emitted_window_targets.append(window_target)
 
         try:
+            if raw_window.shape[0] != expected_native_window_len:
+                raise ValueError(
+                    f"stored PPG window has {raw_window.shape[0]} samples, which does not "
+                    f"match requested window length {expected_native_window_len} samples "
+                    f"({float(window_sec):g}s at {source_frequency} Hz)"
+                )
             window = raw_window.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
                 raw_window, src_fs=100, tgt_fs=FEATURE_FS
             )
@@ -665,6 +673,11 @@ def _infer_prewindowed_sample(base, ppg, acc,
             if acc is not None and is_prewindowed_signal(acc) and step < acc.shape[0]:
                 try:
                     raw_acc = acc[step]
+                    if raw_acc.shape[0] != expected_native_window_len:
+                        raise ValueError(
+                            f"stored ACC window has {raw_acc.shape[0]} samples, which does not "
+                            f"match requested window length {expected_native_window_len} samples"
+                        )
                     acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
                         raw_acc, src_fs=100, tgt_fs=FEATURE_FS
                     )
@@ -1043,6 +1056,13 @@ def compute_sample_metrics(results, method, cfg, model_threshold, stride_sec=1.0
             "window_feature_failure_examples": list(
                 r.get("window_feature_failure_examples", []) or []
             ),
+            "candidate_window_count": max(
+                0,
+                int(r.get(
+                    "candidate_window_count",
+                    len(probs) + window_feature_failure_count,
+                ) or 0),
+            ),
             "window_probs": probs,
             "window_preds": list(window_preds),
             "window_targets": list(r.get("window_targets", []) or []),
@@ -1078,6 +1098,115 @@ def compute_sample_metrics(results, method, cfg, model_threshold, stride_sec=1.0
         ),
     }
     return summary, details
+
+
+PER_SAMPLE_INFERENCE_SUMMARY_COLUMNS = [
+    "sample_name", "target", "pred", "sample_is_correct", "sample_error_type",
+    "ppg_config", "is_fallback", "fallback_reason",
+    "candidate_windows", "successful_windows", "feature_failed_windows",
+    "window_correct", "window_wrong", "window_accuracy", "window_error_rate",
+    "window_tn", "window_fp", "window_fn", "window_tp",
+    "positive_windows", "negative_windows", "positive_window_rate",
+    "window_probability_mean", "window_probability_min", "window_probability_max",
+    "window_probability_std", "ood_mean", "ood_window_alert_rate",
+]
+
+
+def _binary_error_type(target, prediction):
+    target = int(target)
+    prediction = int(prediction)
+    if target == 1:
+        return "TP" if prediction == 1 else "FN"
+    return "FP" if prediction == 1 else "TN"
+
+
+def _finite_summary(values):
+    valid = [float(value) for value in (values or []) if value is not None and np.isfinite(value)]
+    if not valid:
+        return None, None, None, None
+    array = np.asarray(valid, dtype=float)
+    return (
+        float(np.mean(array)),
+        float(np.min(array)),
+        float(np.max(array)),
+        float(np.std(array)),
+    )
+
+
+def build_per_sample_inference_summary_rows(details):
+    """Return one all-sample inference-statistics record per evaluation detail."""
+    rows = []
+    for detail in details:
+        target = int(detail.get("target", 0))
+        pred = int(detail.get("pred", 0))
+        preds = [int(value) for value in (detail.get("window_preds", []) or [])]
+        raw_targets = list(detail.get("window_targets", []) or [])
+        window_targets = [
+            int(raw_targets[index]) if index < len(raw_targets) else target
+            for index in range(len(preds))
+        ]
+        successful = len(preds)
+        correct = sum(
+            int(prediction == actual)
+            for prediction, actual in zip(preds, window_targets)
+        )
+        wrong = successful - correct
+        tn, fp, fn, tp = _safe_confusion(
+            np.asarray(window_targets, dtype=int), np.asarray(preds, dtype=int)
+        ) if successful else (0, 0, 0, 0)
+        failures = max(0, int(detail.get("window_feature_failure_count", 0) or 0))
+        candidates = max(
+            0,
+            int(detail.get("candidate_window_count", successful + failures) or 0),
+        )
+        prob_mean, prob_min, prob_max, prob_std = _finite_summary(
+            detail.get("window_probs", [])
+        )
+        ood_mean, _, _, _ = _finite_summary(detail.get("window_ood_scores", []))
+        rows.append({
+            "sample_name": str(detail.get("sample_name", "")),
+            "target": target,
+            "pred": pred,
+            "sample_is_correct": int(pred == target),
+            "sample_error_type": _binary_error_type(target, pred),
+            "ppg_config": int(detail.get("mode", 0) or 0),
+            "is_fallback": int(bool(detail.get("fallback", False))),
+            "fallback_reason": detail.get("fallback_reason"),
+            "candidate_windows": candidates,
+            "successful_windows": successful,
+            "feature_failed_windows": failures,
+            "window_correct": correct,
+            "window_wrong": wrong,
+            "window_accuracy": float(correct / successful) if successful else None,
+            "window_error_rate": float(wrong / successful) if successful else None,
+            "window_tn": tn,
+            "window_fp": fp,
+            "window_fn": fn,
+            "window_tp": tp,
+            "positive_windows": int(sum(preds)),
+            "negative_windows": int(successful - sum(preds)),
+            "positive_window_rate": float(sum(preds) / successful) if successful else None,
+            "window_probability_mean": prob_mean,
+            "window_probability_min": prob_min,
+            "window_probability_max": prob_max,
+            "window_probability_std": prob_std,
+            "ood_mean": detail.get("ood_mean", ood_mean),
+            "ood_window_alert_rate": detail.get("ood_window_alert_rate"),
+        })
+    return rows
+
+
+def export_per_sample_inference_summary(details, artifact_dir, split, method):
+    """Export all evaluated samples, including fallbacks and no-window records."""
+    os.makedirs(artifact_dir, exist_ok=True)
+    out_path = os.path.join(
+        artifact_dir, f"per_sample_inference_summary_{split}_{method}.csv"
+    )
+    rows = build_per_sample_inference_summary_rows(details)
+    pd.DataFrame(rows, columns=PER_SAMPLE_INFERENCE_SUMMARY_COLUMNS).to_csv(
+        out_path, index=False, encoding="utf-8"
+    )
+    return out_path
 
 
 def _detail_prob_stats(detail):
@@ -2950,6 +3079,11 @@ def main(args=None):
         s = ood_map.get(d["sample_name"], {})
         d["ood_mean"] = s.get("ood_mean")
         d["ood_window_alert_rate"] = s.get("ood_window_alert_rate")
+
+    per_sample_summary_csv = export_per_sample_inference_summary(
+        details, args.artifact_dir, split=args.split, method=args.method
+    )
+    print(f"per-sample inference summary saved: {per_sample_summary_csv}")
 
     # 窗口阈值扫描（联合优化的轻量版）
     threshold_sweep = None

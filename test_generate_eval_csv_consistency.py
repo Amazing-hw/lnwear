@@ -90,6 +90,7 @@ def test_generate_eval_csv_matches_official_metric_summaries(tmp_path):
     sm = pd.read_csv(tmp_path / "per_sample_statemachine_windows.csv")
     sm_detail = pd.read_csv(tmp_path / "statemachine_window_details.csv")
     sample = pd.read_csv(tmp_path / "per_sample_final_prediction.csv")
+    all_samples = pd.read_csv(tmp_path / "per_sample_inference_summary_test_prob_mean.csv")
 
     assert xgb["total_windows"].sum() == 4
     assert xgb["correct_windows"].sum() == 3
@@ -109,6 +110,9 @@ def test_generate_eval_csv_matches_official_metric_summaries(tmp_path):
     fallback = sample.loc[sample["sample_name"] == "fallback-pos"].iloc[0]
     assert fallback["pred"] == 0
     assert fallback["is_fallback"] == 1
+    assert set(all_samples["sample_name"]) == {
+        "mixed-pass", "negative", "fallback-pos", "no-window"
+    }
 
 
 def test_generate_eval_csv_rejects_summary_mismatch(tmp_path):

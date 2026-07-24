@@ -157,6 +157,61 @@ def test_sample_metrics_preserve_partial_window_feature_failures():
     assert details[0]["window_feature_failure_examples"][0]["window_position"] == 0
 
 
+def test_per_sample_inference_summary_includes_fallbacks_and_window_statistics(tmp_path):
+    details = [
+        {
+            "sample_name": "mixed",
+            "target": 1,
+            "pred": 1,
+            "mode": 2,
+            "fallback": False,
+            "fallback_reason": None,
+            "candidate_window_count": 5,
+            "window_feature_failure_count": 2,
+            "window_preds": [1, 0, 1],
+            "window_targets": [1, 1, 1],
+            "window_probs": [0.9, 0.2, 0.8],
+            "window_ood_scores": [0.1, 0.2, 0.3],
+        },
+        {
+            "sample_name": "fallback",
+            "target": 1,
+            "pred": 0,
+            "mode": 0,
+            "fallback": True,
+            "fallback_reason": "no_eligible_windows",
+            "candidate_window_count": 0,
+            "window_feature_failure_count": 0,
+            "window_preds": [],
+            "window_targets": [],
+            "window_probs": [],
+            "window_ood_scores": [],
+        },
+    ]
+
+    path = s06.export_per_sample_inference_summary(
+        details, tmp_path, split="test", method="prob_mean"
+    )
+    actual = pd.read_csv(path)
+
+    assert actual["sample_name"].tolist() == ["mixed", "fallback"]
+    mixed = actual.iloc[0]
+    assert mixed["candidate_windows"] == 5
+    assert mixed["successful_windows"] == 3
+    assert mixed["feature_failed_windows"] == 2
+    assert mixed["window_correct"] == 2
+    assert mixed["window_wrong"] == 1
+    assert mixed["window_accuracy"] == pytest.approx(2 / 3)
+    assert mixed["window_error_rate"] == pytest.approx(1 / 3)
+    assert mixed["window_tp"] == 2
+    assert mixed["window_fn"] == 1
+    fallback = actual.iloc[1]
+    assert fallback["sample_error_type"] == "FN"
+    assert fallback["is_fallback"] == 1
+    assert fallback["successful_windows"] == 0
+    assert pd.isna(fallback["window_accuracy"])
+
+
 class _DeployTestBooster:
     def get_dump(self, with_stats=True):
         return ["0:leaf=0.0,cover=1.0"]

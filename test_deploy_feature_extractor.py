@@ -384,9 +384,10 @@ def test_all_s03_window_features_with_acc_export_deploy_script(tmp_path):
     assert len(vector) == len(selected)
 
 
-def test_standalone_deploy_engine_matches_all_governed_candidates(tmp_path):
+@pytest.mark.parametrize("window_sec", [3.0, 5.0])
+def test_standalone_deploy_engine_matches_all_governed_candidates(tmp_path, window_sec):
     fs = 25.0
-    n = 125
+    n = int(window_sec * fs)
     t = np.arange(n, dtype=float) / fs
     ir = 4.0e6 + 1.0e4 * np.sin(2 * np.pi * 1.17 * t)
     ambient = 1.0e5 + 600.0 * np.sin(2 * np.pi * 0.37 * t)
@@ -405,6 +406,7 @@ def test_standalone_deploy_engine_matches_all_governed_candidates(tmp_path):
         {name: 0.0 for name in selected},
         {},
         formulas,
+        window_sec=window_sec,
     )
     script_path = tmp_path / "deploy_feature_extractor.py"
     script_path.write_text(script, encoding="utf-8")
@@ -428,6 +430,12 @@ def test_standalone_deploy_engine_matches_all_governed_candidates(tmp_path):
             abs=float(record["c_abs_tolerance"]),
             rel=float(record["c_rel_tolerance"]),
         ), name
+
+    with pytest.raises(ValueError, match="does not match deployment window length"):
+        module.extract_raw_feature_dict(
+            ir[:-1], ambient[:-1], g1[:-1], g2[:-1], g3[:-1],
+            acc=acc[:-1], fs=fs, ppg_config=0,
+        )
 
 
 def test_export_feature_contract_files_and_golden_raw_values(tmp_path):

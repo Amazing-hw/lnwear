@@ -110,7 +110,10 @@ from model_search_limits import (
     default_model_search_n_estimators_csv,
     parse_model_search_n_estimators,
 )
-from s03_extract_feature_pool import is_stage2_ir_feature
+from s03_extract_feature_pool import (
+    infer_uniform_prewindowed_window_sec,
+    is_stage2_ir_feature,
+)
 from s04_feature_selection import (
     is_deployment_allowed_feature,
     summarize_deployment_feature_costs,
@@ -149,6 +152,55 @@ def dataset_has_h5_files(dataset_dir):
     if not os.path.isabs(dataset_dir):
         patterns.append(os.path.join("..", dataset_dir, "*.h5"))
     return any(glob.glob(pattern) for pattern in patterns)
+
+
+def resolve_pipeline_window_sec(args, skip_set, raw_argv):
+    """Resolve a shared 3s/5s duration before child-step commands are built."""
+    inferred = None
+    source = None
+    split_path = os.path.join(args.artifact_dir, "splits.json")
+    if "s03" not in skip_set:
+        samples = []
+        if os.path.exists(split_path):
+            with open(split_path, "r", encoding="utf-8") as f:
+                split = json.load(f)
+            samples = [
+                sample
+                for part in ("train", "valid", "test")
+                for sample in split.get(part, [])
+            ]
+            source = "existing splits.json"
+        elif dataset_has_h5_files(args.dataset_dir):
+            from s01_data_split import scan_h5_samples
+
+            samples = scan_h5_samples(args.dataset_dir, n_workers=args.n_workers)
+            source = "dataset H5 metadata"
+        inferred = infer_uniform_prewindowed_window_sec(samples)
+    else:
+        bundle_path = os.path.join(args.artifact_dir, "model_bundle.pkl")
+        if os.path.exists(bundle_path):
+            bundle = joblib.load(bundle_path)
+            value = (bundle.get("meta") or {}).get("win_sec")
+            if value is not None:
+                inferred = int(round(float(value)))
+                source = "existing model bundle"
+
+    if inferred is None:
+        return
+    if inferred not in (3, 5):
+        raise ValueError(f"unsupported inferred window duration: {inferred}s")
+    if int(args.window_sec) == inferred:
+        return
+    if _arg_was_provided(raw_argv, "--window_sec"):
+        raise ValueError(
+            f"--window_sec {args.window_sec} conflicts with {source} duration "
+            f"{inferred}s"
+        )
+    print(
+        f"[window] auto-detected {inferred}s from {source}; "
+        f"overriding default --window_sec {args.window_sec}"
+    )
+    args.window_sec = inferred
 
 
 def _read_s05_quick_k_score(artifact_dir):
@@ -540,6 +592,12 @@ def extract_raw_feature_dict(ir, ambient, g1, g2, g3, acc=None, fs=25, ppg_confi
     g2 = _finite_1d(g2)
     g3 = _finite_1d(g3)
     n = min(ir.size, ambient.size, g1.size, g2.size, g3.size)
+    expected_n = int(round(float(DEFAULT_WINDOW_SEC) * float(fs)))
+    if n > 0 and n != expected_n:
+        raise ValueError(
+            f"PPG signal length {{n}} does not match deployment window length "
+            f"{{expected_n}} samples ({{DEFAULT_WINDOW_SEC:g}}s at {{float(fs):g}} Hz)"
+        )
     if n <= 0:
         raw = {{}}
     else:
@@ -1643,6 +1701,8 @@ def generate_eval_csv(artifact_dir, split="test", method="prob_mean"):
 
     # 读取 warmup_frames —— 与 compute_window_stream_metrics 保持一致
     warmup_frames = 5  # 默认值 K_on，确保状态机预填充充分
+    from s06_deploy_eval import export_per_sample_inference_summary as _export_summary
+    _export_summary(details, artifact_dir, split=split, method=method)
     eval_payload = {}
     eval_path = _os.path.join(artifact_dir, f"end_to_end_eval_{split}_{method}.json")
     if _os.path.exists(eval_path):
@@ -2460,6 +2520,13 @@ def main():
         sys.exit(2)
 
     # ── 构建命令 ──
+    if not args.dry_run:
+        try:
+            resolve_pipeline_window_sec(args, skip_set, _raw_argv)
+        except ValueError as exc:
+            print(f"[ERROR] {exc}")
+            sys.exit(2)
+
     commands = {}
 
     # s01

@@ -31,6 +31,7 @@ import os
 import json
 import argparse
 import re
+import sys
 import warnings as _commercial_warnings
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -1046,7 +1047,7 @@ def finite_signal(x, fill_value=0.0):
 
 
 # =========================================================
-# 5s / 25Hz window robust features
+# Window-length-adaptive 25Hz robust features (3s or 5s)
 # =========================================================
 
 def robust_range_ratio(x):
@@ -3718,7 +3719,12 @@ def _commercial_only_feature_row(window, acc_seg, mode, frequency):
     """Return a feature dict with 8 commercial features + zero-filled model candidates.
 
     This is the fast path used by --commercial_only. It skips the full 126-feature
-    Stage2 pipeline and only computes the 8 features from the commercial float32 port.
+    Stage2 pipeline.  The commercial float32 port has a fixed 5-second contract, so
+    it is used only for native 5-second windows.  For another valid window duration
+    (for example 3 seconds / 75 points at 25 Hz), the same eight field names are
+    calculated by the governed Stage2 implementation instead.  This preserves a
+    duration-consistent feature vector without pretending that the fixed 5-second
+    commercial formula was evaluated on an incomplete window.
     The remaining 118 model-candidate columns are filled with 0.0 so the output CSV
     keeps the complete column set expected by s04/s05/s06.
     """
@@ -3731,17 +3737,41 @@ def _commercial_only_feature_row(window, acc_seg, mode, frequency):
     for name in stage2_model_candidate_names():
         feat[name] = 0.0
 
-    commercial = extract_commercial_feature_overrides(
-        ppg, acc_seg, frequency=frequency, ppg_config=mode,
-    )
-    feat.update(commercial)  # override 8 zeros with real values
+    native_port_length = 125 * (int(frequency) // 25)
+    if int(frequency) in (25, 100) and len(ppg) == native_port_length:
+        commercial = extract_commercial_feature_overrides(
+            ppg, acc_seg, frequency=frequency, ppg_config=mode,
+        )
+        feat.update(commercial)  # override 8 zeros with exact port values
+        diagnostics = {
+            "TOTAL_INVALID_COUNT": 0.0,
+            "PPG_INVALID_COUNT": 0.0,
+            "GREEN_INVALID_COUNT": 0.0,
+            "ACC_AVAILABLE": float(acc_seg is not None),
+        }
+    else:
+        if int(frequency) == 25:
+            ppg_25 = ppg
+            acc_25 = None if acc_seg is None else np.asarray(acc_seg, dtype=np.float64)
+        elif int(frequency) == 100:
+            ppg_25 = _downsample_ppg(ppg, src_fs=100, tgt_fs=25)
+            acc_25 = None if acc_seg is None else _downsample_ppg(
+                acc_seg, src_fs=100, tgt_fs=25
+            )
+        else:
+            raise ValueError(f"unsupported PPG frequency for commercial_only: {frequency}")
+        commercial, diagnostics, _ = extract_stage2_window(
+            ppg_25,
+            mode=mode,
+            fs=25,
+            acc_window=acc_25,
+            selected_features=COMMERCIAL_STAGE2_FIELDS,
+        )
+        feat.update(commercial)
 
     feat["mode"] = int(mode)
     feat["feature_pool_version"] = STAGE2_FEATURE_POOL_VERSION
-    feat["TOTAL_INVALID_COUNT"] = 0.0
-    feat["PPG_INVALID_COUNT"] = 0.0
-    feat["GREEN_INVALID_COUNT"] = 0.0
-    feat["ACC_AVAILABLE"] = float(acc_seg is not None)
+    feat.update(diagnostics)
     return feat
 
 
@@ -3799,12 +3829,25 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
         window_labels = list(window_meta.get("window_labels") or []) if window_meta else []
         native_25hz = sample_frequency == FEATURE_FS
         ppg_src_fs = 25 if native_25hz else 100
+        expected_native_window_len = int(round(
+            float(window_len) * float(ppg_src_fs) / max(float(fs), 1.0)
+        ))
         rows = []
         window_failures = []
         for win_idx in range(ppg.shape[0]):
             window_number = int(window_indices[win_idx]) if window_indices and win_idx < len(window_indices) else int(win_idx)
             window_target = int(window_labels[win_idx]) if window_labels and win_idx < len(window_labels) else int(sample["target"])
             raw_window = ppg[win_idx]
+            if raw_window.shape[0] != expected_native_window_len:
+                window_failures.append((
+                    f"window_idx={win_idx}",
+                    ValueError(
+                        f"stored PPG window has {raw_window.shape[0]} samples, which does not "
+                        f"match requested window length {expected_native_window_len} samples "
+                        f"({float(window_len) / max(float(fs), 1.0):g}s at {ppg_src_fs} Hz)"
+                    ),
+                ))
+                continue
             if raw_window.shape[0] < 2:
                 window_failures.append((
                     f"window_idx={win_idx}",
@@ -3821,6 +3864,11 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
                 try:
                     if is_prewindowed_signal(acc) and win_idx < acc.shape[0]:
                         raw_acc = acc[win_idx]
+                        if raw_acc.shape[0] != expected_native_window_len:
+                            raise ValueError(
+                                f"stored ACC window has {raw_acc.shape[0]} samples, which does not "
+                                f"match requested window length {expected_native_window_len} samples"
+                            )
                         commercial_acc = raw_acc
                         acc_seg = raw_acc.astype(np.float64, copy=False) if native_25hz else _downsample_ppg(
                             raw_acc, src_fs=100, tgt_fs=FEATURE_FS
@@ -3946,7 +3994,7 @@ def _extract_rows_for_sample(sample, window_len, stride_len, fs,
             else:
                 commercial_stride = int(sample_frequency // FEATURE_FS)
                 commercial_start = int(start * commercial_stride)
-                commercial_len = int(125 * commercial_stride)
+                commercial_len = int(win_25 * commercial_stride)
                 commercial_ppg = ppg[commercial_start:commercial_start + commercial_len]
                 commercial_acc = None if acc is None else acc[
                     commercial_start:commercial_start + commercial_len
@@ -4146,6 +4194,42 @@ def extract_features_for_split(samples,
 
     return pd.DataFrame(all_rows)
 
+
+def infer_uniform_prewindowed_window_sec(samples):
+    """Infer a common 3s/5s duration from prewindowed sample metadata.
+
+    Only 3-D PPG records participate. Continuous recordings have no intrinsic
+    window duration and retain the CLI configuration. A mixed-duration dataset is
+    rejected because one shared model cannot use both feature distributions.
+    """
+    inferred = set()
+    for sample in samples or []:
+        shape = tuple(sample.get("ppg_shape") or ())
+        if len(shape) != 3:
+            continue
+        try:
+            frequency = int(sample.get("frequency"))
+        except (TypeError, ValueError):
+            continue
+        matching = {
+            seconds
+            for seconds in (3, 5)
+            if int(seconds * frequency) in shape[1:]
+        }
+        if len(matching) > 1:
+            raise ValueError(
+                f"sample={sample.get('sample_name', 'unknown')} has ambiguous "
+                f"prewindowed PPG shape={shape} at {frequency} Hz"
+            )
+        inferred.update(matching)
+    if len(inferred) > 1:
+        raise ValueError(
+            "mixed prewindowed durations detected (3s and 5s). Split them into "
+            "separate training/deployment runs because they require different models."
+        )
+    return next(iter(inferred), None)
+
+
 # =========================================================
 # main
 # =========================================================
@@ -4185,6 +4269,7 @@ def main(args=None):
     parser.add_argument("--commercial_only", action="store_true",
                         help="仅提取商用 8 特征，跳过 126 项 Stage2 全量池")
 
+    raw_cli_args = sys.argv[1:] if args is None else []
     if args is None:
         args = parser.parse_args()
 
@@ -4201,6 +4286,24 @@ def main(args=None):
     split_path = os.path.join(args.artifact_dir, "splits.json")
     with open(split_path, "r", encoding="utf-8") as f:
         split = json.load(f)
+
+    all_samples = [
+        sample
+        for part in ("train", "valid", "test")
+        for sample in split.get(part, [])
+    ]
+    inferred_window_sec = infer_uniform_prewindowed_window_sec(all_samples)
+    if inferred_window_sec is not None and int(args.window_sec) != inferred_window_sec:
+        if "--window_sec" in raw_cli_args:
+            parser.error(
+                f"--window_sec {args.window_sec} conflicts with prewindowed H5 "
+                f"duration {inferred_window_sec}s"
+            )
+        print(
+            f"[window] auto-detected {inferred_window_sec}s prewindowed H5 data; "
+            f"overriding default --window_sec {args.window_sec}"
+        )
+        args.window_sec = inferred_window_sec
 
     feature_pool_frames = {}
     for part in ["train", "valid", "test"]:

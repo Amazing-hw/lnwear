@@ -434,6 +434,32 @@ def test_s03_prewindowed_sample_uses_all_windows(monkeypatch):
     assert [r["start_100hz"] for r in rows] == [0, 100, 200, 300]
 
 
+def test_s03_prewindowed_window_length_must_match_requested_seconds(monkeypatch):
+    ppg = np.zeros((2, 75, 6), dtype=float)
+    ppg[:, :, 3:] = 2.0e6
+
+    monkeypatch.setattr(s03, "load_ppg", lambda _sample: ppg)
+    monkeypatch.setattr(s03, "load_acc", lambda _sample: None)
+
+    with pytest.raises(RuntimeError, match="does not match requested window length"):
+        s03._extract_rows_for_sample(
+            {
+                "sample_name": "mismatched_3s",
+                "h5_file": "x.h5",
+                "target": 1,
+                "frequency": 25,
+                "ppg_config": 0,
+            },
+            window_len=500,
+            stride_len=100,
+            fs=100,
+            target_aware_stride=False,
+            stride_neg=100,
+            stride_pos=100,
+            use_stage2_ir=False,
+        )
+
+
 def test_s06_prewindowed_inference_runs_xgboost_for_all_windows(monkeypatch):
     ppg_windows = np.zeros((4, 40, 300), dtype=float)
     ppg_windows[:, 0, :] = 4.0e6
@@ -487,6 +513,35 @@ def test_s06_prewindowed_inference_runs_xgboost_for_all_windows(monkeypatch):
     assert result["window_probs"] == [0.8, 0.8, 0.8, 0.8]
     assert "stage1_gate_flags" not in result
     assert "stage2_enabled_flags" not in result
+
+
+def test_s06_prewindowed_window_length_mismatch_is_explicit_fallback():
+    ppg = np.zeros((2, 75, 6), dtype=float)
+    base = {
+        "sample_name": "mismatched_3s",
+        "target": 1,
+        "frequency": 25,
+        "ppg_config": 0,
+        "mode": 0,
+        "fallback": False,
+        "window_indices": [],
+        "window_labels": [],
+    }
+
+    result = s06._infer_prewindowed_sample(
+        base,
+        ppg,
+        acc=None,
+        window_sec=5,
+        stride_sec=1,
+        bundle={"feature_quantiles": None, "feature_names": []},
+        use_stage2_ir=False,
+    )
+
+    assert result["fallback"] is True
+    assert result["fallback_reason"].startswith("all_window_feature_extraction_failed")
+    assert "does not match requested window length" in result["fallback_reason"]
+    assert result["window_feature_failure_count"] == 2
 
 
 def test_s06_continuous_inference_runs_xgboost_for_all_windows(monkeypatch):
